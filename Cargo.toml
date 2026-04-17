@@ -1,18 +1,17 @@
 [package]
 name = "oxideav-gsm"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
-description = "Pure-Rust GSM Full Rate (ETSI 06.10, RPE-LTP) speech codec"
-
+version = "0.0.3"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust GSM Full Rate (ETSI 06.10, RPE-LTP) speech codec — decoder + encoder + WAV-49 framing"
+repository = "https://github.com/OxideAV/oxideav-gsm"
+homepage = "https://github.com/OxideAV/oxideav-gsm"
 readme = "README.md"
-homepage.workspace = true
 keywords = ["multimedia", "audio", "gsm", "telephony", "codec"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
-oxideav-core = { workspace = true }
-oxideav-codec = { workspace = true }
+oxideav-core = "0.0.3"
+oxideav-codec = "0.0.3"
