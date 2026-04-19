@@ -29,7 +29,7 @@ mod math;
 pub mod synthesis;
 pub mod tables;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "gsm";
@@ -43,24 +43,28 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_intra_only(false)
         .with_max_channels(1)
         .with_max_sample_rate(8_000);
-    let cid_std = CodecId::new(CODEC_ID_STR);
-    reg.register_decoder_impl(cid_std.clone(), caps_std.clone(), decoder::make_decoder);
-    reg.register_encoder_impl(cid_std, caps_std, encoder::make_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps_std)
+            .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder),
+    );
 
     let caps_ms = CodecCapabilities::audio("gsm_ms_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_channels(1)
         .with_max_sample_rate(8_000);
-    let cid_ms = CodecId::new(CODEC_ID_MS_STR);
-    reg.register_decoder_impl(cid_ms.clone(), caps_ms.clone(), decoder::make_decoder);
-    reg.register_encoder_impl(cid_ms.clone(), caps_ms, encoder::make_encoder);
-
     // AVI / WAVEFORMATEX tags — `WAVE_FORMAT_GSM610` (0x0031) and
     // `WAVE_FORMAT_MSNAUDIO` (0x0032) both indicate MS-framed GSM in
     // the wild; standard ETSI GSM doesn't have a dedicated AVI tag.
-    reg.claim_tag(cid_ms.clone(), CodecTag::wave_format(0x0031), 10, None);
-    reg.claim_tag(cid_ms, CodecTag::wave_format(0x0032), 10, None);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_MS_STR))
+            .capabilities(caps_ms)
+            .decoder(decoder::make_decoder)
+            .encoder(encoder::make_encoder)
+            .tags([CodecTag::wave_format(0x0031), CodecTag::wave_format(0x0032)]),
+    );
 }
 
 #[cfg(test)]
