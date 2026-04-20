@@ -1,0 +1,78 @@
+oxideav-gsm third-party notices
+===============================
+
+This crate is distributed under the MIT license (see LICENSE) and
+additionally incorporates material derived from the following
+upstream project. Its copyright notice and license terms are
+reproduced below and apply to the incorporated material.
+
+
+libgsm (Jutta Degener / Carsten Bormann, TU Berlin)
+---------------------------------------------------
+
+libgsm is the reference GSM 06.10 Full Rate implementation originally
+written at Technische Universitaet Berlin. Portions of this crate are
+modeled on libgsm primitives and pipeline structure:
+
+  * `src/math.rs` — several fixed-point helpers are modeled on
+    libgsm primitives, including `SASR` (signed arithmetic shift
+    right), `gsm_norm` (leading-zero count for normalization),
+    `gsm_div` (fractional division), and the `L_ACF` autocorrelation
+    accumulation (cf. libgsm `src/gsm_*.c`, `src/short_term.c`,
+    `src/lpc.c`, `inc/private.h`). The `dp[-120..-1]` history
+    addressing convention in the long-term predictor also follows
+    libgsm's layout.
+
+  * `src/encoder.rs` — the preprocessing stage (DC offset removal,
+    pre-emphasis) and the LPC analysis pipeline (autocorrelation,
+    Schur recursion, reflection-coefficient to LAR conversion) are
+    structured after libgsm's `src/preprocess.c` and `src/lpc.c`.
+    Variable layout, ordering of operations, and intermediate
+    scaling choices mirror the reference so that output is
+    bit-exact with ETSI 06.10 test vectors.
+
+The ETSI 06.10 normative tables embedded in `src/tables.rs` — INVA,
+MIC, MAC, B, QLB, FAC, A, B_TIMES_TWO, DLB, NRFAC, and H — are
+spec-defined fixed-point constants drawn from the ETSI/3GPP TS 06.10
+standard itself, not from libgsm. They are reproduced here as
+required for conformant decode/encode and do not constitute material
+derived from libgsm.
+
+libgsm is distributed under the following terms (reproduced verbatim
+from the libgsm `COPYRIGHT` file; see also `LICENSE-libgsm`):
+
+    Copyright 1992, 1993, 1994 by Jutta Degener and Carsten Bormann,
+    Technische Universitaet Berlin
+
+    Any use of this software is permitted provided that this notice is not
+    removed and that neither the authors nor the Technische Universitaet Berlin
+    are deemed to have made any representations as to the suitability of this
+    software for any purpose nor are held responsible for any defects of
+    this software.  THERE IS ABSOLUTELY NO WARRANTY FOR THIS SOFTWARE.
+
+    As a matter of courtesy, the authors request to be informed about uses
+    this software has found, about bugs in this software, and about any
+    improvements that may be of general interest.
+
+    Berlin, 28.11.1994
+    Jutta Degener
+    Carsten Bormann
+
+                                     oOo
+
+    Since the original terms of 15 years ago maybe do not make our
+    intentions completely clear given today's refined usage of the legal
+    terms, we append this additional permission:
+
+          Permission to use, copy, modify, and distribute this software
+          for any purpose with or without fee is hereby granted,
+          provided that this notice is not removed and that neither
+          the authors nor the Technische Universitaet Berlin are
+          deemed to have made any representations as to the suitability
+          of this software for any purpose nor are held responsible
+          for any defects of this software.  THERE IS ABSOLUTELY NO
+          WARRANTY FOR THIS SOFTWARE.
+
+    Berkeley/Bremen, 05.04.2009
+    Jutta Degener
+    Carsten Bormann
