@@ -2,7 +2,7 @@
 //!
 //! Scope: a full pure-Rust decoder + encoder — bit-unpacker, LAR/LTP/RPE
 //! decode and encode, short-term synthesis / analysis filters, and
-//! post-/pre-processing — wired into the `oxideav_codec::Decoder` and
+//! post-/pre-processing — wired into the `oxideav_core::Decoder` and
 //! `Encoder` traits. Two framings are registered for each direction:
 //!
 //! - `gsm`    : the canonical ETSI 33-byte frame (4-bit 0xD magic + 260 bits).
@@ -29,8 +29,8 @@ mod math;
 pub mod synthesis;
 pub mod tables;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 pub const CODEC_ID_STR: &str = "gsm";
 pub const CODEC_ID_MS_STR: &str = "gsm_ms";

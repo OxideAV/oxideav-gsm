@@ -1,4 +1,4 @@
-//! `oxideav_codec::Encoder` implementation for GSM 06.10 Full Rate.
+//! `oxideav_core::Encoder` implementation for GSM 06.10 Full Rate.
 //!
 //! Mirror of [`crate::decoder`]: for every `dequantise` / `synthesis filter`
 //! there is a matching `quantise` / `analysis filter` here. Pipeline:
@@ -13,7 +13,7 @@
 //! the public-domain libgsm implementation by Jutta Degener). Code below
 //! is re-derived, not copy-pasted.
 
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, MediaType, Packet, Result, SampleFormat,
     TimeBase,

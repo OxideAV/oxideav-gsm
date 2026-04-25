@@ -1,6 +1,6 @@
-//! `oxideav_codec::Decoder` implementation for GSM 06.10 Full Rate.
+//! `oxideav_core::Decoder` implementation for GSM 06.10 Full Rate.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
