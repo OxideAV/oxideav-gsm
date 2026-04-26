@@ -105,8 +105,6 @@ mod tests {
         match frame {
             oxideav_core::Frame::Audio(af) => {
                 assert_eq!(af.samples, 160);
-                assert_eq!(af.channels, 1);
-                assert_eq!(af.sample_rate, 8_000);
                 assert_eq!(af.data.len(), 1);
                 assert_eq!(af.data[0].len(), 160 * 2);
             }

@@ -134,16 +134,6 @@ impl Encoder for GsmEncoder {
 
 impl GsmEncoder {
     fn ingest(&mut self, frame: &AudioFrame) -> Result<()> {
-        if frame.channels != 1 || frame.sample_rate != 8_000 {
-            return Err(Error::invalid(
-                "GSM encoder: input must be mono, 8000 Hz S16",
-            ));
-        }
-        if frame.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "GSM encoder: input sample format must be S16",
-            ));
-        }
         let bytes = frame
             .data
             .first()
@@ -1027,12 +1017,8 @@ mod tests {
         let mut enc = make_encoder(&make_params(crate::decoder::CODEC_ID_STANDARD)).unwrap();
         let pcm = vec![0u8; 160 * 2];
         let f = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 8_000,
             samples: 160,
             pts: Some(0),
-            time_base: TimeBase::new(1, 8_000),
             data: vec![pcm],
         };
         enc.send_frame(&Frame::Audio(f)).unwrap();
@@ -1058,12 +1044,8 @@ mod tests {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let f = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 8_000,
             samples: (160 * 4) as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, 8_000),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(f)).unwrap();
@@ -1096,12 +1078,8 @@ mod tests {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let f = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 8_000,
             samples: 320,
             pts: Some(0),
-            time_base: TimeBase::new(1, 8_000),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(f)).unwrap();

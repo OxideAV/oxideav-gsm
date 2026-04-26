@@ -48,7 +48,6 @@ fn encode_pcm(codec_id: &str, pcm: &[i16]) -> Vec<Vec<u8>> {
     params.channels = Some(1);
     params.sample_format = Some(SampleFormat::S16);
     let mut enc = make_encoder(&params).expect("encoder");
-    let tb = TimeBase::new(1, 8_000);
 
     // Feed in 160-sample chunks.
     let bytes = pcm_to_frame_bytes(pcm);
@@ -57,12 +56,8 @@ fn encode_pcm(codec_id: &str, pcm: &[i16]) -> Vec<Vec<u8>> {
     for slice in bytes.chunks(chunk_bytes) {
         let n_samples = (slice.len() / 2) as u32;
         let af = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: 8_000,
             samples: n_samples,
             pts: Some(pts),
-            time_base: tb,
             data: vec![slice.to_vec()],
         };
         enc.send_frame(&Frame::Audio(af)).expect("send");

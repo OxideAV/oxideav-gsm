@@ -1,9 +1,7 @@
 //! `oxideav_core::Decoder` implementation for GSM 06.10 Full Rate.
 
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::frame::{parse_frame, parse_ms_pair, FRAME_SIZE, MS_FRAME_SIZE};
 use crate::synthesis::SynthesisState;
@@ -41,7 +39,6 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         pending: None,
         ms_second: None,
         eof: false,
-        time_base: TimeBase::new(1, sample_rate as i64),
     }))
 }
 
@@ -63,7 +60,6 @@ struct GsmDecoder {
     /// 65-byte packet (produced on the second `receive_frame` call).
     ms_second: Option<(crate::frame::GsmFrame, Option<i64>)>,
     eof: bool,
-    time_base: TimeBase,
 }
 
 impl Decoder for GsmDecoder {
@@ -85,7 +81,7 @@ impl Decoder for GsmDecoder {
         // Drain a buffered MS-second frame first.
         if let Some((gf, pts)) = self.ms_second.take() {
             let pcm = self.state.decode_frame(&gf);
-            return Ok(pcm_to_audio_frame(&pcm, pts, self.time_base));
+            return Ok(pcm_to_audio_frame(&pcm, pts));
         }
         let Some(pkt) = self.pending.take() else {
             return if self.eof {
@@ -104,7 +100,7 @@ impl Decoder for GsmDecoder {
                 }
                 let gf = parse_frame(&pkt.data)?;
                 let pcm = self.state.decode_frame(&gf);
-                Ok(pcm_to_audio_frame(&pcm, pkt.pts, self.time_base))
+                Ok(pcm_to_audio_frame(&pcm, pkt.pts))
             }
             Variant::Microsoft => {
                 if pkt.data.len() != MS_FRAME_SIZE {
@@ -119,7 +115,7 @@ impl Decoder for GsmDecoder {
                 // time_base were in 1/sr units. Otherwise we carry unknown.
                 let pts2 = pkt.pts.map(|p| p + 160);
                 self.ms_second = Some((g1, pts2));
-                Ok(pcm_to_audio_frame(&pcm, pkt.pts, self.time_base))
+                Ok(pcm_to_audio_frame(&pcm, pkt.pts))
             }
         }
     }
@@ -130,18 +126,14 @@ impl Decoder for GsmDecoder {
     }
 }
 
-fn pcm_to_audio_frame(samples: &[i16; 160], pts: Option<i64>, time_base: TimeBase) -> Frame {
+fn pcm_to_audio_frame(samples: &[i16; 160], pts: Option<i64>) -> Frame {
     let mut bytes = Vec::with_capacity(160 * 2);
     for &s in samples.iter() {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: 8_000,
         samples: 160,
         pts,
-        time_base,
         data: vec![bytes],
     })
 }
@@ -151,6 +143,7 @@ mod tests {
     use super::*;
     use crate::bitreader::BitWriter;
     use crate::frame::{GsmFrame, SubFrame};
+    use oxideav_core::TimeBase;
 
     fn pack_standard(frame: &GsmFrame) -> Vec<u8> {
         let mut w = BitWriter::new();
@@ -206,8 +199,6 @@ mod tests {
                 panic!("expected audio frame");
             };
             assert_eq!(a.samples, 160);
-            assert_eq!(a.channels, 1);
-            assert_eq!(a.sample_rate, 8_000);
             assert_eq!(a.data.len(), 1);
             assert_eq!(a.data[0].len(), 320);
             let max = a.data[0]
