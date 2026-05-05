@@ -36,8 +36,10 @@ pub const CODEC_ID_STR: &str = "gsm";
 pub const CODEC_ID_MS_STR: &str = "gsm_ms";
 
 /// Register both the standard and Microsoft GSM framings — each with a
-/// decoder and an encoder implementation.
-pub fn register(reg: &mut CodecRegistry) {
+/// decoder and an encoder implementation. Prefer the unified
+/// [`register`] entry point when you have a
+/// [`oxideav_core::RuntimeContext`] in hand.
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps_std = CodecCapabilities::audio("gsm_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -67,6 +69,32 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs both GSM framings into
+/// the codec sub-registry of the supplied
+/// [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(CODEC_ID_STR)),
+            "standard GSM decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_decoder(&CodecId::new(CODEC_ID_MS_STR)),
+            "MS GSM decoder factory not installed via RuntimeContext"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,7 +110,7 @@ mod tests {
     #[test]
     fn register_and_build_decoder() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_STR)));
         assert!(reg.has_decoder(&CodecId::new(CODEC_ID_MS_STR)));
     }
@@ -94,7 +122,7 @@ mod tests {
         // Nc=0 (which we clamp to the previous nrp; default 40), bc=mc=0,
         // xmaxc=0, all RPE pulses = 0. Output should be silence-ish.
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let mut dec = decoder::make_decoder(&make_params(CODEC_ID_STR)).unwrap();
 
         let mut payload = vec![0u8; frame::FRAME_SIZE];
