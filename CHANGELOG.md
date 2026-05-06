@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.7...v0.0.8) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other
