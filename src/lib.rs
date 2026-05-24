@@ -28,7 +28,10 @@ pub enum Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "oxideav-gsm: orphan-rebuild scaffold — no codec wired up")
+        write!(
+            f,
+            "oxideav-gsm: orphan-rebuild scaffold — no codec wired up"
+        )
     }
 }
 
