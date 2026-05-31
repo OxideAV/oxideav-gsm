@@ -78,6 +78,88 @@ pub fn l_sub(a: i32, b: i32) -> i32 {
     a.saturating_sub(b)
 }
 
+/// §5.1 `norm(L_var1)` — the number of left shifts needed to
+/// normalise `L_var1`. Per §5.1: for positive values on the
+/// interval `[1073741824, 2147483647]` (i.e. the top two bits of
+/// the i32 differ) the answer is 0; for negative values the
+/// interval is `[-2147483648, -1073741824]`. To normalise the
+/// caller does `L_var1 << norm(L_var1)`.
+///
+/// §5.1 leaves `norm(0)` unspecified (the algorithm never invokes
+/// it on a zero argument); we return 0 to keep the function total.
+#[inline]
+pub fn norm(value: i32) -> i16 {
+    if value == 0 {
+        return 0;
+    }
+    // The spec defines the result as the count of left shifts that
+    // brings the value's most-significant magnitude bit into the
+    // top usable position (bit 30 for positives, bit 30 for the
+    // magnitude part of negatives — i.e. the result of one more
+    // shift would change the sign or overflow).
+    //
+    // For non-negative values, that's `value.leading_zeros() - 1`
+    // (subtract one for the sign bit).
+    //
+    // For negative values, the spec's interval [-2147483648,
+    // -1073741824] gives result 0; in i32, that's the values whose
+    // bit pattern starts `10xxxxxx…` or `11xxxxxx…`. The pattern
+    // for "already normalised negative" is `leading_ones() == 1`
+    // (binary `10…` — i.e. only the sign bit is one). More leading
+    // ones means more room to shift left without overflow; the
+    // count of redundant sign bits is `leading_ones() - 1`.
+    // §5.1 normalised intervals:
+    //   positive : [ 2^30,  2^31 - 1 ]
+    //   negative : [-2^31, -2^30      ]
+    //
+    // For non-zero `value`, the answer is `cls(value) - 1`, where
+    // `cls` is the count of leading sign bits (i.e. the leading
+    // run of bits matching the MSB). After `value << (cls-1)`, the
+    // sign bit and bit 30 have opposite values, which is the §5.1
+    // normalised-range invariant for positives and for negatives
+    // except the right-edge `value = -2^30` (where shifting by 1
+    // lands on `-2^31`, the deepest normalised value). That edge
+    // is handled uniformly by this formula — it returns 1, which
+    // remains spec-conformant since `-2^31` is also in
+    // [-2^31, -2^30].
+    let cls = if value >= 0 {
+        value.leading_zeros()
+    } else {
+        value.leading_ones()
+    } as i16;
+    cls - 1
+}
+
+/// §5.1 `div(var1, var2)` — fractional integer division of two
+/// non-negative 16-bit integers with `var2 >= var1`. The result is
+/// in the range `[0, 32767]` (positive, leading bit zero) and is
+/// truncated to 16 bits. Per §5.1 NOTE: `div(var1, var1) = 32767`.
+///
+/// The §5.1 contract is `0 <= var1 <= var2`. We mirror that as a
+/// `debug_assert`; out-of-range inputs return a clamped result so
+/// the function stays total in release builds.
+#[inline]
+pub fn div(var1: i16, var2: i16) -> i16 {
+    debug_assert!(var1 >= 0, "div: var1 must be non-negative");
+    debug_assert!(var2 >= var1, "div: var2 must be >= var1");
+    if var2 == 0 {
+        // Spec contract: var2 > 0; in release this returns 0 to be
+        // total. Hitting this in tests indicates a caller bug.
+        return 0;
+    }
+    if var1 == var2 {
+        return i16::MAX;
+    }
+    if var1 == 0 {
+        return 0;
+    }
+    // Compute `(var1 << 15) / var2` — gives the §3.7 Q15 quotient
+    // rounded toward zero. var1 < var2 ⇒ result < 32768 ⇒ fits i16.
+    let num = (var1 as i32) << 15;
+    let q = num / (var2 as i32);
+    q.clamp(0, i16::MAX as i32) as i16
+}
+
 /// §5.1 left-shift operator with the spec's "negative `n` becomes an
 /// arithmetic right shift by `-n`" rule — the spec defines `<< n` for
 /// `n < 0` and several decoder procedures (e.g. §5.2.16 `temp3 = 1 <<
@@ -158,5 +240,79 @@ mod tests {
     fn l_add_l_sub_saturate() {
         assert_eq!(l_add(i32::MAX, 1), i32::MAX);
         assert_eq!(l_sub(i32::MIN, 1), i32::MIN);
+    }
+
+    /// `norm` of a value already in the §5.1 normalised range
+    /// `[1<<30, i32::MAX]` returns 0.
+    #[test]
+    fn norm_of_normalised_positive_is_zero() {
+        assert_eq!(norm(1 << 30), 0);
+        assert_eq!(norm(i32::MAX), 0);
+    }
+
+    /// `norm` of a smaller positive value returns the count of
+    /// left shifts needed to push the MSB up to bit 30.
+    #[test]
+    fn norm_positive_counts_leading_zeros() {
+        // 1 → needs 30 left-shifts to become 1<<30.
+        assert_eq!(norm(1), 30);
+        // 1<<15 → needs 15 left-shifts.
+        assert_eq!(norm(1 << 15), 15);
+        // 1<<29 → one left-shift away from being normalised.
+        assert_eq!(norm(1 << 29), 1);
+    }
+
+    /// `norm` of a strictly-normalised negative (in `[i32::MIN,
+    /// -1<<30 - 1]`) returns 0. The right edge `-1<<30` returns 1
+    /// under the `cls - 1` formula because shifting by 1 lands on
+    /// the deepest-magnitude normalised value `i32::MIN`; that
+    /// remains spec-conformant since §5.1 admits both endpoints.
+    #[test]
+    fn norm_of_normalised_negative_is_zero() {
+        assert_eq!(norm(i32::MIN), 0);
+        // -(1<<30) - 1 = 0xBFFFFFFF — strictly inside the interval.
+        assert_eq!(norm(-(1 << 30) - 1), 0);
+    }
+
+    /// `norm` of a less-negative value returns the count of
+    /// redundant sign bits that can be shifted out before
+    /// overflow. The `cls - 1` formula yields the count of
+    /// leading bits matching the sign bit, minus the sign bit
+    /// itself.
+    #[test]
+    fn norm_negative_counts_redundant_sign_bits() {
+        // -1 = all-ones; cls = 32; norm = 31.
+        assert_eq!(norm(-1), 31);
+        // -2 = 0xFFFFFFFE; cls = 31; norm = 30.
+        assert_eq!(norm(-2), 30);
+        // -3 = 0xFFFFFFFD; cls = 30; norm = 29.
+        assert_eq!(norm(-3), 29);
+    }
+
+    /// `norm(0)` returns 0 — the spec leaves it undefined; we
+    /// keep the function total.
+    #[test]
+    fn norm_of_zero_is_zero() {
+        assert_eq!(norm(0), 0);
+    }
+
+    /// `div(0, *)` is 0 and `div(x, x)` is 32767, per §5.1.
+    #[test]
+    fn div_edge_cases() {
+        assert_eq!(div(0, 1), 0);
+        assert_eq!(div(0, 32767), 0);
+        assert_eq!(div(1, 1), i16::MAX);
+        assert_eq!(div(32767, 32767), i16::MAX);
+    }
+
+    /// `div(a, b)` for a < b gives the Q15 truncating quotient.
+    #[test]
+    fn div_q15_quotient() {
+        // 1 / 2 in Q15 = 16384.
+        assert_eq!(div(1, 2), 16384);
+        // 1 / 4 in Q15 = 8192.
+        assert_eq!(div(1, 4), 8192);
+        // 3 / 4 in Q15 = 24576.
+        assert_eq!(div(3, 4), 24576);
     }
 }

@@ -425,7 +425,7 @@ fn post_process(sro: &[i16; FRAME_SAMPLES]) -> [i16; FRAME_SAMPLES] {
 
 // ───────────────────────── decoder-homing helper ─────────────────────────
 
-/// Build the §4.6 Table 4.1a/b decoder-homing frame as an
+/// Build the §4.4 Table 4.1a/b decoder-homing frame as an
 /// [`UnpackedFrame`]. The spec specifies it so any implementation
 /// can run the conformance "homing sequence" test (§4.4 step 1).
 pub fn decoder_homing_frame() -> UnpackedFrame {
@@ -448,6 +448,76 @@ pub fn decoder_homing_frame() -> UnpackedFrame {
         }
     }
     f
+}
+
+/// Build the §4.2 encoder-homing-frame as 160 linear PCM samples.
+///
+/// §4.2 definition: *"The encoder-homing-frame consists of 160
+/// identical samples, each 13 bits long, with the least significant
+/// bit set to "one" and all other bits set to "zero". When written
+/// to 16-bit words with left justification, the samples have a
+/// value of 0008 hex."*
+///
+/// `0x0008` is the 13-bit value `0000_0000_0000_1` left-justified
+/// inside a 16-bit word as `S.v.v.v.v.v.v.v.v.v.v.v.v.0.0.0` per
+/// §5.3.7 output format: a 13-bit value `0b0_0000_0000_0001`
+/// shifted left by three becomes `0x0008`. This is the same 160
+/// samples §4.4 Step 1 requires the decoder to emit in response to
+/// a decoder-homing-frame.
+pub fn encoder_homing_frame_pcm() -> [i16; FRAME_SAMPLES] {
+    [0x0008; FRAME_SAMPLES]
+}
+
+/// Returns `true` if `frame` exactly matches the §4.4 Table 4.1a/b
+/// decoder-homing-frame's 76 parameters.
+///
+/// §4.4 NOTE 2 spells out the "delay-optimised" check: comparing
+/// only LARc[1..=8] and the first sub-frame is sufficient when the
+/// decoder is already in its home state. For the full bit-exact
+/// safety here we compare every parameter — the cheaper subset
+/// check is a §4.4 optimisation, not a normative requirement.
+pub fn is_decoder_homing_frame(frame: &UnpackedFrame) -> bool {
+    *frame == decoder_homing_frame()
+}
+
+// ─────────────────── §4.4 decoder-homing protocol ───────────────────
+
+impl DecoderState {
+    /// Decode one frame applying the §4.4 decoder-homing protocol.
+    ///
+    /// §4.4 Step 1 — when the input frame *is* a decoder-homing-frame
+    /// (and not flagged as a bad frame), the output is replaced
+    /// with the encoder-homing-frame (160 samples of `0x0008` per
+    /// §4.2). §4.4 Step 2 — after that frame is processed, the
+    /// decoder's state variables are reset to their §4.6 Table 4.3
+    /// home values so that the *next* frame starts from the home
+    /// state.
+    ///
+    /// §4.4 NOTE 1 explains the consequence: a sequence of N
+    /// decoder-homing-frames will produce at least N-1
+    /// encoder-homing-frames at the output, because the very first
+    /// homing frame may arrive while the decoder is in an arbitrary
+    /// (non-home) state. With this method, the first homing frame
+    /// triggers the substitution; from the second onward the decoder
+    /// is already homed and the output is the spec-defined
+    /// `0x0008`-fill regardless.
+    ///
+    /// For raw §5.3 decoding without the §4.4 substitution, use
+    /// [`Self::decode_frame`] directly.
+    pub fn decode_frame_with_homing(&mut self, frame: &UnpackedFrame) -> [i16; FRAME_SAMPLES] {
+        if is_decoder_homing_frame(frame) {
+            // §4.4 Step 1 — run the normal decode (so internal
+            // state is consistent with having processed the input)
+            // but discard the output and emit the encoder-homing-
+            // frame instead.
+            let _ = self.decode_frame(frame);
+            // §4.4 Step 2 — reset all state variables to home.
+            self.reset();
+            encoder_homing_frame_pcm()
+        } else {
+            self.decode_frame(frame)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +617,97 @@ mod tests {
         let rp = larp_to_rp(&lar);
         assert!(rp[1] > 0);
         assert!(rp[2] < 0);
+    }
+
+    /// §4.2 encoder-homing-frame PCM is exactly 160 samples of
+    /// 0x0008.
+    #[test]
+    fn encoder_homing_frame_is_160_of_0x0008() {
+        let f = encoder_homing_frame_pcm();
+        assert_eq!(f.len(), FRAME_SAMPLES);
+        for (k, s) in f.iter().enumerate() {
+            assert_eq!(*s, 0x0008, "sample {k} should be 0x0008");
+        }
+    }
+
+    /// The §4.4 decoder-homing-frame predicate matches the helper
+    /// it's paired with and rejects everything else.
+    #[test]
+    fn homing_predicate_matches_only_homing_frame() {
+        let h = decoder_homing_frame();
+        assert!(is_decoder_homing_frame(&h));
+        assert!(!is_decoder_homing_frame(&UnpackedFrame::default()));
+        // Mutating any parameter breaks the match.
+        let mut m = h;
+        m.lar_c[1] = 0;
+        assert!(!is_decoder_homing_frame(&m));
+        let mut m = h;
+        m.sub[3].x_mc[4] = 4; // homing frame has 0x0003 here
+        assert!(!is_decoder_homing_frame(&m));
+    }
+
+    /// §4.4 Step 1 — a decoder-homing-frame input produces the
+    /// encoder-homing-frame (160 × 0x0008) at the output.
+    #[test]
+    fn homing_input_produces_encoder_homing_output() {
+        let mut dec = DecoderState::new();
+        let h = decoder_homing_frame();
+        let out = dec.decode_frame_with_homing(&h);
+        for (k, s) in out.iter().enumerate() {
+            assert_eq!(*s, 0x0008, "sample {k} should be 0x0008");
+        }
+    }
+
+    /// §4.4 Step 2 — after processing a decoder-homing-frame the
+    /// decoder is back in its §4.6 home state. The subsequent frame
+    /// therefore decodes identically to one fed to a freshly-homed
+    /// decoder.
+    #[test]
+    fn homing_resets_state_for_next_frame() {
+        let h = decoder_homing_frame();
+        let probe = UnpackedFrame::default(); // arbitrary follow-up
+
+        // Drive `stale` through a noisy frame then a homing frame.
+        let mut stale = DecoderState::new();
+        let mut noisy = h;
+        noisy.lar_c[2] = 21; // perturb away from the homing payload
+        let _ = stale.decode_frame_with_homing(&noisy);
+        let _ = stale.decode_frame_with_homing(&h);
+        let stale_next = stale.decode_frame_with_homing(&probe);
+
+        // `fresh` is just-constructed; one decode of `probe`.
+        let mut fresh = DecoderState::new();
+        let fresh_next = fresh.decode_frame_with_homing(&probe);
+
+        assert_eq!(stale_next, fresh_next, "post-homing state diverged");
+    }
+
+    /// §4.4 NOTE 1 — N homing frames produce at least N-1
+    /// encoder-homing outputs. Concretely: feed three homing
+    /// frames in a row; outputs 2 and 3 must both be the
+    /// encoder-homing-frame.
+    #[test]
+    fn n_homing_frames_yield_n_minus_1_homing_outputs() {
+        let mut dec = DecoderState::new();
+        let h = decoder_homing_frame();
+        let _ = dec.decode_frame_with_homing(&h); // output 1 (first)
+        let out2 = dec.decode_frame_with_homing(&h); // output 2
+        let out3 = dec.decode_frame_with_homing(&h); // output 3
+        let expected = encoder_homing_frame_pcm();
+        assert_eq!(out2, expected);
+        assert_eq!(out3, expected);
+    }
+
+    /// A non-homing input bypasses the §4.4 substitution — the
+    /// output is whatever §5.3 produces.
+    #[test]
+    fn non_homing_input_passes_through() {
+        let mut a = DecoderState::new();
+        let mut b = DecoderState::new();
+        let f = UnpackedFrame::default(); // not a homing frame
+        let raw = a.decode_frame(&f);
+        let viah = b.decode_frame_with_homing(&f);
+        assert_eq!(raw, viah);
     }
 
     /// `rpe_decode` with an all-zero sub-frame yields an all-zero

@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§4.4 decoder-homing protocol + §5.1 `norm` / `div` primitives
+  (2026-06-01).** Wires the §4.4 in-band homing protocol into the
+  decoder: a §4.4 Table 4.1a/b decoder-homing-frame at the input
+  produces the §4.2 encoder-homing-frame (160 samples of `0x0008`)
+  at the output and resets the decoder's §4.6 state. Exposed as
+  `DecoderState::decode_frame_with_homing` (raw `decode_frame`
+  remains available for callers that want pre-protocol §5.3
+  output) and wired into the `make_decoder` `oxideav_core::Decoder`
+  adapter so codec-registry callers also get conformance-correct
+  behaviour. Helpers `encoder_homing_frame_pcm()` and
+  `is_decoder_homing_frame()` are public.
+  Also adds the two remaining §5.1 arithmetic primitives —
+  `norm(L_var1) -> i16` (count of left shifts to normalise) and
+  `div(var1, var2) -> i16` (Q15 fractional integer division with
+  the §5.1 `var2 >= var1 >= 0` contract). Neither is used by the
+  §5.3 decoder pipeline yet; they're staged for the §5.2 encoder
+  that arrives in a later round.
+
 - **First clean-room decoder slice (2026-05-29).** Implements the GSM
   06.10 RPE-LTP §5.3 fixed-point decoder pipeline against the staged
   ETSI EN 300 961 V8.1.1 spec under `docs/audio/gsm/`. Covers:

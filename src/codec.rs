@@ -100,7 +100,11 @@ impl Decoder for GsmDecoder {
             let bytes = &pkt.data[f * 33..(f + 1) * 33];
             let frame = UnpackedFrame::from_bit_stream_msb_first(bytes)
                 .map_err(|e| CoreError::invalid(e.to_string()))?;
-            let samples = self.state.decode_frame(&frame);
+            // Apply §4.4 decoder-homing protocol: a decoder-homing
+            // frame substitutes the encoder-homing-frame output and
+            // resets the decoder state. Pass-through for normal
+            // frames.
+            let samples = self.state.decode_frame_with_homing(&frame);
             for s in samples {
                 pcm.extend_from_slice(&s.to_le_bytes());
             }

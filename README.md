@@ -7,7 +7,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
-| Decoder   | First slice landed (clean-room rebuild) | §5.3 fixed-point pipeline: frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping. Conformance verification against the §6 test sequences pending. |
+| Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
 | Encoder   | Not implemented | §3.1 / §5.2 encoder is a separate body of work; `make_encoder` returns `Unsupported`. |
 
 ## Implementation
@@ -30,9 +30,30 @@ The decoder is a direct translation of the §5.3 fixed-point pipeline:
 * **§5.3.5** De-emphasis — first-order IIR with coefficient `28180 * 2^-15`.
 * **§5.3.6 / §5.3.7** Upscale + output truncation — double the sample and clear the low three bits per the 13-bit two's complement output format.
 
-Arithmetic primitives (`add`, `sub`, `mult`, `mult_r`, `L_add`, `L_mult`,
-`abs`, signed-`shl`/`shr`) are saturating per §5.1 and live in
-`src/arith.rs`.
+Arithmetic primitives (`add`, `sub`, `mult`, `mult_r`, `L_add`,
+`L_mult`, `L_sub`, `abs`, signed-`shl`/`shr`, `norm`, `div`) are
+saturating per §5.1 and live in `src/arith.rs`. `norm` and `div`
+are not used by the §5.3 decoder pipeline but land alongside the
+others so the §5.2 encoder slice that consumes them in a later
+round has a stable, tested fixed-point surface to build on.
+
+## Codec homing (§4.4)
+
+The decoder implements the §4.4 in-band homing protocol via
+[`DecoderState::decode_frame_with_homing`] (also wired into the
+`oxideav_core::Decoder` adapter on `make_decoder`):
+
+* If the input frame matches the §4.4 Table 4.1a/b
+  decoder-homing-frame, the output is replaced with the §4.2
+  encoder-homing-frame (160 samples of `0x0008`) and the
+  decoder's state is reset to the §4.6 Table 4.3 home values.
+* Otherwise the frame passes straight to the §5.3 pipeline.
+
+Per §4.4 NOTE 1, this gives the "N homing frames in → N-1 homing
+frames out" property the spec calls for, since the first homing
+frame triggers a state reset that the second arrives into.
+`decode_frame` is kept as the raw §5.3 entry point for callers
+who want pre-homing pipeline output.
 
 ## Public API
 
