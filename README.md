@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | Not implemented | §3.1 / §5.2 encoder is a separate body of work; `make_encoder` returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.3 pre-processing | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. LPC analysis (§5.2.4..§5.2.7), short-term analysis filter (§5.2.10), LTP (§5.2.11..§5.2.14), RPE selection + APCM (§5.2.15..§5.2.17), and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -36,6 +36,35 @@ saturating per §5.1 and live in `src/arith.rs`. `norm` and `div`
 are not used by the §5.3 decoder pipeline but land alongside the
 others so the §5.2 encoder slice that consumes them in a later
 round has a stable, tested fixed-point surface to build on.
+
+## Encoder pre-processing (§5.2.0..§5.2.3)
+
+The encoder's input-shaping pipeline is implemented as
+[`PreProcessor`] in `src/encoder.rs`. It maps a frame of 160 raw
+PCM input samples `sop[0..159]` (§5.2.0 format
+`S.v.v.v.v.v.v.v.v.v.v.v.v.v.x.x.x`) to the analysis-clause input
+`s[0..159]`:
+
+* **§5.2.1 `downscale_frame`** — clear the three "don't care" LSBs
+  via `>>3 then <<2`, leaving a 13-bit-aligned sample.
+* **§5.2.2 `offset_compensation`** — high-pass IIR with the spec's
+  31×16-bit recursive arm split. `z1` (16-bit) and `L_z2` (32-bit)
+  state are carried across frames per the §5.2.2 "Keep z1 and L_z2
+  in memory" note + §4.5 Table 4.2 home value 0.
+* **§5.2.3 `pre_emphasis`** — first-order FIR with coefficient
+  `mult_r(mp, -28180)`. `mp` (16-bit) state carried across frames
+  per the §5.2.3 "Keep mp in memory" note + §4.5 home value 0.
+  Symmetric to the decoder's §5.3.5 `+28180` de-emphasis pole.
+
+`PreProcessor::process_frame` runs §5.2.1 → §5.2.2 → §5.2.3 end-
+to-end for callers who only want the pre-processing output.
+
+The §5.2.4 (autocorrelation), §5.2.5 (Schur recursion), §5.2.6
+(reflection→LAR), §5.2.7 (LAR quantisation), §5.2.10 (short-term
+analysis filter), §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17
+(weighting filter + RPE selection + APCM quantisation) stages, and
+the §1.7 frame packer arrive in later rounds. Until they land,
+`make_encoder` still returns `Unsupported`.
 
 ## Codec homing (§4.4)
 

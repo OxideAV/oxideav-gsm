@@ -56,6 +56,7 @@ pub mod arith;
 pub mod bitstream;
 pub mod codec;
 pub mod decoder;
+pub mod encoder;
 pub mod error;
 pub mod tables;
 
@@ -64,6 +65,7 @@ pub use codec::{make_decoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
+pub use encoder::PreProcessor;
 pub use error::Error;
 
 use oxideav_core::{CodecParameters, Encoder, Result, RuntimeContext};

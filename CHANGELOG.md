@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.0..§5.2.3 encoder pre-processing pipeline (2026-06-02).**
+  Lands the encoder's input-shaping stage as a public `PreProcessor`
+  struct in `encoder::PreProcessor` (re-exported as
+  `oxideav_gsm::PreProcessor`):
+  - §5.2.1 `downscale_frame` — `>>3` then `<<2` per the §5.2.1
+    pseudocode, dropping the three "don't care" LSBs of the §5.2.0
+    input format and re-emitting at the bit-2 alignment the §5.2.2
+    IIR consumes.
+  - §5.2.2 `offset_compensation` — the high-pass IIR with extended
+    (32-bit) precision recursive arm. `z1` / `L_z2` state are
+    persisted across frames per §5.2.2 + §4.5 Table 4.2 home values.
+  - §5.2.3 `pre_emphasis` — first-order FIR with coefficient
+    `-28180 * 2^-15`. `mp` state persisted per §5.2.3 + §4.5
+    Table 4.2 home values. Pairs symmetrically with the decoder's
+    §5.3.5 de-emphasis (`+28180`).
+  - `process_frame` — single-call convenience that runs the three
+    stages end-to-end on a 160-sample input frame.
+  - `reset` returns the pre-processor to §4.5 home values.
+  Twelve unit tests cover monotone decay of the §5.2.2 IIR step
+  response, cross-frame state persistence, determinism from the
+  home state, sign preservation, and the §5.2.3 first-sample
+  identity. The §5.2.4..§5.2.18 stages (LPC analysis, LTP, RPE,
+  APCM, frame packing) arrive in later rounds; `make_encoder` still
+  returns `Unsupported`.
+
 - **§4.4 decoder-homing protocol + §5.1 `norm` / `div` primitives
   (2026-06-01).** Wires the §4.4 in-band homing protocol into the
   decoder: a §4.4 Table 4.1a/b decoder-homing-frame at the input
