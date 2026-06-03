@@ -6,6 +6,47 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.8..§5.2.10 encoder short-term analysis filter (2026-06-04).**
+  Lands the §5.2 short-term analysis filtering clause as the
+  `analysis::Analyzer` struct + `analysis::short_term_analysis_filter`
+  free function:
+  - `short_term_analysis_filter(s, rp, u, k_start, k_end)` runs the
+    §5.2.10 8-stage lattice over `s[k_start..=k_end]` with the
+    block's reflection coefficients `rp[1..=8]`, updating the
+    persistent filter memory `u[0..=7]` (§4.5 Table 4.2 / §5.2.10
+    "Initial value: u[0..7] = 0") in place. Inner loop is the
+    spec's verbatim `temp = add(u[i-1], mult_r(rp[i], di)); di =
+    add(di, mult_r(rp[i], u[i-1])); u[i-1] = sav; sav = temp;`
+    sequence.
+  - `Analyzer::analyse_frame(s) -> (LARc[1..=8], d[0..159])` runs
+    §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a
+    pre-processed frame. It quantises + codes the LARs, decodes
+    them back into `LARpp(j)` via the §5.2.8 path (so encoder and
+    decoder see bit-identical reflection coefficients), then for
+    each of the four §5.2.9.1 blocks (k = 0..=12, 13..=26,
+    27..=39, 40..=159) interpolates `LARpp(j-1)` with `LARpp(j)`,
+    converts to `rp[1..=8]` via §5.2.9.2, and runs the §5.2.10
+    filter to produce that block's short-term residual `d[..]`.
+    After the four blocks complete, `LARpp(j-1)` is updated to
+    `LARpp(j)` for the next frame.
+  - `Analyzer` persists `LARpp(j-1)[1..=8]` (§4.5 / §5.2.9.1
+    "Initial value: LARpp(j-1)[1..8] = 0") and `u[0..=7]` (§4.5 /
+    §5.2.10) across calls. `Analyzer::new()` / `Analyzer::reset()`
+    return the §4.5 home state.
+  - The §5.2.8 LAR decode, §5.2.9.1 LAR interpolation, and §5.2.9.2
+    LARp → rp helpers — already implemented in `src/decoder.rs` for
+    the §5.3 pipeline — are now `pub(crate)` so the encoder reuses
+    the same code path. No behaviour change to the decoder.
+  Ten unit tests cover the §5.2.10 identity behaviour under zero
+  reflection coefficients, single-sample blocks, the DC-step
+  high-pass shape with `rp[1] = 0.5`, the `Analyzer` home state
+  invariant, the `reset` round trip, the zero-input → zero-residual
+  invariant, end-to-end determinism, cross-frame state evolution,
+  the §5.2.4..§5.2.7 LARc determinism across frames, and a
+  block-0 split-vs-canonical equivalence check.
+  `make_encoder` still returns `Unsupported` — §5.2.11..§5.2.18
+  LTP / RPE / APCM and §1.7 frame packing arrive in later rounds.
+
 - **§5.2.7 encoder LAR quantisation + coding (2026-06-03).** Adds the
   `analysis::quantise_lar` free function to the existing
   `encoder::analysis` sub-module, plus the end-to-end

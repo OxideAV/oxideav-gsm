@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.7 pre-processing + LPC analysis + LAR quantisation | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, and §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes). All four stages are stateless per-frame helpers exposed as `autocorrelation`, `reflection_coefficients`, `reflection_to_lar`, `quantise_lar`, plus the end-to-end `analyse_frame` (returns `LAR[1..=8]`) and `analyse_and_quantise_frame` (returns `LARc[1..=8]`). §5.2.10 short-term analysis filter, §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.10 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -107,16 +107,56 @@ emit the `LARc[1..=8]` codewords the §1.7 bit packer consumes:
 `analyse_frame` runs §5.2.4 → §5.2.5 → §5.2.6 end-to-end and
 returns `LAR[1..=8]`; `analyse_and_quantise_frame` extends the
 chain through §5.2.7 and returns `LARc[1..=8]`. All four helpers
-are stateless — the only cross-frame state in the §5.2 encoder so
-far lives in [`PreProcessor`] (§5.2.2/§5.2.3) and in the §5.2.10
-short-term analysis filter (§4.5 `u[0..=7]`), which arrives in a
-later round.
+are stateless.
 
-The §5.2.10 (short-term analysis filter), §5.2.11..§5.2.14 (LTP
-analysis), §5.2.15..§5.2.17 (weighting filter + RPE selection +
-APCM quantisation) stages, and the §1.7 frame packer arrive in
-later rounds. Until they land, `make_encoder` still returns
-`Unsupported`.
+## Encoder short-term analysis filter (§5.2.8..§5.2.10)
+
+The short-term analysis filtering clause is implemented as the
+[`analysis::Analyzer`] struct and the
+[`analysis::short_term_analysis_filter`] free function in
+`src/encoder.rs`. [`Analyzer`] runs the full chain §5.2.7 →
+§5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 on a pre-processed input
+frame `s[0..159]` and returns `(LARc[1..=8], d[0..159])` where
+`d` is the short-term residual that §5.2.11 LTP analysis
+consumes:
+
+* **§5.2.8** — `decode_lar(LARc) → LARpp(j)` runs the spec's
+  `LARpp[i] = 2 * mult_r(INVA[i], (LARc[i] + MIC[i]) * 1024 - 2*B[i])`
+  loop so encoder and decoder see bit-identical reflection
+  coefficients. (The §5.2.8 helper itself is shared with the
+  decoder pipeline at `pub(crate)` scope.)
+* **§5.2.9.1** — for each of the four blocks (k = 0..=12,
+  13..=26, 27..=39, 40..=159) the interpolator mixes
+  `LARpp(j-1)` and `LARpp(j)` per Table 3.2 weights
+  0.75/0.25, 0.50/0.50, 0.25/0.75, 1.0. (Shared with the
+  decoder at `pub(crate)` scope.)
+* **§5.2.9.2** — each interpolated `LARp` is converted to `rp`
+  via the inverse of §5.2.6's piecewise map (segment points
+  11059 / 20070). (Shared with the decoder.)
+* **§5.2.10 `short_term_analysis_filter`** — runs the 8-stage
+  lattice over `s[k_start..=k_end]`:
+  ```text
+  FOR k = k_start to k_end:
+      di = s[k]; sav = di;
+      FOR i = 1 to 8:
+          temp = add(u[i-1], mult_r(rp[i], di));
+          di   = add(di,     mult_r(rp[i], u[i-1]));
+          u[i-1] = sav; sav = temp;
+      NEXT i:
+      d[k] = di;
+  NEXT k:
+  ```
+  `u[0..=7]` is the §4.5 Table 4.2 short-term analysis filter
+  memory and is persisted across blocks and across frames by the
+  [`Analyzer`] caller.
+
+`Analyzer::new()` returns the §4.5 home state (`LARpp(j-1) = 0`,
+`u = 0`). `Analyzer::reset()` returns to the home state.
+
+The §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17 (weighting
+filter + RPE selection + APCM quantisation) stages, and the §1.7
+frame packer arrive in later rounds. Until they land,
+`make_encoder` still returns `Unsupported`.
 
 ## Codec homing (§4.4)
 

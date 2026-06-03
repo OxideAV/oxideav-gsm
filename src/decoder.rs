@@ -126,7 +126,11 @@ impl DecoderState {
 /// Note (§5.2.8 NOTE): the addition of `MIC[i]` is used to restore
 /// the sign of `LARc[i]` — the encoder offset it positive in §5.2.7
 /// so the wire format is always unsigned.
-fn decode_lar(lar_c: &[i16; 9]) -> [i16; 9] {
+///
+/// Exposed `pub(crate)` so the encoder's §5.2.10 short-term analysis
+/// filter — which needs the LARpp values the decoder will see, not
+/// the un-quantised LARs — can drive the identical §5.2.8 path.
+pub(crate) fn decode_lar(lar_c: &[i16; 9]) -> [i16; 9] {
     let mut lar_pp = [0i16; 9];
     for i in 1..=8 {
         let mut temp1 = add(lar_c[i], MIC[i]) << 10;
@@ -151,7 +155,12 @@ fn decode_lar(lar_c: &[i16; 9]) -> [i16; 9] {
 ///
 /// `block` selects which of those four windows the caller wants:
 /// 0 ⇒ 0..=12, 1 ⇒ 13..=26, 2 ⇒ 27..=39, 3 ⇒ 40..=159.
-fn interpolate_lar(prev: &[i16; 9], curr: &[i16; 9], block: u8) -> [i16; 9] {
+///
+/// Exposed `pub(crate)` so the encoder's §5.2.10 short-term analysis
+/// filter — which the spec specifies "operates with four different
+/// sets of coefficients" derived the same way — can reuse the
+/// identical §5.2.9.1 path.
+pub(crate) fn interpolate_lar(prev: &[i16; 9], curr: &[i16; 9], block: u8) -> [i16; 9] {
     let mut out = [0i16; 9];
     for i in 1..=8 {
         out[i] = match block {
@@ -180,7 +189,12 @@ fn interpolate_lar(prev: &[i16; 9], curr: &[i16; 9], block: u8) -> [i16; 9] {
 
 /// Convert interpolated LARp[1..=8] back into reflection
 /// coefficients rp[1..=8] per §5.2.9.2.
-fn larp_to_rp(lar_p: &[i16; 9]) -> [i16; 9] {
+///
+/// Exposed `pub(crate)` so the encoder's §5.2.10 short-term analysis
+/// filter, which uses the same rp[1..=8] lattice coefficients the
+/// decoder's §5.3.4 synthesis filter does, can reuse the identical
+/// §5.2.9.2 path.
+pub(crate) fn larp_to_rp(lar_p: &[i16; 9]) -> [i16; 9] {
     let mut rp = [0i16; 9];
     for i in 1..=8 {
         let mut temp = abs(lar_p[i]);
