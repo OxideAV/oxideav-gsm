@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.4..§5.2.6 encoder LPC-analysis front-end (2026-06-03).**
+  Adds the autocorrelation → Schur → LAR transform stages as the
+  public `encoder::analysis` sub-module (re-exported as
+  `oxideav_gsm::analysis`):
+  - §5.2.4 `autocorrelation` — Dynamic-scaled inner-product
+    `L_ACF[0..=8] = Σ s[i] * s[i-k]`. Scaling factor
+    `scalauto = sub(4, norm(smax << 16))` whenever `smax > 0`;
+    when `scalauto > 0` the input is downscaled by
+    `mult_r(s[k], 16384 >> (scalauto-1))` before accumulating.
+  - §5.2.5 `reflection_coefficients` — Schur recursion driving
+    `r[n] = div(|P[1]|, P[0])` (Q15) with sign restored from
+    `P[1] > 0`, the `L_ACF[0] == 0` short-circuit, and the
+    early-exit branch when `P[0] < |P[1]|`.
+  - §5.2.6 `reflection_to_lar` — Three-segment piecewise map
+    of `|r[i]|` into `LAR[i]` (breakpoints 22118 / 31130) with
+    the sign of `r[i]` restored. Inverse of the decoder's
+    §5.2.9.2 lookup.
+  - `analyse_frame` — Convenience wrapper running §5.2.4 →
+    §5.2.5 → §5.2.6 end-to-end on a pre-processed frame.
+  Twelve unit tests cover the §5.2.4 dynamic scaling, the
+  §5.2.5 zero-L_ACF and abort branches, segment 1/2/3 boundaries
+  in §5.2.6, end-to-end determinism, and the approximate
+  even-symmetry property under input negation. `make_encoder`
+  still returns `Unsupported` — §5.2.7 quantisation + §5.2.10
+  short-term analysis filter + §5.2.11..§5.2.18 LTP/RPE/APCM +
+  §1.7 frame packer arrive in later rounds.
+
 - **§5.2.0..§5.2.3 encoder pre-processing pipeline (2026-06-02).**
   Lands the encoder's input-shaping stage as a public `PreProcessor`
   struct in `encoder::PreProcessor` (re-exported as

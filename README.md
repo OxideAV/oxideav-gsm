@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.3 pre-processing | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. LPC analysis (§5.2.4..§5.2.7), short-term analysis filter (§5.2.10), LTP (§5.2.11..§5.2.14), RPE selection + APCM (§5.2.15..§5.2.17), and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.6 pre-processing + LPC analysis front-end | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), and §5.2.6 reflection → Log-Area Ratio transform — all stateless per-frame helpers exposed as `autocorrelation`, `reflection_coefficients`, `reflection_to_lar`, and the end-to-end `analyse_frame`. §5.2.7 LAR quantisation, §5.2.10 short-term analysis filter, §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -59,12 +59,47 @@ PCM input samples `sop[0..159]` (§5.2.0 format
 `PreProcessor::process_frame` runs §5.2.1 → §5.2.2 → §5.2.3 end-
 to-end for callers who only want the pre-processing output.
 
-The §5.2.4 (autocorrelation), §5.2.5 (Schur recursion), §5.2.6
-(reflection→LAR), §5.2.7 (LAR quantisation), §5.2.10 (short-term
-analysis filter), §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17
-(weighting filter + RPE selection + APCM quantisation) stages, and
-the §1.7 frame packer arrive in later rounds. Until they land,
-`make_encoder` still returns `Unsupported`.
+## Encoder LPC analysis (§5.2.4..§5.2.6)
+
+The LPC analysis front-end is implemented under the public
+[`analysis`] sub-module of `src/encoder.rs`. It consumes the
+[`PreProcessor`] output `s[0..159]` and emits the per-frame
+`LAR[1..=8]` array the §5.2.7 quantiser will consume:
+
+* **§5.2.4 `autocorrelation`** — Compute the dynamic-scaled
+  inner product `L_ACF[0..=8] = Σ s[i] * s[i-k]` for `k = 0..=8`.
+  The dynamic scaling computes `scalauto = sub(4, norm(smax << 16))`
+  for the frame's max-magnitude `smax`, then applies
+  `s[k] = mult_r(s[k], 16384 >> (scalauto-1))` whenever
+  `scalauto > 0` to keep the accumulator from overflowing.
+* **§5.2.5 `reflection_coefficients`** — Schur recursion driving
+  `r[i] = div(|P[1]|, P[0])` (Q15) with sign restored from
+  `P[1]`, plus the spec's early-exit branch when `P[0] < |P[1]|`
+  zeroes the remaining `r[i]`. Includes the `L_ACF[0] == 0`
+  short-circuit (all reflection coefficients zero).
+* **§5.2.6 `reflection_to_lar`** — Piecewise map of `|r[i]|`
+  into `LAR[i]`:
+  - `|r| < 22118` → `LAR = |r| >> 1`
+  - `22118 ≤ |r| < 31130` → `LAR = |r| - 11059`
+  - `|r| ≥ 31130` → `LAR = (|r| - 26112) << 2`
+
+  with the sign of `r[i]` restored at the end. This is the inverse
+  of the decoder's §5.2.9.2 LARp → rp lookup; the segment-2/3
+  breakpoint matches the decoder's `temp < 20070` boundary
+  (20070 = 31129 - 11059, the encoder's segment-2/3 transition
+  value).
+
+`analyse_frame` runs §5.2.4 → §5.2.5 → §5.2.6 end-to-end. All
+three helpers are stateless — the only cross-frame state in the
+§5.2 encoder so far lives in [`PreProcessor`] (§5.2.2/§5.2.3) and
+in the §5.2.10 short-term analysis filter (§4.5 `u[0..=7]`), which
+arrives in a later round.
+
+The §5.2.7 (LAR quantisation), §5.2.10 (short-term analysis
+filter), §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17
+(weighting filter + RPE selection + APCM quantisation) stages,
+and the §1.7 frame packer arrive in later rounds. Until they
+land, `make_encoder` still returns `Unsupported`.
 
 ## Codec homing (§4.4)
 

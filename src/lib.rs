@@ -33,9 +33,15 @@
 //!
 //! ## Encoder
 //!
-//! Not yet implemented (the §3.1 + §5.2 encoder is a separate
-//! body of work and arrives in a later round). Calling
-//! [`make_encoder`] returns an `Unsupported` error.
+//! Partial — §5.2.0..§5.2.3 (pre-processing pipeline) and §5.2.4 /
+//! §5.2.5 / §5.2.6 (autocorrelation → Schur → LAR transform) are
+//! available as the public [`PreProcessor`] struct and the
+//! [`analysis`] sub-module respectively. The remaining stages
+//! (§5.2.7 LAR quantisation, §5.2.10 short-term analysis filter,
+//! §5.2.11..§5.2.18 LTP analysis + RPE selection + APCM
+//! quantisation, §1.7 frame packing) arrive in later rounds.
+//! Calling [`make_encoder`] still returns an `Unsupported` error
+//! while those stages land.
 //!
 //! ## Carriage format
 //!
@@ -65,7 +71,7 @@ pub use codec::{make_decoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
-pub use encoder::PreProcessor;
+pub use encoder::{analysis, PreProcessor};
 pub use error::Error;
 
 use oxideav_core::{CodecParameters, Encoder, Result, RuntimeContext};
