@@ -34,11 +34,11 @@
 //! ## Encoder
 //!
 //! Partial — §5.2.0..§5.2.3 (pre-processing pipeline) and §5.2.4 /
-//! §5.2.5 / §5.2.6 (autocorrelation → Schur → LAR transform) are
-//! available as the public [`PreProcessor`] struct and the
-//! [`analysis`] sub-module respectively. The remaining stages
-//! (§5.2.7 LAR quantisation, §5.2.10 short-term analysis filter,
-//! §5.2.11..§5.2.18 LTP analysis + RPE selection + APCM
+//! §5.2.5 / §5.2.6 / §5.2.7 (autocorrelation → Schur → LAR
+//! transform → LAR quantisation + coding) are available as the
+//! public [`PreProcessor`] struct and the [`analysis`] sub-module
+//! respectively. The remaining stages (§5.2.10 short-term analysis
+//! filter, §5.2.11..§5.2.18 LTP analysis + RPE selection + APCM
 //! quantisation, §1.7 frame packing) arrive in later rounds.
 //! Calling [`make_encoder`] still returns an `Unsupported` error
 //! while those stages land.

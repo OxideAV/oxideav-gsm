@@ -8,18 +8,18 @@
 //!   pre-emphasis). That sub-pipeline maps a frame of 160 raw PCM
 //!   input samples `sop[0..159]` to the `s[0..159]` array that the
 //!   LPC-analysis clause (§5.2.4 onwards) consumes.
-//! * The **LPC-analysis front-end** — §5.2.4 (autocorrelation with
-//!   the spec's dynamic input scaling), §5.2.5 (Schur recursion that
-//!   produces the eight reflection coefficients `r[1..8]`), and
-//!   §5.2.6 (reflection → Log-Area Ratio transform). These three
-//!   stages are stateless per-frame helpers exposed as free functions
-//!   under the [`analysis`] sub-module.
+//! * The **LPC-analysis front-end + LAR quantiser** — §5.2.4
+//!   (autocorrelation with the spec's dynamic input scaling), §5.2.5
+//!   (Schur recursion that produces the eight reflection coefficients
+//!   `r[1..8]`), §5.2.6 (reflection → Log-Area Ratio transform), and
+//!   §5.2.7 (LAR quantisation + coding into the `LARc[1..8]`
+//!   codewords). These four stages are stateless per-frame helpers
+//!   exposed as free functions under the [`analysis`] sub-module.
 //!
-//! Subsequent encoder stages (§5.2.7 LAR quantisation, §5.2.8 LAR
-//! decode + §5.2.9.1/§5.2.9.2 interpolation on the analysis side,
-//! §5.2.10 short-term analysis filter, §5.2.11..§5.2.18 LTP analysis,
-//! RPE selection + APCM quantisation, then §1.7 frame packing) arrive
-//! in later rounds.
+//! Subsequent encoder stages (§5.2.8 LAR decode + §5.2.9.1/§5.2.9.2
+//! interpolation on the analysis side, §5.2.10 short-term analysis
+//! filter, §5.2.11..§5.2.18 LTP analysis, RPE selection + APCM
+//! quantisation, then §1.7 frame packing) arrive in later rounds.
 //!
 //! Until the rest of the encoder lands, the
 //! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
@@ -527,7 +527,8 @@ mod tests {
 #[allow(clippy::needless_range_loop)]
 pub mod analysis {
     use super::FRAME_SAMPLES;
-    use crate::arith::{abs, add, div, l_add, l_mult, mult_r, norm, sub};
+    use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, sub};
+    use crate::tables::{A, B, MAC, MIC};
 
     /// §5.2.4 — autocorrelation with dynamic input scaling.
     ///
@@ -813,6 +814,81 @@ pub mod analysis {
         let l_acf = autocorrelation(s);
         let r = reflection_coefficients(&l_acf);
         reflection_to_lar(&r)
+    }
+
+    /// §5.2.7 — quantise + code the Log-Area Ratios `LAR[1..=8]` into
+    /// the coded `LARc[1..=8]` array that gets packed into the §1.7
+    /// frame.
+    ///
+    /// §5.2.7 pseudocode:
+    /// ```text
+    /// FOR i = 1 to 8:
+    ///     temp = mult(A[i], LAR[i]);
+    ///     temp = add(temp, B[i]);
+    ///     temp = add(temp, 256);          /* for rounding */
+    ///     LARc[i] = temp >> 9;
+    ///
+    ///     /* Check IF LARc[i] lies between MIN and MAX */
+    ///     IF (LARc[i] > MAC[i]) THEN LARc[i] = MAC[i];
+    ///     IF (LARc[i] < MIC[i]) THEN LARc[i] = MIC[i];
+    ///
+    ///     LARc[i] = sub(LARc[i], MIC[i]); /* make LARc[i] positive */
+    /// NEXT i:
+    /// ```
+    ///
+    /// `A[i]` is staged as `integer(real_A[i] * 1024)` (§5.4 Table 5.1
+    /// column A) and `B[i]` as `integer(real_B[i] * 512)` (column B);
+    /// `mult(A[i], LAR[i])` ≈ `real_A * LAR / 32` (Q15 mult on a Q10
+    /// scaled `A`), `+ B` adds the column-B bias at the same Q9 scale,
+    /// `+ 256` is the Q9 half-step rounding constant, and the trailing
+    /// `>> 9` lands the result in the integer `LARc` codeword domain.
+    /// `MIC[i]` and `MAC[i]` (Table 5.1 columns MIC / MAC) bound the
+    /// codeword to the per-segment width specified by Table 1.1, and
+    /// the final `sub(_, MIC[i])` shifts the signed codeword into the
+    /// unsigned 0..(MAC-MIC) range that the §1.7 bit packer emits.
+    ///
+    /// Symmetry / inverse — this is the encoder partner of the
+    /// decoder's §5.2.8 `decode_lar` (see `src/decoder.rs`); the
+    /// composition `quantise_lar` ∘ `decode_lar` is a quantisation
+    /// round trip and, modulo the inherent quantiser step, the
+    /// composition `decode_lar(quantise_lar(LAR))` returns a value
+    /// close to the input `LAR`.
+    ///
+    /// The `LAR` input is the §5.2.6 output (`reflection_to_lar`).
+    /// Index 0 is reserved (zero); only `LAR[1..=8]` participate.
+    pub fn quantise_lar(lar: &[i16; 9]) -> [i16; 9] {
+        let mut lar_c = [0i16; 9];
+        for i in 1..=8 {
+            // §5.2.7: `temp = mult(A[i], LAR[i]); temp = add(temp, B[i]);
+            //          temp = add(temp, 256); LARc[i] = temp >> 9;`
+            let mut temp = mult(A[i], lar[i]);
+            temp = add(temp, B[i]);
+            temp = add(temp, 256);
+            // §5.1: `>> 9` is the 16-bit arithmetic right shift.
+            let mut code = temp >> 9;
+
+            // §5.2.7 bounds check against Table 5.1 MIN / MAX.
+            if code > MAC[i] {
+                code = MAC[i];
+            }
+            if code < MIC[i] {
+                code = MIC[i];
+            }
+
+            // §5.2.7 NOTE — "The equation is used to make all the
+            // LARc[i] positive." Shift the signed codeword into the
+            // unsigned 0..(MAC-MIC) range the §1.7 bit packer emits.
+            lar_c[i] = sub(code, MIC[i]);
+        }
+        lar_c
+    }
+
+    /// Convenience wrapper: run §5.2.4 + §5.2.5 + §5.2.6 + §5.2.7
+    /// end-to-end on a pre-processed frame `s[0..159]` and return the
+    /// per-frame `LARc[1..=8]` codewords. Index 0 is a sentinel zero.
+    pub fn analyse_and_quantise_frame(s: &[i16; FRAME_SAMPLES]) -> [i16; 9] {
+        let lar = analyse_frame(s);
+        quantise_lar(&lar)
     }
 
     #[cfg(test)]
@@ -1137,6 +1213,231 @@ pub mod analysis {
                 l1 < 1000,
                 "LAR L1 distance under sign flip too large: a={a:?} b={b:?} l1={l1}"
             );
+        }
+
+        // ─── §5.2.7 LAR quantisation ───
+
+        /// `LAR = 0` ⇒ `LARc[i] = sub((B[i]+256) >> 9, MIC[i])`,
+        /// the per-segment "centre" code. Spell out the eight values
+        /// explicitly so the encode-side scaling is pinned to Table 5.1
+        /// columns A / B / MIC / MAC.
+        ///
+        /// Hand-derivation per the §5.2.7 pseudocode:
+        /// * i=1: B=0, MIC=-32 → (0+256)>>9 = 0 → sub(0,-32) = 32.
+        /// * i=2: B=0, MIC=-32 → 32 (same as i=1).
+        /// * i=3: B=2048, MIC=-16 → (2048+256)>>9 = 4 → sub(4,-16) = 20.
+        /// * i=4: B=-2560, MIC=-16 → (-2560+256)>>9 = -2304>>9 = -5 →
+        ///   sub(-5,-16) = 11.
+        /// * i=5: B=94, MIC=-8 → (94+256)>>9 = 0 → sub(0,-8) = 8.
+        /// * i=6: B=-1792, MIC=-8 → (-1792+256)>>9 = -1536>>9 = -3 →
+        ///   sub(-3,-8) = 5.
+        /// * i=7: B=-341, MIC=-4 → (-341+256)>>9 = -85>>9 = -1 →
+        ///   sub(-1,-4) = 3.
+        /// * i=8: B=-1144, MIC=-4 → (-1144+256)>>9 = -888>>9 = -2 →
+        ///   sub(-2,-4) = 2.
+        #[test]
+        fn quantise_lar_zero_input_gives_per_index_centre() {
+            let lar = [0i16; 9];
+            let lar_c = quantise_lar(&lar);
+            assert_eq!(lar_c, [0, 32, 32, 20, 11, 8, 5, 3, 2]);
+        }
+
+        /// §5.2.7 saturates the codeword at `MAC[i]` for any LAR large
+        /// enough to overshoot the upper bound; after the `sub(_, MIC)`
+        /// final step the codeword is `MAC[i] - MIC[i]`. For i=1
+        /// (MIC=-32, MAC=31) that's 63 — the largest 6-bit codeword
+        /// the §1.7 frame packer holds.
+        #[test]
+        fn quantise_lar_saturates_at_mac_minus_mic() {
+            let mut lar = [0i16; 9];
+            // i16::MAX-class LAR — the encode arithmetic for any of
+            // the eight indices will overshoot MAC.
+            for slot in lar.iter_mut().skip(1) {
+                *slot = i16::MAX;
+            }
+            let lar_c = quantise_lar(&lar);
+            // For every index i, the saturated codeword is MAC-MIC.
+            let expected = [0, 63, 63, 31, 31, 15, 15, 7, 7];
+            assert_eq!(lar_c, expected);
+        }
+
+        /// §5.2.7 saturates the codeword at `MIC[i]` for any LAR large
+        /// enough to undershoot the lower bound; after the
+        /// `sub(_, MIC)` final step the codeword is `MIC[i] - MIC[i]`
+        /// = 0 (the smallest unsigned codeword).
+        #[test]
+        fn quantise_lar_saturates_at_mic_to_zero_codeword() {
+            let mut lar = [0i16; 9];
+            for slot in lar.iter_mut().skip(1) {
+                *slot = i16::MIN;
+            }
+            let lar_c = quantise_lar(&lar);
+            // Every index's codeword is 0 (= MIC - MIC).
+            assert_eq!(lar_c, [0; 9]);
+        }
+
+        /// §5.2.7 LARc width matches Table 1.1: the six §1.7 LAR
+        /// fields are 6, 6, 5, 5, 4, 4, 3, 3 bits respectively.
+        /// After the `sub(_, MIC)` shift every LARc fits in its bit
+        /// budget — i.e. `LARc[i] <= MAC[i] - MIC[i]` and
+        /// `MAC-MIC+1` is a power of two equal to `2^bits`.
+        #[test]
+        fn quantise_lar_fits_table_1_1_bit_widths() {
+            // Choose a varied LAR vector that exercises both branches
+            // of the MIN/MAX bound check.
+            let lar = [0i16, 5000, -5000, 8000, -8000, 1500, -1500, 800, -800];
+            let lar_c = quantise_lar(&lar);
+            // Table 1.1 bit widths for LARc[1..=8].
+            let widths = [0u32, 6, 6, 5, 5, 4, 4, 3, 3];
+            for i in 1..=8 {
+                let cap = (1i16 << widths[i]) - 1;
+                assert!(lar_c[i] >= 0, "LARc[{i}] must be unsigned");
+                assert!(
+                    lar_c[i] <= cap,
+                    "LARc[{i}] = {} exceeds {}-bit cap {}",
+                    lar_c[i],
+                    widths[i],
+                    cap
+                );
+            }
+        }
+
+        /// §5.2.7 / §5.2.8 round-trip on the all-zero LAR: the codeword
+        /// from `quantise_lar(LAR=0)` decodes back to LAR ≈ 0. The
+        /// decoder isn't part of this module so we hand-verify the
+        /// outcome: with LARc set to the per-index centre (above) and
+        /// MIC restored, `temp1 = add(LARc, MIC) << 10 = 0`; then
+        /// `temp2 = B[i] << 1`; then `temp1 = sub(temp1, temp2) =
+        /// -B[i] << 1`; then `temp1 = mult_r(INVA[i], temp1)`; then
+        /// `LARpp[i] = 2*temp1`. For the indices where `B[i] = 0`
+        /// (i=1,2) the result is exactly 0; for the rest, the result
+        /// is bounded by the per-segment quantiser step. Verify the
+        /// i=1,2 exact-zero half here; the bounded-error half is
+        /// covered by `quantise_then_decode_round_trip` below.
+        #[test]
+        fn quantise_lar_zero_input_round_trips_exact_for_b_zero_indices() {
+            let lar = [0i16; 9];
+            let lar_c = quantise_lar(&lar);
+            // i=1, i=2 have B=0 so decode_lar maps them back to 0
+            // exactly: the per-index centre code is exactly the value
+            // that cancels MIC in the decoder's `add(LARc, MIC)`.
+            assert_eq!(lar_c[1] as i32 + MIC[1] as i32, 0);
+            assert_eq!(lar_c[2] as i32 + MIC[2] as i32, 0);
+        }
+
+        /// End-to-end §5.2.7 + §5.2.8 quantiser round trip: encode a
+        /// LAR vector with `quantise_lar`, decode the resulting LARc
+        /// back through the §5.2.8 decode_lar inverse, and confirm the
+        /// recovered LAR is within ~one quantiser step of the input.
+        ///
+        /// One encoder codeword increment corresponds to a LAR delta
+        /// of `(1 << 9) * (1 << 15) / A[i] = 2^24 / A[i]` — the
+        /// effective inverse of `mult(A[i], LAR) >> 9`. With Table 5.1
+        /// `A[i]` values in `[8534, 20480]` the per-index step lies in
+        /// `[~819, ~1966]` LAR units, so the round-trip error for any
+        /// in-range LAR is bounded by one such step. We bound at 2000
+        /// (the largest per-index step + a small slack for the
+        /// asymmetric round-half-up vs floor mismatch between encoder
+        /// `>> 9` and decoder `mult_r`).
+        #[test]
+        fn quantise_then_decode_round_trip_within_one_step() {
+            use crate::tables::INVA;
+
+            // A LAR vector that stays within the quantiser's
+            // representable range for every i.
+            let lar = [0i16, 4000, -3000, 2500, -1200, 800, -400, 250, -100];
+            let lar_c = quantise_lar(&lar);
+
+            // Open-coded §5.2.8 (decode_lar lives in the sibling
+            // `decoder` module; per-crate visibility means we
+            // re-inline it here rather than expand the public surface
+            // for the test).
+            let mut lar_pp = [0i16; 9];
+            for i in 1..=8 {
+                let mut t1 = add(lar_c[i], MIC[i]) << 10;
+                let t2 = B[i] << 1;
+                t1 = sub(t1, t2);
+                t1 = mult_r(INVA[i], t1);
+                lar_pp[i] = add(t1, t1);
+            }
+            // Per-index round-trip error bound — one quantiser step
+            // at i=7 (worst case ≈ 1966 LAR units) + slack.
+            for i in 1..=8 {
+                let err = (lar[i] as i32 - lar_pp[i] as i32).abs();
+                assert!(
+                    err <= 2000,
+                    "LAR round-trip error too large at i={i}: in={} out={} err={err}",
+                    lar[i],
+                    lar_pp[i]
+                );
+            }
+        }
+
+        /// §5.2.7 is monotonic per index — larger LAR ⇒ larger (or
+        /// equal, when saturated) codeword. Verify on a sweep of LAR
+        /// values for i=1.
+        #[test]
+        fn quantise_lar_is_monotonic_per_index() {
+            let mut prev_code: i16 = i16::MIN;
+            for v in (-30000i16..=30000).step_by(500) {
+                let mut lar = [0i16; 9];
+                lar[1] = v;
+                let lar_c = quantise_lar(&lar);
+                assert!(
+                    lar_c[1] >= prev_code,
+                    "non-monotone at LAR[1]={v}: code={} prev={prev_code}",
+                    lar_c[1]
+                );
+                prev_code = lar_c[1];
+            }
+        }
+
+        /// §5.2.7 invariant: index 0 is reserved and always emits 0.
+        #[test]
+        fn quantise_lar_index_zero_is_sentinel() {
+            let mut lar = [0i16; 9];
+            lar[0] = 12345; // any value — the encoder ignores i=0.
+            let lar_c = quantise_lar(&lar);
+            assert_eq!(lar_c[0], 0);
+        }
+
+        /// `analyse_and_quantise_frame` on an all-zero input returns
+        /// the per-index centre codewords (= `quantise_lar([0; 9])`).
+        #[test]
+        fn analyse_and_quantise_frame_zero_input() {
+            let s = [0i16; FRAME_SAMPLES];
+            let lar_c = analyse_and_quantise_frame(&s);
+            assert_eq!(lar_c, [0, 32, 32, 20, 11, 8, 5, 3, 2]);
+        }
+
+        /// `analyse_and_quantise_frame` is deterministic — every
+        /// component on the chain (§5.2.4 / §5.2.5 / §5.2.6 / §5.2.7)
+        /// is stateless per frame.
+        #[test]
+        fn analyse_and_quantise_frame_is_deterministic() {
+            let mut s = [0i16; FRAME_SAMPLES];
+            for (k, slot) in s.iter_mut().enumerate() {
+                *slot = ((k as i16) * 47) ^ 0x4D;
+            }
+            let a = analyse_and_quantise_frame(&s);
+            let b = analyse_and_quantise_frame(&s);
+            assert_eq!(a, b);
+        }
+
+        /// `analyse_and_quantise_frame` post-condition: every LARc
+        /// fits its Table 1.1 bit budget regardless of input.
+        #[test]
+        fn analyse_and_quantise_frame_lar_c_in_range() {
+            let mut s = [0i16; FRAME_SAMPLES];
+            for (k, slot) in s.iter_mut().enumerate() {
+                *slot = ((k as i16) * 59) ^ 0x6E;
+            }
+            let lar_c = analyse_and_quantise_frame(&s);
+            let widths = [0u32, 6, 6, 5, 5, 4, 4, 3, 3];
+            for i in 1..=8 {
+                let cap = (1i16 << widths[i]) - 1;
+                assert!((0..=cap).contains(&lar_c[i]));
+            }
         }
 
         // Silence unused-import warning when this private inner

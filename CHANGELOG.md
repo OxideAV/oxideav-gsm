@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.7 encoder LAR quantisation + coding (2026-06-03).** Adds the
+  `analysis::quantise_lar` free function to the existing
+  `encoder::analysis` sub-module, plus the end-to-end
+  `analysis::analyse_and_quantise_frame` convenience wrapper:
+  - `quantise_lar(LAR[1..=8]) -> LARc[1..=8]` runs the four-step
+    §5.2.7 pseudocode: `temp = mult(A[i], LAR[i]); temp = add(temp,
+    B[i]); temp = add(temp, 256); LARc[i] = temp >> 9;` followed by
+    the §5.2.7 `MAC[i]` / `MIC[i]` bounds check and the final
+    `sub(LARc[i], MIC[i])` that lifts the signed codeword into the
+    unsigned 0..(MAC-MIC) range the §1.7 bit packer emits.
+  - Backed by §5.4 Table 5.1 columns A / B / MIC / MAC which were
+    already staged in `tables.rs` for the §5.2.8 decoder partner.
+  - `analyse_and_quantise_frame(s)` runs §5.2.4 → §5.2.5 → §5.2.6 →
+    §5.2.7 end-to-end on a pre-processed frame, giving the §1.7
+    frame packer the `LARc[1..=8]` codeword array.
+  Ten unit tests cover the per-index "centre" code for LAR=0 (one
+  arithmetic value pinned per i), upper / lower saturation (the
+  encoder lands on `MAC[i]-MIC[i]` and 0 respectively), Table 1.1
+  bit-width compliance (every codeword fits its 3/4/5/6-bit field),
+  the §5.2.7 / §5.2.8 round-trip bound (decode of a quantised LAR
+  recovers a value within one quantiser step), per-index monotonicity,
+  the sentinel-zero invariant at index 0, and the end-to-end
+  determinism + range invariants on `analyse_and_quantise_frame`.
+  `make_encoder` still returns `Unsupported` — §5.2.10 short-term
+  analysis filter + §5.2.11..§5.2.18 LTP / RPE / APCM + §1.7 frame
+  packer arrive in later rounds.
+
 - **§5.2.4..§5.2.6 encoder LPC-analysis front-end (2026-06-03).**
   Adds the autocorrelation → Schur → LAR transform stages as the
   public `encoder::analysis` sub-module (re-exported as

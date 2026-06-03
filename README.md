@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.6 pre-processing + LPC analysis front-end | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), and §5.2.6 reflection → Log-Area Ratio transform — all stateless per-frame helpers exposed as `autocorrelation`, `reflection_coefficients`, `reflection_to_lar`, and the end-to-end `analyse_frame`. §5.2.7 LAR quantisation, §5.2.10 short-term analysis filter, §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.7 pre-processing + LPC analysis + LAR quantisation | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, and §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes). All four stages are stateless per-frame helpers exposed as `autocorrelation`, `reflection_coefficients`, `reflection_to_lar`, `quantise_lar`, plus the end-to-end `analyse_frame` (returns `LAR[1..=8]`) and `analyse_and_quantise_frame` (returns `LARc[1..=8]`). §5.2.10 short-term analysis filter, §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -59,12 +59,13 @@ PCM input samples `sop[0..159]` (§5.2.0 format
 `PreProcessor::process_frame` runs §5.2.1 → §5.2.2 → §5.2.3 end-
 to-end for callers who only want the pre-processing output.
 
-## Encoder LPC analysis (§5.2.4..§5.2.6)
+## Encoder LPC analysis + LAR quantisation (§5.2.4..§5.2.7)
 
 The LPC analysis front-end is implemented under the public
 [`analysis`] sub-module of `src/encoder.rs`. It consumes the
 [`PreProcessor`] output `s[0..159]` and emits the per-frame
-`LAR[1..=8]` array the §5.2.7 quantiser will consume:
+`LAR[1..=8]` array, then optionally runs the §5.2.7 quantiser to
+emit the `LARc[1..=8]` codewords the §1.7 bit packer consumes:
 
 * **§5.2.4 `autocorrelation`** — Compute the dynamic-scaled
   inner product `L_ACF[0..=8] = Σ s[i] * s[i-k]` for `k = 0..=8`.
@@ -88,18 +89,34 @@ The LPC analysis front-end is implemented under the public
   breakpoint matches the decoder's `temp < 20070` boundary
   (20070 = 31129 - 11059, the encoder's segment-2/3 transition
   value).
+* **§5.2.7 `quantise_lar`** — Scale, bias, round, bound, and shift
+  the eight `LAR[i]` values into the `LARc[i]` codewords the §1.7
+  bit packer emits:
+  - `temp = mult(A[i], LAR[i])` — Q15 product against Table 5.1
+    column A (`real_A[i] * 1024`).
+  - `temp = add(temp, B[i])` — bias from Table 5.1 column B
+    (`real_B[i] * 512`).
+  - `temp = add(temp, 256); LARc[i] = temp >> 9` — Q9 round-half-up
+    landing the signed code value.
+  - Clamp to `[MIC[i], MAC[i]]` per Table 5.1, then
+    `sub(LARc[i], MIC[i])` shifts the bound code into the unsigned
+    0..(MAC-MIC) range the §1.7 bit packer holds. This is the
+    inverse of the decoder's §5.2.8 `decode_lar` (driven by Table
+    5.2 INVA).
 
-`analyse_frame` runs §5.2.4 → §5.2.5 → §5.2.6 end-to-end. All
-three helpers are stateless — the only cross-frame state in the
-§5.2 encoder so far lives in [`PreProcessor`] (§5.2.2/§5.2.3) and
-in the §5.2.10 short-term analysis filter (§4.5 `u[0..=7]`), which
-arrives in a later round.
+`analyse_frame` runs §5.2.4 → §5.2.5 → §5.2.6 end-to-end and
+returns `LAR[1..=8]`; `analyse_and_quantise_frame` extends the
+chain through §5.2.7 and returns `LARc[1..=8]`. All four helpers
+are stateless — the only cross-frame state in the §5.2 encoder so
+far lives in [`PreProcessor`] (§5.2.2/§5.2.3) and in the §5.2.10
+short-term analysis filter (§4.5 `u[0..=7]`), which arrives in a
+later round.
 
-The §5.2.7 (LAR quantisation), §5.2.10 (short-term analysis
-filter), §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17
-(weighting filter + RPE selection + APCM quantisation) stages,
-and the §1.7 frame packer arrive in later rounds. Until they
-land, `make_encoder` still returns `Unsupported`.
+The §5.2.10 (short-term analysis filter), §5.2.11..§5.2.14 (LTP
+analysis), §5.2.15..§5.2.17 (weighting filter + RPE selection +
+APCM quantisation) stages, and the §1.7 frame packer arrive in
+later rounds. Until they land, `make_encoder` still returns
+`Unsupported`.
 
 ## Codec homing (§4.4)
 
