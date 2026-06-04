@@ -543,7 +543,36 @@ pub mod analysis {
     use super::FRAME_SAMPLES;
     use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, sub};
     use crate::decoder::{decode_lar, interpolate_lar, larp_to_rp};
-    use crate::tables::{A, B, MAC, MIC};
+    use crate::tables::{A, B, DLB, MAC, MIC, QLB};
+
+    /// Number of samples in one sub-segment (§5.2.11 input range
+    /// `d[0..39]` / §5.2.12 output range `e[0..39]`).
+    pub const SUBFRAME_SAMPLES: usize = 40;
+
+    /// Number of sub-segments per 160-sample frame (§5.2.11 is run
+    /// once per sub-segment).
+    pub const SUBFRAMES_PER_FRAME: usize = 4;
+
+    /// Length of the §4.5 `dp[-120..=-1]` LTP delay line.
+    pub const LTP_DELAY: usize = 120;
+
+    /// Per-sub-segment LTP parameters produced by §5.2.11.
+    ///
+    /// `n_c` is the §5.2.11 LTP lag in the range \[40, 120\] (7-bit
+    /// codeword the §1.7 packer emits as `Nc`). `b_c` is the §5.2.11
+    /// coded LTP gain in the range \[0, 3\] (2-bit codeword `bc`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LtpParameters {
+        /// §5.2.11 LTP lag — the lambda that maximises the
+        /// cross-correlation. Spec range 40..=120. When `L_max` is
+        /// non-positive the spec exits the procedure early without
+        /// updating `Nc`; this field then carries the entry-time
+        /// `Nc = 40` initialisation per §5.2.11.
+        pub n_c: i16,
+        /// §5.2.11 coded LTP gain — index into [`QLB`] / [`DLB`].
+        /// Spec range 0..=3.
+        pub b_c: i16,
+    }
 
     /// §5.2.4 — autocorrelation with dynamic input scaling.
     ///
@@ -1063,6 +1092,405 @@ pub mod analysis {
             self.lar_pp_prev = lar_pp_curr;
 
             (lar_c, d_frame)
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // §5.2.11 / §5.2.12 — Long-Term Prediction (LTP) clause
+    // ──────────────────────────────────────────────────────────────────
+
+    /// §5.2.11 — compute the LTP parameters `(Nc, bc)` for one
+    /// 40-sample sub-segment.
+    ///
+    /// `d` is the §5.2.10 short-term residual `d[0..=39]` for this
+    /// sub-segment; `dp_hist` is the §4.5 LTP delay line
+    /// `dp[-120..=-1]` with `dp_hist[0]` = `dp[-1]` (the most-recent
+    /// past sample) and `dp_hist[119]` = `dp[-120]` (the oldest).
+    /// This matches the decoder's `drp_hist` layout and the spec's
+    /// `dp[k - lambda]` indexing (positive `lambda` reaches back into
+    /// history).
+    ///
+    /// Returns the [`LtpParameters`] `(Nc, bc)`. The procedure does
+    /// **not** consume the calling state or modify `dp_hist`; the §4.5
+    /// across-sub-segment dp-update happens later via §5.2.18 once the
+    /// RPE pulses for this sub-segment have been generated.
+    ///
+    /// §5.2.11 pseudocode (verbatim):
+    /// ```text
+    /// Search of the optimum scaling of d[0..39].
+    /// dmax = 0;
+    /// FOR k = 0 to 39:
+    ///     temp = abs( d[k] );
+    ///     IF (temp > dmax) THEN dmax = temp;
+    /// NEXT k:
+    /// temp = 0;
+    /// IF (dmax == 0) THEN scal = 0;
+    ///   ELSE temp = norm( dmax << 16 );
+    /// IF (temp > 6) THEN scal = 0;
+    ///   ELSE scal = sub(6, temp);
+    ///
+    /// Initialization of a working array wt[0..39].
+    /// FOR k = 0 to 39: wt[k] = d[k] >> scal; NEXT k:
+    ///
+    /// Search for the maximum cross-correlation and coding of the LTP lag.
+    /// L_max = 0;
+    /// Nc = 40;
+    /// FOR lambda = 40 to 120:
+    ///     L_result = 0;
+    ///     FOR k = 0 to 39:
+    ///         L_temp   = L_mult( wt[k], dp[k-lambda] );
+    ///         L_result = L_add ( L_temp, L_result );
+    ///     NEXT k:
+    ///     IF ( L_result > L_max ) THEN
+    ///         Nc    = lambda;
+    ///         L_max = L_result;
+    /// NEXT lambda:
+    ///
+    /// Rescaling of L_max.  L_max = L_max >> ( sub(6, scal) );
+    ///
+    /// Initialization of a working array wt[0..39].
+    /// FOR k = 0 to 39: wt[k] = dp[k-Nc] >> 3; NEXT k:
+    ///
+    /// Compute the power of the reconstructed short term residual dp[..].
+    /// L_power = 0;
+    /// FOR k = 0 to 39:
+    ///     L_temp  = L_mult( wt[k], wt[k] );
+    ///     L_power = L_add ( L_temp, L_power );
+    /// NEXT k:
+    ///
+    /// Normalization of L_max and L_power.
+    /// IF ( L_max <= 0 ) THEN bc = 0; EXIT;
+    /// IF ( L_max >= L_power ) THEN bc = 3; EXIT;
+    /// temp = norm( L_power );
+    /// R    = ( L_max   << temp ) >> 16;
+    /// S    = ( L_power << temp ) >> 16;
+    ///
+    /// Coding of the LTP gain.  Table 5.3a yields DLB[i].
+    /// FOR bc = 0 to 2:
+    ///     IF ( R <= mult(S, DLB[bc]) ) THEN EXIT;
+    /// NEXT bc:
+    /// bc = 3;
+    /// ```
+    pub fn ltp_parameters(
+        d: &[i16; SUBFRAME_SAMPLES],
+        dp_hist: &[i16; LTP_DELAY],
+    ) -> LtpParameters {
+        // §5.2.11 — dmax = max |d[k]|.
+        let mut dmax: i16 = 0;
+        for &v in d.iter() {
+            let t = abs(v);
+            if t > dmax {
+                dmax = t;
+            }
+        }
+
+        // §5.2.11 — derive `scal`.
+        //
+        //   IF (dmax == 0) THEN scal = 0;
+        //   ELSE temp = norm(dmax << 16);
+        //   IF (temp > 6) THEN scal = 0;
+        //   ELSE scal = sub(6, temp);
+        //
+        // `dmax << 16` is a 32-bit left shift: dmax is in [0, 32767]
+        // so dmax<<16 is in [0, 0x7FFF_0000] and never overflows i32.
+        let scal: i16 = if dmax == 0 {
+            0
+        } else {
+            let t = norm((dmax as i32) << 16);
+            if t > 6 {
+                0
+            } else {
+                sub(6, t)
+            }
+        };
+
+        // §5.2.11 — wt[k] = d[k] >> scal (sign-extending right shift).
+        let mut wt = [0i16; SUBFRAME_SAMPLES];
+        let scal_u = scal as u32;
+        for (slot, &v) in wt.iter_mut().zip(d.iter()) {
+            *slot = v >> scal_u;
+        }
+
+        // §5.2.11 — main cross-correlation search.
+        //
+        // The spec's `dp[k - lambda]` reaches into the §4.5 history
+        // for lambda in [40, 120] and k in [0, 39]: k - lambda lies
+        // in [-120, -1] — entirely inside `dp_hist`. We index with
+        // `dp_hist[lambda - k - 1]` (so lambda=40, k=39 ⇒ dp[-1]
+        // = dp_hist[0]; lambda=120, k=0 ⇒ dp[-120] = dp_hist[119]).
+        let mut l_max: i32 = 0;
+        let mut n_c: i16 = 40;
+        for lambda in 40i16..=120 {
+            let mut l_result: i32 = 0;
+            for k in 0..SUBFRAME_SAMPLES {
+                let dp_idx = (lambda as usize) - k - 1; // == lambda - k - 1
+                let l_temp = l_mult(wt[k], dp_hist[dp_idx]);
+                l_result = l_add(l_temp, l_result);
+            }
+            if l_result > l_max {
+                n_c = lambda;
+                l_max = l_result;
+            }
+        }
+
+        // §5.2.11 — Rescaling of L_max. `L_max >>= sub(6, scal)`.
+        //
+        // The §5.1 right-shift operator with negative count becomes
+        // a left shift of the same magnitude (sign-extending fill),
+        // so we need the signed-right-shift semantics. The shift
+        // amount `sub(6, scal)` is in [0, 6] when scal >= 0 and in
+        // [7, 22] when scal is negative (norm > 6 path can't reach
+        // this branch — we just set scal=0 then). With the §5.2.11
+        // `temp > 6 ⇒ scal = 0` clamp, `6 - scal` is in [-15, 6];
+        // negative values become a left shift on L_max.
+        let shift_amt = sub(6, scal);
+        l_max = if shift_amt >= 0 {
+            l_max >> (shift_amt as u32)
+        } else {
+            // §5.1 negative-shift semantics: `>> n` with n<0 becomes
+            // `<< -n` (zero-fill). Use saturating logic via i64 to
+            // bound the value before truncating back to i32.
+            let n = (-shift_amt) as u32 & 31;
+            ((l_max as i64) << n).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        };
+
+        // §5.2.11 — wt[k] = dp[k - Nc] >> 3 over k = 0..=39.
+        for (k, slot) in wt.iter_mut().enumerate() {
+            let dp_idx = (n_c as usize) - k - 1;
+            *slot = dp_hist[dp_idx] >> 3;
+        }
+
+        // §5.2.11 — L_power = Σ L_mult(wt[k], wt[k]).
+        let mut l_power: i32 = 0;
+        for &w in wt.iter() {
+            let l_temp = l_mult(w, w);
+            l_power = l_add(l_temp, l_power);
+        }
+
+        // §5.2.11 — Normalization of L_max / L_power + coding of bc.
+        if l_max <= 0 {
+            return LtpParameters { n_c, b_c: 0 };
+        }
+        if l_max >= l_power {
+            return LtpParameters { n_c, b_c: 3 };
+        }
+
+        // §5.2.11 — `temp = norm(L_power); R = (L_max << temp) >> 16;
+        //            S = (L_power << temp) >> 16;`
+        //
+        // `L_power > L_max > 0` at this branch, so norm(L_power) >= 1
+        // and the spec's `<< temp` cannot overflow (norm guarantees
+        // L_power<<temp stays in i32 range).
+        let temp = norm(l_power) as u32;
+        let r: i16 = ((l_max as u32).wrapping_shl(temp) as i32 >> 16) as i16;
+        let s: i16 = ((l_power as u32).wrapping_shl(temp) as i32 >> 16) as i16;
+
+        // §5.2.11 — coding of the LTP gain via Table 5.3a (DLB[]).
+        //
+        // FOR bc = 0 to 2: IF (R <= mult(S, DLB[bc])) THEN EXIT;
+        // NEXT bc:
+        // bc = 3;
+        let mut b_c: i16 = 3;
+        for bc_try in 0..=2 {
+            if r <= mult(s, DLB[bc_try]) {
+                b_c = bc_try as i16;
+                break;
+            }
+        }
+
+        LtpParameters { n_c, b_c }
+    }
+
+    /// §5.2.12 — long-term analysis filtering.
+    ///
+    /// Decodes the §5.2.11 coded LTP gain `bc` via [`QLB`] and uses it
+    /// together with the LTP lag `Nc` to compute the long-term residual
+    /// `e[0..=39]` for one sub-segment. Also returns the long-term
+    /// prediction estimate `dpp[0..=39]` (the spec's intermediate
+    /// `dpp[k] = mult_r(bp, dp[k - Nc])`), which the caller combines
+    /// with the §5.2.17 reconstructed long-term residual `ep[..]` in
+    /// §5.2.18 to update the §4.5 `dp[-120..=-1]` delay line.
+    ///
+    /// §5.2.12 pseudocode (verbatim):
+    /// ```text
+    /// bp = QLB[bc];
+    /// FOR k = 0 to 39:
+    ///     dpp[k] = mult_r( bp, dp[k - Nc] );
+    ///     e[k]   = sub   ( d[k], dpp[k]   );
+    /// NEXT k:
+    /// ```
+    ///
+    /// Returns `(dpp, e)` over `0..=39`. The dp-history indexing
+    /// matches [`ltp_parameters`].
+    pub fn long_term_analysis_filter(
+        d: &[i16; SUBFRAME_SAMPLES],
+        dp_hist: &[i16; LTP_DELAY],
+        params: LtpParameters,
+    ) -> ([i16; SUBFRAME_SAMPLES], [i16; SUBFRAME_SAMPLES]) {
+        // §5.2.12 — bp = QLB[bc].
+        let bp = QLB[params.b_c as usize];
+
+        let mut dpp = [0i16; SUBFRAME_SAMPLES];
+        let mut e = [0i16; SUBFRAME_SAMPLES];
+        for k in 0..SUBFRAME_SAMPLES {
+            let dp_idx = (params.n_c as usize) - k - 1;
+            dpp[k] = mult_r(bp, dp_hist[dp_idx]);
+            e[k] = sub(d[k], dpp[k]);
+        }
+        (dpp, e)
+    }
+
+    /// Persistent §4.5 / §5.2.11 / §5.2.12 / §5.2.18 LTP state.
+    ///
+    /// Wraps the §4.5 Table 4.2 `dp[-120..=-1]` delay-line entry — the
+    /// reconstructed short-term residual history the long-term
+    /// predictor reaches into.
+    ///
+    /// `dp_hist[0]` holds `dp[-1]` (the most-recent past sample);
+    /// `dp_hist[119]` holds `dp[-120]` (the oldest). This is the same
+    /// layout the decoder's `drp_hist` uses; it matches the §5.2.11
+    /// `dp[k - lambda]` indexing where positive `lambda` reaches back
+    /// into history.
+    ///
+    /// The §5.2.18 `dp[]` update folds in the per-sub-segment
+    /// reconstructed long-term residual `ep[0..=39]` and the long-term
+    /// prediction estimate `dpp[0..=39]` from §5.2.12. Until the
+    /// §5.2.13..§5.2.17 RPE / APCM stages land, the LTP analyser can
+    /// still drive §5.2.11 / §5.2.12 on a caller-provided dp history,
+    /// and [`LtpAnalyzer::update_dp_after_subframe`] lets a caller close
+    /// the loop manually with their own `ep[..]`.
+    #[derive(Debug, Clone)]
+    pub struct LtpAnalyzer {
+        /// §4.5 Table 4.2 `dp[-120..=-1]` — the LTP delay line.
+        /// Home value: all-zero.
+        dp_hist: [i16; LTP_DELAY],
+    }
+
+    impl Default for LtpAnalyzer {
+        fn default() -> Self {
+            Self {
+                dp_hist: [0; LTP_DELAY],
+            }
+        }
+    }
+
+    impl LtpAnalyzer {
+        /// Build a fresh LTP analyser in its §4.5 home state
+        /// (`dp[-120..=-1] = 0`).
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Reset the LTP analyser to its §4.5 home state.
+        pub fn reset(&mut self) {
+            *self = Self::default();
+        }
+
+        /// Inspect the persisted `dp[-120..=-1]` delay line.
+        ///
+        /// `dp_hist()[0]` is `dp[-1]`; `dp_hist()[119]` is `dp[-120]`.
+        pub fn dp_hist(&self) -> &[i16; LTP_DELAY] {
+            &self.dp_hist
+        }
+
+        /// Run §5.2.11 + §5.2.12 on one sub-segment.
+        ///
+        /// Inputs:
+        ///
+        /// * `d[0..=39]` — the §5.2.10 short-term residual for this
+        ///   sub-segment.
+        ///
+        /// Outputs:
+        ///
+        /// * `LtpParameters` — the codewords `(Nc, bc)` the §1.7 packer
+        ///   will emit.
+        /// * `dpp[0..=39]` — the §5.2.12 long-term prediction estimate.
+        /// * `e[0..=39]` — the §5.2.12 long-term residual that
+        ///   §5.2.13 (the weighting filter) consumes.
+        ///
+        /// This routine does **not** apply the §5.2.18 dp-update; the
+        /// update folds in the §5.2.17 reconstructed long-term residual
+        /// `ep[..]` which only becomes available after the
+        /// §5.2.13..§5.2.17 RPE / APCM stages run. Once those stages
+        /// land, the caller (or a follow-up method on this struct) will
+        /// invoke [`Self::update_dp_after_subframe`] with `ep[..]`.
+        pub fn analyse_subframe(
+            &self,
+            d: &[i16; SUBFRAME_SAMPLES],
+        ) -> (
+            LtpParameters,
+            [i16; SUBFRAME_SAMPLES],
+            [i16; SUBFRAME_SAMPLES],
+        ) {
+            let params = ltp_parameters(d, &self.dp_hist);
+            let (dpp, e) = long_term_analysis_filter(d, &self.dp_hist, params);
+            (params, dpp, e)
+        }
+
+        /// Apply the §5.2.18 dp-update once the sub-segment's
+        /// reconstructed long-term residual `ep[0..=39]` is known.
+        ///
+        /// §5.2.18 pseudocode (verbatim):
+        /// ```text
+        /// FOR k = 0 to 79:
+        ///     dp[-120 + k] = dp[-80 + k];
+        /// NEXT k:
+        ///
+        /// FOR k = 0 to 39:
+        ///     dp[-40 + k] = add( ep[k], dpp[k] );
+        /// NEXT k:
+        /// ```
+        ///
+        /// In words: slide the older 80 history samples leftward by 40,
+        /// then write the new 40 samples `add(ep[k], dpp[k])` into the
+        /// `dp[-40..=-1]` slot. With the `dp_hist[0] = dp[-1]` layout
+        /// the encoder uses, "leftward by 40" maps to "shift `dp_hist`
+        /// entries 0..=79 into positions 40..=119" and the new samples
+        /// land at positions 39 downto 0 (so `dp_hist[0]` = `dp[-1]` =
+        /// `add(ep[39], dpp[39])`, etc.).
+        ///
+        /// `dpp` is the second-tuple member of
+        /// [`Self::analyse_subframe`]; `ep` is produced by §5.2.17
+        /// once the RPE / APCM stages land (a later round).
+        pub fn update_dp_after_subframe(
+            &mut self,
+            ep: &[i16; SUBFRAME_SAMPLES],
+            dpp: &[i16; SUBFRAME_SAMPLES],
+        ) {
+            // §5.2.18 step 1: dp[-120 + k] = dp[-80 + k], k = 0..=79.
+            //
+            // Maps to: dp_hist positions [80, 119] (= dp[-120..=-81])
+            // get the contents of dp_hist positions [40, 79]
+            // (= dp[-80..=-41]); then dp_hist positions [40, 79]
+            // (= dp[-80..=-41]) get the contents of dp_hist [0, 39]
+            // (= dp[-40..=-1]).
+            //
+            // Equivalent in our layout: shift the first 80 entries
+            // (the "newer" half) into positions 40..=119; the deepest
+            // 40 entries (positions 80..=119 = dp[-120..=-81]) are
+            // dropped per the spec ("dp[-120 + k] = dp[-80 + k]"
+            // overwrites them). Using copy_within for the rotation.
+            self.dp_hist.copy_within(0..80, 40);
+
+            // §5.2.18 step 2: dp[-40 + k] = add(ep[k], dpp[k]) for
+            // k = 0..=39.
+            //
+            // dp[-1] = add(ep[39], dpp[39]) ⇒ dp_hist[0]
+            // dp[-2] = add(ep[38], dpp[38]) ⇒ dp_hist[1]
+            // …
+            // dp[-40] = add(ep[0], dpp[0]) ⇒ dp_hist[39]
+            for k in 0..SUBFRAME_SAMPLES {
+                self.dp_hist[SUBFRAME_SAMPLES - 1 - k] = add(ep[k], dpp[k]);
+            }
+        }
+    }
+
+    impl LtpAnalyzer {
+        /// Convenience: assemble an [`LtpAnalyzer`] with a caller-
+        /// supplied initial delay line. Useful for unit tests that
+        /// pre-seed the §4.5 history.
+        pub fn with_dp_hist(dp_hist: [i16; LTP_DELAY]) -> Self {
+            Self { dp_hist }
         }
     }
 
@@ -1866,6 +2294,302 @@ pub mod analysis {
             for k in 0..=12 {
                 assert_eq!(d_canonical[k], d_manual[k], "block 0 sample {k}");
             }
+        }
+
+        // ─── §5.2.11 / §5.2.12 LTP analysis ───
+
+        /// §5.2.11 on an all-zero `d[..]` and all-zero history: dmax = 0
+        /// ⇒ scal = 0; the entire cross-correlation search yields
+        /// `L_result = 0` for every lambda; `L_max` never increases so
+        /// `Nc` stays at its initial 40 and the `L_max <= 0` branch
+        /// gives `bc = 0`.
+        #[test]
+        fn ltp_zero_input_yields_home_lag_and_zero_gain() {
+            let d = [0i16; SUBFRAME_SAMPLES];
+            let dp_hist = [0i16; LTP_DELAY];
+            let p = ltp_parameters(&d, &dp_hist);
+            assert_eq!(p.n_c, 40);
+            assert_eq!(p.b_c, 0);
+        }
+
+        /// §5.2.12 on an all-zero `d[..]` + all-zero history: `bp =
+        /// QLB[0]` = 3277, `dpp[k] = mult_r(3277, 0) = 0`, `e[k] =
+        /// sub(0, 0) = 0`.
+        #[test]
+        fn ltp_filter_zero_input_yields_zero_residual() {
+            let d = [0i16; SUBFRAME_SAMPLES];
+            let dp_hist = [0i16; LTP_DELAY];
+            let params = LtpParameters { n_c: 40, b_c: 0 };
+            let (dpp, e) = long_term_analysis_filter(&d, &dp_hist, params);
+            for k in 0..SUBFRAME_SAMPLES {
+                assert_eq!(dpp[k], 0, "dpp[{k}]");
+                assert_eq!(e[k], 0, "e[{k}]");
+            }
+        }
+
+        /// §5.2.11 LTP-lag detection: seed the §4.5 history with a
+        /// short impulse train and the §5.2.10 residual with a matching
+        /// shifted train; the cross-correlation must peak at the seeded
+        /// lag.
+        ///
+        /// We use lag 40 (the spec's minimum) — the closest history
+        /// sample, `dp[-1]`, lines up with `d[39]` so for k=0..=39 we
+        /// get `dp[k - 40] = dp_hist[40 - k - 1] = dp_hist[39 - k]`.
+        /// Construct `dp_hist[i] = 1000` for `i = 0..=39` (i.e.
+        /// `dp[-1..=-40]`) and zero elsewhere; construct `d[k] = 1000`
+        /// for all k. The k=0..=39 inner product sums to a positive
+        /// L_result for lambda = 40 (40 * L_mult(1000,1000) = 40 *
+        /// 2,000,000 = 8e7) and to zero for lambda > 40 (history is
+        /// zero beyond dp[-40]).
+        #[test]
+        fn ltp_lag_detection_minimum_pitch() {
+            let d = [1000i16; SUBFRAME_SAMPLES];
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for slot in dp_hist[0..40].iter_mut() {
+                *slot = 1000;
+            }
+            let p = ltp_parameters(&d, &dp_hist);
+            assert_eq!(p.n_c, 40, "Nc should land on the seeded lag 40");
+            // L_max > 0, so bc must be at least 1; with l_max < l_power
+            // path it lands in [0, 3]. With strong correlation we expect
+            // bc = 3 (the L_max >= L_power short-circuit).
+            assert!(p.b_c >= 1);
+        }
+
+        /// §5.2.11 LTP-lag detection at a non-minimum lag — seed
+        /// history at lag 80 only and confirm `Nc = 80`.
+        #[test]
+        fn ltp_lag_detection_mid_range() {
+            let d = [2000i16; SUBFRAME_SAMPLES];
+            let mut dp_hist = [0i16; LTP_DELAY];
+            // dp_hist[i] = dp[-(i+1)]. Lag 80 wants k - 80 ∈ {-40, .., -80
+            // - 39 +} → dp[-80..=-41] → dp_hist[40..=79].
+            for slot in dp_hist[40..80].iter_mut() {
+                *slot = 2000;
+            }
+            let p = ltp_parameters(&d, &dp_hist);
+            assert_eq!(p.n_c, 80, "Nc should land on the seeded lag 80");
+        }
+
+        /// §5.2.11 bc = 3 (max-gain) branch: when `L_max >= L_power`
+        /// the procedure exits with `bc = 3` and `Nc` reflecting the
+        /// lag at which the cross-correlation peaked. The constant-d /
+        /// constant-history seed of `ltp_lag_detection_minimum_pitch`
+        /// satisfies `L_max == L_power` (the lagged signal IS the
+        /// reference), so bc = 3.
+        #[test]
+        fn ltp_max_gain_branch_lands_on_bc_3() {
+            let d = [4000i16; SUBFRAME_SAMPLES];
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for slot in dp_hist[0..40].iter_mut() {
+                *slot = 4000;
+            }
+            let p = ltp_parameters(&d, &dp_hist);
+            assert_eq!(p.b_c, 3);
+        }
+
+        /// §5.2.11 `Nc` codeword fits the §1.7 Table 1.1 7-bit field
+        /// (range 40..=120).
+        #[test]
+        fn ltp_n_c_always_in_spec_range() {
+            // Random-ish d, random-ish dp_hist: we just need to drive
+            // the search.
+            let mut d = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in d.iter_mut().enumerate() {
+                *slot = ((k as i16) * 173).wrapping_sub(2048);
+            }
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for (i, slot) in dp_hist.iter_mut().enumerate() {
+                *slot = ((i as i16) * 79).wrapping_sub(1024);
+            }
+            let p = ltp_parameters(&d, &dp_hist);
+            assert!(
+                (40..=120).contains(&p.n_c),
+                "Nc must be in [40, 120], got {}",
+                p.n_c
+            );
+            assert!((0..=3).contains(&p.b_c), "bc must be in [0, 3]");
+        }
+
+        /// §5.2.12 inverse — when the LTP estimate exactly matches the
+        /// input (bc=3 saturating gain on a constant-history seed),
+        /// the long-term residual `e[..]` shrinks toward zero. We
+        /// don't get exact zero because QLB[3] = 32767 is not 1.0 in
+        /// Q15 (it's 32767/32768).
+        #[test]
+        fn ltp_filter_max_gain_reduces_residual() {
+            let d = [8000i16; SUBFRAME_SAMPLES];
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for slot in dp_hist[0..40].iter_mut() {
+                *slot = 8000;
+            }
+            let params = LtpParameters { n_c: 40, b_c: 3 };
+            let (_dpp, e) = long_term_analysis_filter(&d, &dp_hist, params);
+            // The residual shrinks roughly by the (1 - 32767/32768)
+            // factor. Each e[k] should be small relative to d[k].
+            for &ek in e.iter() {
+                assert!(ek.unsigned_abs() <= 8, "|e[k]| = {} too large", ek.abs());
+            }
+        }
+
+        /// §5.2.12 sign-preservation: `e[k] = sub(d[k], dpp[k])`. For
+        /// an all-zero history `dpp[k] = mult_r(QLB[bc], 0) = 0`, so
+        /// `e[k] = d[k]` regardless of bc.
+        #[test]
+        fn ltp_filter_passes_through_with_empty_history() {
+            let mut d = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in d.iter_mut().enumerate() {
+                *slot = ((k as i16) * 11).wrapping_sub(200);
+            }
+            let dp_hist = [0i16; LTP_DELAY];
+            for &bc_try in &[0i16, 1, 2, 3] {
+                let params = LtpParameters {
+                    n_c: 40,
+                    b_c: bc_try,
+                };
+                let (_dpp, e) = long_term_analysis_filter(&d, &dp_hist, params);
+                assert_eq!(e, d, "bc = {bc_try}: e[..] must equal d[..]");
+            }
+        }
+
+        /// `LtpAnalyzer` in the home state matches the
+        /// `ltp_parameters` + `long_term_analysis_filter` composition
+        /// driven with an all-zero history (i.e. the §4.5 home state).
+        #[test]
+        fn ltp_analyzer_home_state_matches_free_functions() {
+            let mut d = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in d.iter_mut().enumerate() {
+                *slot = ((k as i16) * 31).wrapping_sub(512);
+            }
+            let dp_hist = [0i16; LTP_DELAY];
+            let p_free = ltp_parameters(&d, &dp_hist);
+            let (dpp_free, e_free) = long_term_analysis_filter(&d, &dp_hist, p_free);
+
+            let a = LtpAnalyzer::new();
+            let (p_analyzer, dpp_analyzer, e_analyzer) = a.analyse_subframe(&d);
+            assert_eq!(p_free, p_analyzer);
+            assert_eq!(dpp_free, dpp_analyzer);
+            assert_eq!(e_free, e_analyzer);
+        }
+
+        /// `LtpAnalyzer::reset` returns to the §4.5 home state.
+        #[test]
+        fn ltp_analyzer_reset_returns_home() {
+            let mut a = LtpAnalyzer::new();
+            let ep = [123i16; SUBFRAME_SAMPLES];
+            let dpp = [-321i16; SUBFRAME_SAMPLES];
+            a.update_dp_after_subframe(&ep, &dpp);
+            assert_ne!(a.dp_hist(), &[0i16; LTP_DELAY]);
+            a.reset();
+            assert_eq!(a.dp_hist(), &[0i16; LTP_DELAY]);
+        }
+
+        /// §5.2.18 dp-update lays the new 40 samples into dp_hist[0..=39]
+        /// with the spec's index reversal — `dp[-1] = add(ep[39],
+        /// dpp[39])` lands in `dp_hist[0]`, etc.
+        #[test]
+        fn ltp_dp_update_orders_newest_sample_first() {
+            let mut a = LtpAnalyzer::new();
+            let mut ep = [0i16; SUBFRAME_SAMPLES];
+            let mut dpp = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                ep[k] = k as i16;
+                dpp[k] = 100 * (k as i16);
+            }
+            a.update_dp_after_subframe(&ep, &dpp);
+            // dp[-1] = ep[39] + dpp[39] = 39 + 3900 = 3939 ⇒ dp_hist[0]
+            assert_eq!(a.dp_hist()[0], 3939);
+            // dp[-2] = ep[38] + dpp[38] = 38 + 3800 = 3838 ⇒ dp_hist[1]
+            assert_eq!(a.dp_hist()[1], 3838);
+            // dp[-40] = ep[0] + dpp[0] = 0 ⇒ dp_hist[39]
+            assert_eq!(a.dp_hist()[39], 0);
+            // Positions 40..=119 should still be zero (no older
+            // history existed).
+            for i in 40..LTP_DELAY {
+                assert_eq!(a.dp_hist()[i], 0, "dp_hist[{i}] should be 0");
+            }
+        }
+
+        /// §5.2.18 dp-update across two sub-segments: the first update's
+        /// 40 samples slide into dp_hist[40..=79] after the second
+        /// update.
+        #[test]
+        fn ltp_dp_update_slides_history_across_two_sub_segments() {
+            let mut a = LtpAnalyzer::new();
+            // First sub-segment: dp_hist[0..=39] ← deterministic.
+            let mut ep1 = [0i16; SUBFRAME_SAMPLES];
+            let mut dpp1 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                ep1[k] = (k as i16) + 1;
+                dpp1[k] = 0;
+            }
+            a.update_dp_after_subframe(&ep1, &dpp1);
+            let first = *a.dp_hist();
+            // Second sub-segment: new content.
+            let mut ep2 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                ep2[k] = -((k as i16) + 1);
+            }
+            let dpp2 = [0i16; SUBFRAME_SAMPLES];
+            a.update_dp_after_subframe(&ep2, &dpp2);
+            let second = *a.dp_hist();
+            // After the second update, the entries that were in
+            // dp_hist[0..=39] (newest, after sub-segment 1) should now
+            // sit at dp_hist[40..=79] (slid leftward by 40 in spec
+            // terms — i.e. 40 positions further into the past).
+            for i in 0..SUBFRAME_SAMPLES {
+                assert_eq!(
+                    second[40 + i],
+                    first[i],
+                    "dp_hist[40+{i}] = first dp_hist[{i}]",
+                );
+            }
+            // The newest 40 entries should be the negated ramp.
+            for k in 0..SUBFRAME_SAMPLES {
+                // ep2[k] + dpp2[k] = -(k+1); lands at dp_hist[39-k].
+                assert_eq!(second[SUBFRAME_SAMPLES - 1 - k], -((k as i16) + 1));
+            }
+        }
+
+        /// `LtpAnalyzer::analyse_subframe` is pure with respect to the
+        /// delay-line state — it must not mutate `dp_hist`.
+        #[test]
+        fn ltp_analyzer_analyse_subframe_is_non_mutating() {
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for (i, slot) in dp_hist.iter_mut().enumerate() {
+                *slot = (i as i16) * 13;
+            }
+            let a = LtpAnalyzer::with_dp_hist(dp_hist);
+            let mut d = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in d.iter_mut().enumerate() {
+                *slot = (k as i16) * 7;
+            }
+            let _ = a.analyse_subframe(&d);
+            assert_eq!(
+                a.dp_hist(),
+                &dp_hist,
+                "analyse_subframe must not mutate state"
+            );
+        }
+
+        /// Determinism: running `analyse_subframe` twice with the same
+        /// state + input must produce the same outputs.
+        #[test]
+        fn ltp_analyzer_deterministic() {
+            let mut dp_hist = [0i16; LTP_DELAY];
+            for (i, slot) in dp_hist.iter_mut().enumerate() {
+                *slot = ((i as i16).wrapping_mul(17)) ^ 0x1234;
+            }
+            let a = LtpAnalyzer::with_dp_hist(dp_hist);
+            let mut d = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in d.iter_mut().enumerate() {
+                *slot = ((k as i16).wrapping_mul(19)) ^ 0x4321;
+            }
+            let r1 = a.analyse_subframe(&d);
+            let r2 = a.analyse_subframe(&d);
+            assert_eq!(r1.0, r2.0);
+            assert_eq!(r1.1, r2.1);
+            assert_eq!(r1.2, r2.2);
         }
 
         // Silence unused-import warning when this private inner

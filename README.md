@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.10 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. §5.2.11..§5.2.14 LTP analysis, §5.2.15..§5.2.17 RPE selection + APCM, and frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.12 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13..§5.2.17 weighting filter + RPE selection + APCM, and §1.7 frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -153,9 +153,53 @@ consumes:
 `Analyzer::new()` returns the §4.5 home state (`LARpp(j-1) = 0`,
 `u = 0`). `Analyzer::reset()` returns to the home state.
 
-The §5.2.11..§5.2.14 (LTP analysis), §5.2.15..§5.2.17 (weighting
-filter + RPE selection + APCM quantisation) stages, and the §1.7
-frame packer arrive in later rounds. Until they land,
+## Encoder LTP clause (§5.2.11..§5.2.12, §5.2.18)
+
+The Long-Term Prediction clause is implemented as the
+[`analysis::LtpAnalyzer`] struct + two free functions:
+[`analysis::ltp_parameters`] (§5.2.11) and
+[`analysis::long_term_analysis_filter`] (§5.2.12). Per sub-segment
+(40 samples), the analyser consumes `d[0..=39]` (the §5.2.10
+short-term residual for that sub-segment) and emits
+`(LtpParameters, dpp[0..=39], e[0..=39])`:
+
+* **§5.2.11 `ltp_parameters`** — Compute the LTP parameters
+  `(Nc, bc)`:
+  - Search for the optimum scaling of `d[0..=39]`:
+    `scal = sub(6, norm(dmax << 16))` clamped to 0 when
+    `norm > 6` or `dmax == 0`.
+  - `wt[k] = d[k] >> scal`; then for each candidate lag
+    `lambda = 40..=120` accumulate
+    `L_result = Σ L_mult(wt[k], dp[k-lambda])` and track the
+    maximum `L_max` with its `Nc = lambda` argmax. The §4.5
+    delay line `dp[-120..=-1]` is held in `LtpAnalyzer`.
+  - Rescale: `L_max >>= sub(6, scal)` (the §5.1 negative-shift
+    rule applies when `scal > 6`).
+  - `wt[k] = dp[k-Nc] >> 3`, then `L_power = Σ L_mult(wt[k],
+    wt[k])`.
+  - `bc` decision tree: `L_max <= 0 ⇒ bc = 0`;
+    `L_max >= L_power ⇒ bc = 3`; otherwise
+    `temp = norm(L_power); R = (L_max << temp) >> 16;
+    S = (L_power << temp) >> 16;` and the first
+    `bc ∈ {0, 1, 2}` for which `R <= mult(S, DLB[bc])` (Table
+    5.3a) is the codeword, else `bc = 3`.
+* **§5.2.12 `long_term_analysis_filter`** — Decode `bp =
+  QLB[bc]` (Table 5.3b) and compute, for `k = 0..=39`:
+  `dpp[k] = mult_r(bp, dp[k-Nc])`,
+  `e[k] = sub(d[k], dpp[k])`. `dpp[..]` is returned alongside
+  `e[..]` because §5.2.18 needs it to update the delay line.
+* **§5.2.18 `LtpAnalyzer::update_dp_after_subframe`** — Once
+  the §5.2.17 reconstructed long-term residual `ep[0..=39]` is
+  known (a later round), slide the older 80 entries of the
+  delay line leftward by 40 and write `add(ep[k], dpp[k])`
+  into the `dp[-40..=-1]` slot. The §4.5 `dp_hist` is stored
+  with `dp_hist[0] = dp[-1]` (the newest history sample), so
+  `dp[-1] = add(ep[39], dpp[39])` lands in `dp_hist[0]`.
+
+`LtpAnalyzer::new()` returns the §4.5 home state
+(`dp[-120..=-1] = 0`). `LtpAnalyzer::reset()` returns to the home
+state. Until §5.2.13..§5.2.17 (weighting filter + RPE selection +
+APCM quantisation) and the §1.7 frame packer arrive,
 `make_encoder` still returns `Unsupported`.
 
 ## Codec homing (§4.4)

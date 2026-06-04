@@ -41,9 +41,15 @@
 //! [`analysis::Analyzer`] struct runs §5.2.7 → §5.2.8 → §5.2.9.1 →
 //! §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame and
 //! emits the `LARc[1..=8]` codewords plus the short-term residual
-//! `d[0..=159]` that §5.2.11 (LTP analysis) consumes. The remaining
-//! stages (§5.2.11..§5.2.18 LTP analysis + RPE selection + APCM
-//! quantisation, §1.7 frame packing) arrive in later rounds.
+//! `d[0..=159]` that §5.2.11 (LTP analysis) consumes. The §5.2.11
+//! LTP parameter calculation, §5.2.12 long-term analysis filter,
+//! and §5.2.18 `dp[-120..=-1]` delay-line update are exposed as
+//! [`LtpAnalyzer`] / [`LtpParameters`]: per sub-segment, the
+//! analyser produces the `(Nc, bc)` codewords, the long-term
+//! prediction estimate `dpp[0..=39]`, and the long-term residual
+//! `e[0..=39]` that the §5.2.13 weighting filter (next round) will
+//! consume. The remaining stages (§5.2.13..§5.2.18 RPE selection +
+//! APCM quantisation, §1.7 frame packing) arrive in later rounds.
 //! Calling [`make_encoder`] still returns an `Unsupported` error
 //! while those stages land.
 //!
@@ -75,6 +81,7 @@ pub use codec::{make_decoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
+pub use encoder::analysis::{LtpAnalyzer, LtpParameters};
 pub use encoder::{analysis, PreProcessor};
 pub use error::Error;
 

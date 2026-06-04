@@ -6,6 +6,53 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.11 / §5.2.12 / §5.2.18 encoder LTP analysis clause
+  (2026-06-04).** Lands the Long-Term Prediction analysis stages
+  as the `analysis::LtpAnalyzer` struct + free functions
+  `analysis::ltp_parameters` and
+  `analysis::long_term_analysis_filter`:
+  - `ltp_parameters(d, dp_hist) -> LtpParameters` runs §5.2.11
+    end-to-end on a 40-sample short-term residual sub-segment
+    and the §4.5 `dp[-120..=-1]` delay line: dynamic input
+    scaling (`scal = sub(6, norm(dmax << 16))` clamped to 0
+    when `norm > 6` or `dmax == 0`), cross-correlation peak
+    search over `lambda = 40..=120` driving `(Nc, L_max)`,
+    `L_max` rescaling by `sub(6, scal)` (with §5.1 negative-
+    shift fall-through), the `wt[k] = dp[k-Nc] >> 3` power
+    accumulator `L_power = Σ L_mult(wt, wt)`, and the §5.2.11
+    `bc` decision tree against Table 5.3a `DLB[..]` (`L_max <= 0
+    ⇒ bc = 0`; `L_max >= L_power ⇒ bc = 3`; otherwise the first
+    `bc ∈ {0, 1, 2}` with `R <= mult(S, DLB[bc])`).
+  - `long_term_analysis_filter(d, dp_hist, params) ->
+    (dpp, e)` runs §5.2.12: `bp = QLB[bc]`,
+    `dpp[k] = mult_r(bp, dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`.
+    Returns `dpp` alongside `e` since §5.2.18 needs both.
+  - `LtpAnalyzer::analyse_subframe(d) -> (LtpParameters,
+    dpp[0..=39], e[0..=39])` is the per-sub-segment driver
+    using the persisted `dp[-120..=-1]` history.
+  - `LtpAnalyzer::update_dp_after_subframe(ep, dpp)` lands
+    §5.2.18: slide the older 80 dp-history entries leftward by
+    40 and write `add(ep[k], dpp[k])` into the `dp[-40..=-1]`
+    slot. The §4.5 home value `dp[-120..=-1] = 0` is the default
+    state of `LtpAnalyzer::new()`.
+  - `LtpAnalyzer::reset` returns to the §4.5 home state.
+  - Re-exported as `oxideav_gsm::{LtpAnalyzer, LtpParameters}`.
+  Fourteen unit tests cover the §5.2.11 zero-input ⇒ `(Nc=40,
+  bc=0)` invariant, the lag-40 (minimum) and lag-80 (mid-range)
+  cross-correlation peak detection on seeded delay-line content,
+  the `bc=3` saturating-gain branch, the `Nc ∈ [40, 120]` /
+  `bc ∈ [0, 3]` codeword-range invariant on pseudorandom inputs,
+  the §5.2.12 zero-history pass-through (`e[k] = d[k]` regardless
+  of `bc`), the maximum-gain residual-shrinking property, the
+  `LtpAnalyzer` home-state equivalence with the free functions,
+  reset round-trip, `analyse_subframe` non-mutating contract,
+  determinism, and two §5.2.18 dp-update tests covering the
+  newest-sample-first ordering (`dp_hist[0] = dp[-1]`) and the
+  across-sub-segment slide behaviour. `make_encoder` still
+  returns `Unsupported` — §5.2.13..§5.2.17 weighting filter +
+  RPE selection + APCM quantisation and §1.7 frame packing
+  arrive in later rounds.
+
 - **§5.2.8..§5.2.10 encoder short-term analysis filter (2026-06-04).**
   Lands the §5.2 short-term analysis filtering clause as the
   `analysis::Analyzer` struct + `analysis::short_term_analysis_filter`
