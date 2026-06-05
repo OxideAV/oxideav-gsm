@@ -6,6 +6,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.13 encoder weighting filter (2026-06-05).** Lands the §5.2.13
+  block-filter clause as the stateless free function
+  `analysis::weighting_filter`:
+  - `weighting_filter(e: &[i16; 40]) -> [i16; 40]` runs the §5.2.13
+    pseudocode verbatim: build the 50-sample working array
+    `wt[0..=49]` with 5 leading zeros, `wt[5..=44] = e[0..=39]`, and
+    5 trailing zeros; for each `k = 0..=39` accumulate
+    `L_result = 8192 + Σ L_mult(wt[k+i], H[i])` for `i = 0..=10`,
+    apply two saturating doublings (`L_add(L_result, L_result)`
+    twice, the spec's `×2` then `×4` scaling), and emit
+    `x[k] = L_result >> 16`.
+  - Backed by §5.4 Table 5.4 `H[0..=10]` (already staged in
+    `tables.rs` for the staging audit; the encoder now actually
+    consumes it).
+  - The filter is stateless — no §4.5 Table 4.2 home state is
+    added; each sub-segment starts the `wt[]` array fresh from
+    `e[..]` with zero padding.
+  - The output `x[0..=39]` is the input the §5.2.14 RPE grid
+    selection step (a later round) consumes; the spec's diagram
+    in §3.1 (figure 3.1) and the §5.2.13 → §5.2.14 chain in §5.2
+    both feed `x[..]` directly into the grid-selection
+    sub-procedure.
+  Six unit tests cover the zero-input ⇒ zero-output invariant, the
+  determinism of the stateless filter, the approximate odd-symmetry
+  under input negation (±1 LSB tolerance for the `+8192` rounding
+  bias), an end-positioned unit impulse at `e[0]` against an
+  independently-derived spec-arithmetic expected response, the
+  trailing-edge zero-pad correctness via an impulse at `e[39]`, and
+  a stateless-across-calls check (the result of two successive calls
+  on the same input is invariant to a different input being
+  filtered in between). `make_encoder` still returns `Unsupported`
+  — §5.2.14..§5.2.17 RPE selection + APCM quantisation + RPE grid
+  positioning and §1.7 frame packing arrive in later rounds.
+
 - **§5.2.11 / §5.2.12 / §5.2.18 encoder LTP analysis clause
   (2026-06-04).** Lands the Long-Term Prediction analysis stages
   as the `analysis::LtpAnalyzer` struct + free functions

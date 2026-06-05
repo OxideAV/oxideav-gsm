@@ -23,9 +23,22 @@
 //!   Table 4.2 `LARpp(j-1)[1..=8]` and `u[0..=7]` state across the
 //!   four per-frame interpolation blocks and across frames.
 //!
-//! Subsequent encoder stages (§5.2.11..§5.2.18 LTP analysis, RPE
-//! selection + APCM quantisation, then §1.7 frame packing) arrive
-//! in later rounds.
+//! * The **LTP analysis clause** — §5.2.11 LTP parameter calculation
+//!   (cross-correlation peak search over lags 40..=120, Table 5.3a
+//!   `DLB`-driven `bc` decision tree), §5.2.12 long-term analysis
+//!   filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k],
+//!   dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update. Driven
+//!   per-sub-segment via the [`analysis::LtpAnalyzer`] struct.
+//! * The **§5.2.13 weighting filter** — an 11-tap FIR block filter
+//!   convolving the §5.2.12 long-term residual `e[0..=39]` with the
+//!   Table 5.4 impulse response `H[0..=10]` to produce the block-
+//!   filtered signal `x[0..=39]` that §5.2.14 RPE grid selection
+//!   consumes. Exposed as the stateless free function
+//!   [`analysis::weighting_filter`].
+//!
+//! Subsequent encoder stages (§5.2.14 RPE grid selection, §5.2.15
+//! APCM quantisation, §5.2.16 APCM inverse quantisation, §5.2.17 RPE
+//! grid positioning, then §1.7 frame packing) arrive in later rounds.
 //!
 //! Until the rest of the encoder lands, the
 //! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
@@ -543,7 +556,7 @@ pub mod analysis {
     use super::FRAME_SAMPLES;
     use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, sub};
     use crate::decoder::{decode_lar, interpolate_lar, larp_to_rp};
-    use crate::tables::{A, B, DLB, MAC, MIC, QLB};
+    use crate::tables::{A, B, DLB, H, MAC, MIC, QLB};
 
     /// Number of samples in one sub-segment (§5.2.11 input range
     /// `d[0..39]` / §5.2.12 output range `e[0..39]`).
@@ -1492,6 +1505,77 @@ pub mod analysis {
         pub fn with_dp_hist(dp_hist: [i16; LTP_DELAY]) -> Self {
             Self { dp_hist }
         }
+    }
+
+    /// §5.2.13 — Weighting filter.
+    ///
+    /// Convolves the §5.2.12 long-term residual `e[0..=39]` with the
+    /// 11-tap FIR impulse response [`H`] (Table 5.4) using the spec's
+    /// "block filter" framing: the input is zero-padded on both sides
+    /// (5 leading + 5 trailing zeros) into a 50-sample working array
+    /// `wt[0..=49]`, then the 11-tap dot product is taken at each of
+    /// 40 output positions to land `x[0..=39]`. The result is the
+    /// block-filtered signal that §5.2.14 RPE grid selection consumes.
+    ///
+    /// §5.2.13 pseudocode (verbatim):
+    /// ```text
+    /// Initialization of a temporary working array wt[0..49]:
+    ///   FOR k = 0 to 4:    wt[k] = 0;
+    ///   FOR k = 5 to 44:   wt[k] = e[k-5];
+    ///   FOR k = 45 to 49:  wt[k] = 0;
+    ///
+    /// Compute the signal x[0..39]:
+    ///   FOR k = 0 to 39:
+    ///       L_result = 8192;   /* rounding of the output */
+    ///       FOR i = 0 to 10:
+    ///           L_temp   = L_mult( wt[k+i], H[i] );
+    ///           L_result = L_add ( L_result, L_temp );
+    ///       NEXT i:
+    ///       L_result = L_add( L_result, L_result );  /* scaling x2 */
+    ///       L_result = L_add( L_result, L_result );  /* scaling x4 */
+    ///       x[k]     = L_result >> 16;
+    ///   NEXT k:
+    /// ```
+    ///
+    /// Notes:
+    ///
+    /// * The two `L_add(L_result, L_result)` doublings together
+    ///   shift the 32-bit accumulator left by 2 bits, with the §5.1
+    ///   saturating addition rule applied at each doubling. The
+    ///   subsequent `>> 16` shifts the high 16 bits out as the
+    ///   filtered sample.
+    /// * Table 5.4 stores `H[i] * 2^13` (the integer scaling defined
+    ///   in §5.2.13 "scaling is used" — `H[0..10] =
+    ///   integer(real_H[0..10] * 8192)`); the `L_mult` accumulation
+    ///   absorbs that scaling, and the trailing `<<2; >>16` lands
+    ///   the §5.2.14 input in the spec's expected magnitude.
+    /// * The filter is stateless — every sub-segment starts the
+    ///   `wt[]` array fresh from `e[..]` with zero padding, so no
+    ///   §4.5 Table 4.2 home state is added by this clause.
+    pub fn weighting_filter(e: &[i16; SUBFRAME_SAMPLES]) -> [i16; SUBFRAME_SAMPLES] {
+        // §5.2.13 — initialise the 50-sample working array wt[0..=49].
+        //   wt[0..=4]   = 0   (5 leading zeros)
+        //   wt[5..=44]  = e[k-5]  (the 40-sample input)
+        //   wt[45..=49] = 0   (5 trailing zeros)
+        let mut wt = [0i16; 50];
+        wt[5..45].copy_from_slice(&e[..SUBFRAME_SAMPLES]);
+
+        // §5.2.13 — compute x[0..=39].
+        let mut x = [0i16; SUBFRAME_SAMPLES];
+        for k in 0..SUBFRAME_SAMPLES {
+            // L_result = 8192 (rounding constant) + Σ L_mult(wt[k+i], H[i]).
+            let mut l_result: i32 = 8192;
+            for i in 0..=10 {
+                let l_temp = l_mult(wt[k + i], H[i]);
+                l_result = l_add(l_result, l_temp);
+            }
+            // Two saturating doublings = ×4 scaling.
+            l_result = l_add(l_result, l_result);
+            l_result = l_add(l_result, l_result);
+            // x[k] = L_result >> 16.
+            x[k] = (l_result >> 16) as i16;
+        }
+        x
     }
 
     #[cfg(test)]
@@ -2590,6 +2674,171 @@ pub mod analysis {
             assert_eq!(r1.0, r2.0);
             assert_eq!(r1.1, r2.1);
             assert_eq!(r1.2, r2.2);
+        }
+
+        // ─── §5.2.13 weighting filter ───
+
+        /// All-zero input ⇒ all-zero output. The §5.2.13 rounding
+        /// constant 8192 is below `2^16`, so two doublings keep it at
+        /// 32768, and `32768 >> 16 = 0`.
+        #[test]
+        fn weighting_filter_zero_input_is_zero() {
+            let e = [0i16; SUBFRAME_SAMPLES];
+            let x = weighting_filter(&e);
+            for (k, v) in x.iter().enumerate() {
+                assert_eq!(*v, 0, "x[{k}] should be 0 for zero input");
+            }
+        }
+
+        /// Determinism: same input ⇒ same output. The filter is
+        /// stateless per the §5.2.13 spec text.
+        #[test]
+        fn weighting_filter_deterministic() {
+            let mut e = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in e.iter_mut().enumerate() {
+                *slot = ((k as i16).wrapping_mul(37)) ^ 0x2a5b;
+            }
+            let x1 = weighting_filter(&e);
+            let x2 = weighting_filter(&e);
+            assert_eq!(x1, x2);
+        }
+
+        /// Linearity (sign): negating the input negates the output.
+        /// `L_mult(-a, b) = -L_mult(a, b)`, `L_add(-x, -y) = -L_add(x, y)`,
+        /// and the rounding constant is symmetric in that the
+        /// `>> 16` is an arithmetic shift; the only deviation is the
+        /// `+8192` rounding bias, which is below the truncation
+        /// granularity once the sum survives `>>16`. We exercise an
+        /// input whose response is large enough that the rounding
+        /// bias is dwarfed.
+        #[test]
+        fn weighting_filter_linear_sign_flip() {
+            // Spread a moderate-magnitude input across the central
+            // taps so the rounding bias is small relative to the
+            // 11-tap accumulator.
+            let mut e = [0i16; SUBFRAME_SAMPLES];
+            for (k, slot) in e.iter_mut().enumerate() {
+                *slot = if k % 3 == 0 { 4000 } else { -2500 };
+            }
+            let mut ne = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                ne[k] = -e[k];
+            }
+            let x = weighting_filter(&e);
+            let nx = weighting_filter(&ne);
+            // Allow a ±1 tolerance because the `+8192` rounding bias
+            // breaks strict odd symmetry by at most one LSB after the
+            // `>>16` step.
+            for k in 0..SUBFRAME_SAMPLES {
+                let diff = (x[k] as i32) + (nx[k] as i32);
+                assert!(
+                    diff.abs() <= 1,
+                    "x[{k}] + nx[{k}] = {diff}, expected |diff| <= 1",
+                );
+            }
+        }
+
+        /// Impulse-response check: a unit impulse at the central
+        /// `wt[k+i] = H[i]` slot should produce a scaled copy of
+        /// `H[..]` centred on the impulse position.
+        ///
+        /// With e[0] = 1 and all other e[k] = 0, wt[5] = 1 (others 0).
+        /// For each output position k, the accumulator picks up
+        /// exactly one term: i = 5 - k (when 0 <= 5 - k <= 10, i.e.
+        /// k in [0, 5]). For k > 5 the impulse moves out of the
+        /// 11-tap window so x[k] = 0 (modulo the rounding bias which
+        /// `>> 16`'s away).
+        ///
+        /// Per the spec: `L_result = (L_mult(1, H[5-k]) + 8192) * 4 >> 16`.
+        /// `L_mult(1, H[i]) = 2 * H[i]`; `(2*H[i] + 8192) * 4 >> 16` =
+        /// `(8*H[i] + 32768) >> 16`. For |H[i]| <= 8192 the result is
+        /// 0 for typical taps and 1 (rounding) for the H[5]=8192 tap.
+        #[test]
+        fn weighting_filter_unit_impulse_at_position_zero() {
+            let mut e = [0i16; SUBFRAME_SAMPLES];
+            e[0] = 1;
+            let x = weighting_filter(&e);
+
+            // Re-derive the expected x[..] from the spec arithmetic
+            // for k = 0..=5 (within the 11-tap window) and 6..=39
+            // (outside).
+            for k in 0..SUBFRAME_SAMPLES {
+                let expected: i16 = if k <= 5 {
+                    // i = 5 - k; only wt[k + (5-k)] = wt[5] = 1 hits.
+                    let h_tap = H[5 - k];
+                    let l_mult_val = (h_tap as i32) << 1; // L_mult(1, H[i]) = 2*H[i]
+                    let after_round = l_mult_val + 8192;
+                    let after_x2 = after_round.saturating_add(after_round);
+                    let after_x4 = after_x2.saturating_add(after_x2);
+                    (after_x4 >> 16) as i16
+                } else {
+                    // Window-out: accumulator stays at 8192;
+                    // (8192 * 4) >> 16 = 0.
+                    0
+                };
+                assert_eq!(
+                    x[k], expected,
+                    "x[{k}] = {} but expected {} (impulse response)",
+                    x[k], expected,
+                );
+            }
+        }
+
+        /// Sub-segment boundary: the `wt[]` array is zero-padded on
+        /// the trailing edge so an input impulse at e[39] (= wt[44])
+        /// contributes only to outputs k in [34, 39], where the tap
+        /// index `i = 44 - k` falls in the valid range [0, 10]. For
+        /// k < 34, the impulse is outside the 11-tap window and the
+        /// accumulator stays at the rounding constant only.
+        ///
+        /// Validates that the zero-pad is correct (no leak from
+        /// outside the 40-sample sub-segment) and exercises the
+        /// non-trivial high-end-of-window response.
+        #[test]
+        fn weighting_filter_zero_pad_trailing_edge() {
+            let mut e = [0i16; SUBFRAME_SAMPLES];
+            e[39] = 4096; // big enough that H taps register after >>16
+            let x = weighting_filter(&e);
+
+            // For k in [34, 39] the impulse at wt[44] hits via tap
+            // i = 44 - k ∈ [5, 10], so the output is
+            // `(L_mult(4096, H[44-k]) + 8192) * 4 >> 16`.
+            for k in 0..SUBFRAME_SAMPLES {
+                let expected: i16 = if (34..=39).contains(&k) {
+                    let h_tap = H[44 - k];
+                    let l_mult_val = (4096_i32 * (h_tap as i32)) << 1;
+                    let after_round = l_mult_val + 8192;
+                    let after_x2 = after_round.saturating_add(after_round);
+                    let after_x4 = after_x2.saturating_add(after_x2);
+                    (after_x4 >> 16) as i16
+                } else {
+                    0
+                };
+                assert_eq!(
+                    x[k], expected,
+                    "x[{k}] = {} but expected {} (trailing-edge impulse)",
+                    x[k], expected,
+                );
+            }
+        }
+
+        /// The filter is stateless: invoking it twice in succession,
+        /// the second on a different input, must not be influenced by
+        /// the first.
+        #[test]
+        fn weighting_filter_stateless() {
+            let mut e1 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                e1[k] = (k as i16) * 11;
+            }
+            let mut e2 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                e2[k] = -(k as i16) * 7;
+            }
+            let x2_before_warmup = weighting_filter(&e2);
+            let _ = weighting_filter(&e1);
+            let x2_after_warmup = weighting_filter(&e2);
+            assert_eq!(x2_before_warmup, x2_after_warmup);
         }
 
         // Silence unused-import warning when this private inner

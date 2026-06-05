@@ -47,9 +47,15 @@
 //! [`LtpAnalyzer`] / [`LtpParameters`]: per sub-segment, the
 //! analyser produces the `(Nc, bc)` codewords, the long-term
 //! prediction estimate `dpp[0..=39]`, and the long-term residual
-//! `e[0..=39]` that the §5.2.13 weighting filter (next round) will
-//! consume. The remaining stages (§5.2.13..§5.2.18 RPE selection +
-//! APCM quantisation, §1.7 frame packing) arrive in later rounds.
+//! `e[0..=39]` that the §5.2.13 weighting filter consumes. The
+//! §5.2.13 weighting filter is also in place as the stateless free
+//! function [`analysis::weighting_filter`]: it convolves
+//! `e[0..=39]` with the Table 5.4 11-tap impulse response and emits
+//! the block-filtered signal `x[0..=39]` that §5.2.14 RPE grid
+//! selection (a later round) consumes. The remaining stages
+//! (§5.2.14..§5.2.17 RPE selection + APCM quantisation + APCM
+//! inverse + RPE grid positioning, then §1.7 frame packing) arrive
+//! in later rounds.
 //! Calling [`make_encoder`] still returns an `Unsupported` error
 //! while those stages land.
 //!
