@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.13 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter + weighting filter | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13 weighting filter is in place as the stateless `weighting_filter` free function — an 11-tap FIR block filter with zero padding (5 leading + 5 trailing zeros) convolving `e[0..=39]` with Table 5.4 `H[0..=10]` to produce the block-filtered signal `x[0..=39]` the §5.2.14 RPE grid selection consumes. §5.2.14..§5.2.17 RPE selection + APCM + RPE grid positioning, and §1.7 frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.14 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter + weighting filter + RPE grid selection | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13 weighting filter is in place as the stateless `weighting_filter` free function — an 11-tap FIR block filter with zero padding (5 leading + 5 trailing zeros) convolving `e[0..=39]` with Table 5.4 `H[0..=10]` to produce the block-filtered signal `x[0..=39]` the §5.2.14 RPE grid selection consumes. §5.2.14 RPE grid selection is in place as the stateless `select_rpe_grid` free function returning `RpeGrid { m_c, x_m }` — picks the sub-sampling grid `m ∈ {0, 1, 2, 3}` that maximises the squared-energy proxy `Σ L_mult(x[m+3i] >> 2, x[m+3i] >> 2)` and down-samples to emit `xM[0..=12] = x[Mc + 3*i]`, the 13-pulse sequence §5.2.15 APCM quantisation consumes. §5.2.15..§5.2.17 APCM + RPE grid positioning, and §1.7 frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -221,9 +221,39 @@ FIR impulse response `H[0..=10]` of Table 5.4 (already staged in
 The filter is stateless — every sub-segment starts the `wt[]` array
 fresh from `e[..]` with zero padding, so no §4.5 Table 4.2 home
 state is added by this clause. The output `x[0..=39]` is the input
-the §5.2.14 RPE grid selection step (a later round) consumes.
+the §5.2.14 RPE grid selection step consumes.
 
-Until §5.2.14..§5.2.17 (RPE selection + APCM quantisation + RPE
+## Encoder RPE grid selection (§5.2.14)
+
+The §5.2.14 adaptive sample-rate decimation step is implemented as
+the stateless free function [`analysis::select_rpe_grid`] in
+`src/encoder.rs`. It picks one of four interleaved sub-sampling
+grids of the §5.2.13 weighted signal `x[0..=39]` and emits the
+down-sampled 13-pulse sequence the §5.2.15 APCM quantiser
+consumes:
+
+* For each grid offset `m ∈ {0, 1, 2, 3}`, accumulate the
+  squared-energy proxy `L_result = Σ L_mult(x[m+3i] >> 2,
+  x[m+3i] >> 2)` for `i = 0..=12` through the §5.1 saturating
+  32-bit `L_add`. The `>> 2` pre-shift scales each contribution
+  into a margin where the 13-term sum cannot overflow the 32-bit
+  accumulator.
+* The strict `L_result > EM` comparison keeps the lower `m` on
+  ties — the entry-time `Mc = 0` default propagates when no later
+  grid scores strictly higher (an all-zero input therefore yields
+  `m_c = 0`).
+* The chosen grid is down-sampled by a factor of 3:
+  `xM[i] = x[Mc + 3*i]` for `i = 0..=12`.
+
+The function returns the `RpeGrid { m_c, x_m }` struct (also
+re-exported from the crate root): `m_c` is the 2-bit codeword the
+§1.7 frame packer emits as one of `Mc[1..=4]` per Table 1.1, and
+`x_m[0..=12]` is the 13-sample RPE sequence (`RPE_PULSES = 13`
+constant) that §5.2.15 APCM quantisation (a later round) consumes.
+The selector is stateless — `x[]` already carries all §5.2.12 /
+§5.2.13 context, and no §4.5 Table 4.2 entry is owned by §5.2.14.
+
+Until §5.2.15..§5.2.17 (APCM quantisation + APCM inverse + RPE
 grid positioning) and the §1.7 frame packer arrive, `make_encoder`
 still returns `Unsupported`.
 

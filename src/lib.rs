@@ -52,10 +52,15 @@
 //! function [`analysis::weighting_filter`]: it convolves
 //! `e[0..=39]` with the Table 5.4 11-tap impulse response and emits
 //! the block-filtered signal `x[0..=39]` that §5.2.14 RPE grid
-//! selection (a later round) consumes. The remaining stages
-//! (§5.2.14..§5.2.17 RPE selection + APCM quantisation + APCM
-//! inverse + RPE grid positioning, then §1.7 frame packing) arrive
-//! in later rounds.
+//! selection consumes. §5.2.14 RPE grid selection is exposed as
+//! the stateless free function [`analysis::select_rpe_grid`]
+//! returning [`analysis::RpeGrid`]: it picks the sub-sampling grid
+//! offset `Mc ∈ {0, 1, 2, 3}` that maximises the down-sampled
+//! energy of `x[]` and emits the 13-pulse sequence
+//! `xM[0..=12] = x[Mc + 3*i]` that §5.2.15 APCM quantisation (a
+//! later round) consumes. The remaining stages (§5.2.15..§5.2.17
+//! APCM quantisation + APCM inverse + RPE grid positioning, then
+//! §1.7 frame packing) arrive in later rounds.
 //! Calling [`make_encoder`] still returns an `Unsupported` error
 //! while those stages land.
 //!
@@ -87,7 +92,7 @@ pub use codec::{make_decoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
-pub use encoder::analysis::{LtpAnalyzer, LtpParameters};
+pub use encoder::analysis::{LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, PreProcessor};
 pub use error::Error;
 

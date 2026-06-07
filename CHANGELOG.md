@@ -6,6 +6,41 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.14 encoder RPE grid selection (2026-06-07).** Lands the
+  adaptive sample-rate decimation step that follows §5.2.13. Exposed
+  as the stateless free function `analysis::select_rpe_grid` and the
+  new `analysis::RpeGrid { m_c, x_m }` return type:
+  - `select_rpe_grid(x: &[i16; 40]) -> RpeGrid` runs the §5.2.14
+    pseudocode verbatim: for each grid offset `m = 0..=3`,
+    accumulate `L_result = Σ L_mult(x[m+3i] >> 2, x[m+3i] >> 2)`
+    for `i = 0..=12` through the saturating 32-bit `L_add`; the
+    strict `L_result > EM` comparison keeps the lower `m` on ties
+    (the entry-time `Mc = 0` default propagates when all four
+    grids carry equal energy).
+  - The chosen grid is then down-sampled by a factor of 3:
+    `xM[i] = x[Mc + 3*i]` for `i = 0..=12`. `xM` is the 13-sample
+    sequence the §5.2.15 APCM quantiser (a later round) consumes;
+    `Mc` is the 2-bit codeword the §1.7 packer emits as one of
+    `Mc[1..=4]` per Table 1.1.
+  - Re-exported from the crate root as `RpeGrid` for ergonomic
+    access alongside the existing `LtpParameters` / `LtpAnalyzer`
+    re-exports.
+  - The new constant `analysis::RPE_PULSES = 13` formalises the
+    spec's 13-pulse RPE sequence length so later stages
+    (§5.2.15..§5.2.17) don't have to repeat the literal.
+  Seven unit tests cover the zero-input ⇒ `m_c = 0` invariant, the
+  determinism of the stateless selector, the four single-impulse
+  argmax cases (one impulse per grid-unique index — `x[0]`, `x[1]`,
+  `x[2]`, `x[39]` — landing on grids 0, 1, 2, 3 respectively), the
+  strict-`>` tie-break (equal-energy impulses on grid 1 and grid 2
+  select grid 1), the down-sampling formula `xM[i] = x[Mc + 3*i]`
+  on a varied input, an argmax check (place most of the energy on
+  grid 2 and confirm it wins) against an independently-written
+  reference computation, and statelessness across calls.
+  `make_encoder` still returns `Unsupported` — §5.2.15..§5.2.17
+  APCM quantisation + RPE grid positioning and §1.7 frame packing
+  arrive in later rounds.
+
 - **§5.2.13 encoder weighting filter (2026-06-05).** Lands the §5.2.13
   block-filter clause as the stateless free function
   `analysis::weighting_filter`:

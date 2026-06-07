@@ -35,10 +35,18 @@
 //!   filtered signal `x[0..=39]` that §5.2.14 RPE grid selection
 //!   consumes. Exposed as the stateless free function
 //!   [`analysis::weighting_filter`].
+//! * The **§5.2.14 RPE grid selection** — adaptive sample-rate
+//!   decimation that picks one of the four sub-sampling grids of
+//!   `x[0..=39]` that maximises the sum of squared
+//!   `(x[m+3i] >> 2)` values, then down-samples to emit the 13-pulse
+//!   sequence `xM[0..=12] = x[Mc + 3*i]`. The 2-bit codeword `Mc`
+//!   is what the §1.7 packer emits as `Mc[1..=4]` (one per
+//!   sub-segment). Exposed as the stateless free function
+//!   [`analysis::select_rpe_grid`] returning [`analysis::RpeGrid`].
 //!
-//! Subsequent encoder stages (§5.2.14 RPE grid selection, §5.2.15
-//! APCM quantisation, §5.2.16 APCM inverse quantisation, §5.2.17 RPE
-//! grid positioning, then §1.7 frame packing) arrive in later rounds.
+//! Subsequent encoder stages (§5.2.15 APCM quantisation, §5.2.16
+//! APCM inverse quantisation, §5.2.17 RPE grid positioning, then
+//! §1.7 frame packing) arrive in later rounds.
 //!
 //! Until the rest of the encoder lands, the
 //! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
@@ -1578,6 +1586,117 @@ pub mod analysis {
         x
     }
 
+    /// Number of RPE pulses emitted per sub-segment by §5.2.14
+    /// (`xM[0..=12]`) — the down-sampled grid carries 13 samples.
+    pub const RPE_PULSES: usize = 13;
+
+    /// Per-sub-segment §5.2.14 output: the chosen RPE grid offset
+    /// `Mc ∈ {0, 1, 2, 3}` plus the 13-sample down-sampled sequence
+    /// `xM[0..=12] = x[Mc + 3*i]` that §5.2.15 APCM quantisation
+    /// (a later round) consumes.
+    ///
+    /// `Mc` is the 2-bit codeword the §1.7 frame packer emits as
+    /// `Mc` per Table 1.1 (one of `Mc[1]..Mc[4]` for the four
+    /// sub-segments of a frame).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RpeGrid {
+        /// §5.2.14 RPE grid offset — the `m ∈ {0, 1, 2, 3}` that
+        /// maximises the sub-sampled energy `EM`. Emitted to the
+        /// bit packer as the 2-bit `Mc` codeword.
+        pub m_c: i16,
+        /// §5.2.14 down-sampled RPE sequence `xM[0..=12] =
+        /// x[Mc + 3*i]` for `i = 0..=12`. Input to the §5.2.15
+        /// APCM quantiser (a later round).
+        pub x_m: [i16; RPE_PULSES],
+    }
+
+    /// §5.2.14 — RPE grid selection (adaptive sample-rate decimation).
+    ///
+    /// Picks one of the four interleaved sub-sampling grids of `x[]`
+    /// that maximises the sum of squared `(x[m+3i] >> 2)` values
+    /// across the 13 grid positions, then emits the chosen grid's
+    /// 13 samples as `xM[0..=12]`. The right-shift-by-2 the spec
+    /// applies before squaring scales each contribution from the
+    /// 16-bit `x[]` range into a margin where the `L_mult`
+    /// (`<<1`) + 13-term `L_add` accumulation cannot overflow the
+    /// 32-bit `L_result`.
+    ///
+    /// §5.2.14 pseudocode (verbatim):
+    /// ```text
+    /// EM = 0;
+    /// Mc = 0;
+    /// FOR m = 0 to 3:
+    ///     L_result = 0;
+    ///     FOR i = 0 to 12:
+    ///         temp1    = x[m + (3*i)] >> 2;
+    ///         L_temp   = L_mult( temp1, temp1 );
+    ///         L_result = L_add ( L_temp, L_result );
+    ///     NEXT i:
+    ///     IF ( L_result > EM ) THEN
+    ///         Mc = m;
+    ///         EM = L_result;
+    /// NEXT m:
+    ///
+    /// Down-sampling by a factor 3 to get the selected xM[0..12]
+    /// RPE sequence.
+    /// FOR i = 0 to 12:
+    ///     xM[i] = x[Mc + (3*i)];
+    /// NEXT i:
+    /// ```
+    ///
+    /// Notes on the spec pseudocode as written:
+    ///
+    /// * The strict inequality `L_result > EM` means that on ties
+    ///   the smaller `m` wins (the entry-time `Mc = 0` is only
+    ///   overwritten when a later grid scores strictly higher).
+    ///   In particular, an all-zero `x[]` returns `m_c = 0` with an
+    ///   all-zero `xM[]`.
+    /// * The grid `m = 0` covers indices `{0, 3, 6, …, 36}`, `m = 1`
+    ///   covers `{1, 4, 7, …, 37}`, `m = 2` covers `{2, 5, 8, …, 38}`,
+    ///   and `m = 3` covers `{3, 6, 9, …, 39}`. The four grids
+    ///   together touch `x[0..=39]` — the last sample `x[39]` is
+    ///   reachable only via `m = 3` and `i = 12`.
+    /// * The accumulator is signed 32-bit; with `temp1 ∈ [-8192,
+    ///   8191]` after the `>>2`, `L_mult(temp1, temp1) ∈
+    ///   [0, 2 * 8191 * 8191] ≈ 1.34 × 10⁸`. Thirteen of those sum
+    ///   to ≤ 1.74 × 10⁹ < 2³¹, so saturation in `L_add` is not
+    ///   reachable for normal inputs. We still use the saturating
+    ///   `l_add` to stay bit-exact with the pseudocode.
+    /// * The filter is stateless — `x[]` already carries the
+    ///   §5.2.13 / §5.2.12 context, and no §4.5 Table 4.2 entry
+    ///   is owned by §5.2.14.
+    pub fn select_rpe_grid(x: &[i16; SUBFRAME_SAMPLES]) -> RpeGrid {
+        // §5.2.14 entry-time initialisation: EM = 0, Mc = 0.
+        let mut em: i32 = 0;
+        let mut m_c: i16 = 0;
+
+        // §5.2.14 outer loop: m = 0..=3 over the four sub-sampling
+        // grids.
+        for m in 0..4 {
+            let mut l_result: i32 = 0;
+            // §5.2.14 inner loop: i = 0..=12, sum |x[m+3i] >> 2|²
+            // through the saturating accumulator.
+            for i in 0..RPE_PULSES {
+                let temp1 = x[m + 3 * i] >> 2;
+                let l_temp = l_mult(temp1, temp1);
+                l_result = l_add(l_temp, l_result);
+            }
+            // §5.2.14: strict greater-than means earlier m wins ties.
+            if l_result > em {
+                m_c = m as i16;
+                em = l_result;
+            }
+        }
+
+        // §5.2.14 down-sampling: xM[i] = x[Mc + 3*i] for i = 0..=12.
+        let mut x_m = [0i16; RPE_PULSES];
+        for i in 0..RPE_PULSES {
+            x_m[i] = x[(m_c as usize) + 3 * i];
+        }
+
+        RpeGrid { m_c, x_m }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2839,6 +2958,188 @@ pub mod analysis {
             let _ = weighting_filter(&e1);
             let x2_after_warmup = weighting_filter(&e2);
             assert_eq!(x2_before_warmup, x2_after_warmup);
+        }
+
+        // ─── §5.2.14 RPE grid selection ───
+
+        /// Helper: independently compute the §5.2.14 grid energy for
+        /// `m` against `x[]` using the pseudocode's saturating
+        /// `L_mult`/`L_add` shape but written from scratch in the
+        /// test (so the test isn't tautological against the impl).
+        fn rpe_grid_energy_reference(x: &[i16; SUBFRAME_SAMPLES], m: usize) -> i32 {
+            let mut acc: i32 = 0;
+            for i in 0..RPE_PULSES {
+                let temp1 = x[m + 3 * i] >> 2;
+                let prod = ((temp1 as i32) * (temp1 as i32)) << 1;
+                acc = acc.saturating_add(prod);
+            }
+            acc
+        }
+
+        /// All-zero input ⇒ `m_c = 0` (entry-time default; strict
+        /// `>` means the zero candidates never overwrite) and the
+        /// 13-sample `xM[]` is all zero.
+        #[test]
+        fn rpe_grid_zero_input_picks_grid_zero() {
+            let x = [0i16; SUBFRAME_SAMPLES];
+            let g = select_rpe_grid(&x);
+            assert_eq!(g.m_c, 0);
+            assert_eq!(g.x_m, [0i16; RPE_PULSES]);
+        }
+
+        /// Determinism: identical inputs ⇒ identical outputs across
+        /// invocations. §5.2.14 is stateless per the spec.
+        #[test]
+        fn rpe_grid_deterministic() {
+            let mut x = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                x[k] = ((k as i32 * 1373) % 9001 - 4500) as i16;
+            }
+            let g1 = select_rpe_grid(&x);
+            let g2 = select_rpe_grid(&x);
+            assert_eq!(g1, g2);
+        }
+
+        /// Place a single non-zero sample on indices that belong to
+        /// exactly one of the four grids and confirm `m_c` follows.
+        ///
+        /// Grid membership:
+        /// * Grid 0 = `{0, 3, 6, …, 36}`
+        /// * Grid 1 = `{1, 4, 7, …, 37}`
+        /// * Grid 2 = `{2, 5, 8, …, 38}`
+        /// * Grid 3 = `{3, 6, 9, …, 39}`
+        ///
+        /// Grid 0 and grid 3 share most of their indices; the ones
+        /// unique to each are `x[0]` (grid 0 only) and `x[39]`
+        /// (grid 3 only). `x[1]` is grid 1 only and `x[2]` is grid 2
+        /// only. An impulse on the grid-unique index hits a
+        /// non-overlapping slot, so the chosen grid's `L_result`
+        /// strictly exceeds the (zero) energy of the other grids.
+        #[test]
+        fn rpe_grid_single_impulse_picks_its_own_grid() {
+            // (grid index, unique sample position, xM index).
+            let cases: [(i16, usize, usize); 4] = [
+                (0, 0, 0),   // x[0] → grid 0, xM[0]
+                (1, 1, 0),   // x[1] → grid 1, xM[0]
+                (2, 2, 0),   // x[2] → grid 2, xM[0]
+                (3, 39, 12), // x[39] → grid 3, xM[12]
+            ];
+            for (m_expected, pos, xm_idx) in cases {
+                let mut x = [0i16; SUBFRAME_SAMPLES];
+                x[pos] = 1000; // large enough to survive >>2 + ×2
+                let g = select_rpe_grid(&x);
+                assert_eq!(
+                    g.m_c, m_expected,
+                    "impulse at x[{pos}] should select grid {m_expected}, got {}",
+                    g.m_c,
+                );
+                // Exactly one xM[] slot carries the impulse; the rest
+                // are zero.
+                for i in 0..RPE_PULSES {
+                    let expected = if i == xm_idx { 1000 } else { 0 };
+                    assert_eq!(g.x_m[i], expected, "xM[{i}] mismatch");
+                }
+            }
+        }
+
+        /// Tie-break rule: when two grids carry identical energy,
+        /// the strict `L_result > EM` test means the lower `m` wins.
+        /// Construct a signal where grid 1 and grid 2 carry equal
+        /// energy (both have a single impulse at `i = 0` of the
+        /// same magnitude) — grid 1 must be picked.
+        #[test]
+        fn rpe_grid_tie_breaks_to_lower_m() {
+            let mut x = [0i16; SUBFRAME_SAMPLES];
+            // Impulse on grid 1 at i = 0 ⇒ x[1].
+            x[1] = 500;
+            // Impulse on grid 2 at i = 0 ⇒ x[2], same magnitude.
+            x[2] = 500;
+            let g = select_rpe_grid(&x);
+            assert_eq!(g.m_c, 1);
+            // xM = x[1 + 3*i] for i = 0..=12. Only xM[0] is non-zero
+            // (= x[1] = 500); none of x[4], x[7], …, x[37] were set.
+            assert_eq!(g.x_m[0], 500);
+            for i in 1..RPE_PULSES {
+                assert_eq!(g.x_m[i], 0);
+            }
+        }
+
+        /// `xM[i]` corresponds index-for-index with `x[m_c + 3*i]`.
+        /// Build a non-trivial `x[]`, confirm `m_c` is in range, and
+        /// verify each of the 13 emitted samples matches the spec's
+        /// down-sampling formula.
+        #[test]
+        fn rpe_grid_down_sample_indices_correct() {
+            let mut x = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                // Mix of positive and negative samples so the
+                // squared-energy comparison has something to chew on.
+                x[k] = ((k as i32) * 173 - 3000) as i16;
+            }
+            let g = select_rpe_grid(&x);
+            assert!((0..4).contains(&g.m_c));
+            for i in 0..RPE_PULSES {
+                assert_eq!(
+                    g.x_m[i],
+                    x[(g.m_c as usize) + 3 * i],
+                    "xM[{i}] should equal x[{} + 3*{i}] = x[{}]",
+                    g.m_c,
+                    (g.m_c as usize) + 3 * i,
+                );
+            }
+        }
+
+        /// `m_c` must be the argmax of the four per-grid `L_result`
+        /// values (with the strict-`>` tie-break). Verify both that
+        /// the chosen grid's energy is `>= 0` and that no other grid
+        /// strictly exceeds it.
+        #[test]
+        fn rpe_grid_chosen_energy_is_argmax() {
+            let mut x = [0i16; SUBFRAME_SAMPLES];
+            // Use a sparse-ish pattern that puts most energy on
+            // grid 2: large values at indices 2, 5, 8, 11, 14, ….
+            for i in 0..RPE_PULSES {
+                x[2 + 3 * i] = 2500;
+            }
+            // And smaller noise on the other grids.
+            x[0] = 100;
+            x[4] = -150;
+            x[7] = 80;
+            let g = select_rpe_grid(&x);
+            assert_eq!(g.m_c, 2);
+
+            let em_chosen = rpe_grid_energy_reference(&x, g.m_c as usize);
+            for m in 0..4 {
+                let em_other = rpe_grid_energy_reference(&x, m);
+                if m == (g.m_c as usize) {
+                    assert_eq!(em_other, em_chosen);
+                } else {
+                    assert!(
+                        em_other <= em_chosen,
+                        "grid {m} energy {em_other} should not exceed chosen grid {} energy {em_chosen}",
+                        g.m_c,
+                    );
+                }
+            }
+        }
+
+        /// Statelessness across calls. The §5.2.14 spec carries no
+        /// persistent state; intermediate inputs must not perturb a
+        /// later call's output.
+        #[test]
+        fn rpe_grid_stateless() {
+            let mut x1 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                x1[k] = (k as i16) * 13 - 200;
+            }
+            let mut x2 = [0i16; SUBFRAME_SAMPLES];
+            for k in 0..SUBFRAME_SAMPLES {
+                x2[k] = -(k as i16) * 23 + 300;
+            }
+            let g2_before = select_rpe_grid(&x2);
+            let _ = select_rpe_grid(&x1);
+            let g2_after = select_rpe_grid(&x2);
+            assert_eq!(g2_before, g2_after);
         }
 
         // Silence unused-import warning when this private inner
