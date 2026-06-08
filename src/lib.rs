@@ -57,10 +57,17 @@
 //! returning [`analysis::RpeGrid`]: it picks the sub-sampling grid
 //! offset `Mc ∈ {0, 1, 2, 3}` that maximises the down-sampled
 //! energy of `x[]` and emits the 13-pulse sequence
-//! `xM[0..=12] = x[Mc + 3*i]` that §5.2.15 APCM quantisation (a
-//! later round) consumes. The remaining stages (§5.2.15..§5.2.17
-//! APCM quantisation + APCM inverse + RPE grid positioning, then
-//! §1.7 frame packing) arrive in later rounds.
+//! `xM[0..=12] = x[Mc + 3*i]` that §5.2.15 APCM quantisation
+//! consumes. §5.2.15 APCM forward quantisation of the RPE sequence
+//! is exposed as the stateless free function
+//! [`analysis::apcm_quantise_rpe`] returning the
+//! [`ApcmQuantised`] struct: it picks the 6-bit block-maximum
+//! codeword `xmaxc` and the 13 3-bit codewords `xMc[0..=12]` the
+//! §1.7 frame packer emits, plus the post-normalisation
+//! `(exp, mant)` pair §5.2.16 inverse APCM quantisation consumes.
+//! The remaining stages (§5.2.16 encoder-side APCM inverse +
+//! §5.2.17 RPE grid positioning needed to feed §5.2.18, then §1.7
+//! frame packing) arrive in later rounds.
 //! Calling [`make_encoder`] still returns an `Unsupported` error
 //! while those stages land.
 //!
@@ -92,7 +99,7 @@ pub use codec::{make_decoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
-pub use encoder::analysis::{LtpAnalyzer, LtpParameters, RpeGrid};
+pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, PreProcessor};
 pub use error::Error;
 

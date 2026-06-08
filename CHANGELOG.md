@@ -6,6 +6,57 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.15 encoder APCM forward quantisation (2026-06-08).** Lands
+  the §5.2.15 block-maximum + 3-bit pulse coding step that follows
+  §5.2.14. Exposed as the stateless free function
+  `analysis::apcm_quantise_rpe` and the new `analysis::ApcmQuantised
+  { xmaxc, x_mc, exp, mant }` return type:
+  - `apcm_quantise_rpe(x_m: &[i16; 13]) -> ApcmQuantised` runs the
+    §5.2.15 pseudocode verbatim: find `xmax = max |xM[i]|`; pack
+    the 6-bit `xmaxc` codeword via the six-step `temp = xmax >> 9`
+    exponent search and the final
+    `xmaxc = (xmax >> (exp+5)) + (exp << 3)` step (3-bit exp +
+    3-bit mantissa); re-derive the decoded `(exp, mant)` pair
+    (with the §5.2.15 `mant == 0 ⇒ exp = -4, mant = 15` short-
+    circuit and the iterative normalisation that drops `mant` into
+    8..=15 while decrementing `exp` up to three times); then
+    direct-code each pulse via
+    `temp = xM[i] << (6 - exp); temp = mult(temp, NRFAC[mant]);
+    xMc[i] = (temp >> 12) + 4`.
+  - Returns the 6-bit `xmaxc ∈ 0..=63` codeword + 13 × 3-bit
+    `xMc[i] ∈ 0..=7` codewords the §1.7 frame packer (later round)
+    emits as `Xmaxc[1..=4]` + `Xm[1..=4][0..12]` per Table 1.1.
+  - Also returns the post-normalisation `(exp, mant)` pair so the
+    §5.2.16 inverse APCM quantiser (later round) can consume them
+    directly, per the spec's "Keep in memory exp and mant for the
+    following inverse APCM quantizer" note. `mant ∈ 0..=7` after
+    the closing `sub(mant, 8)` step indexes both `NRFAC[..]`
+    (§5.2.15) and `FAC[..]` (§5.2.16).
+  - Backed by §5.4 Table 5.5 `NRFAC[0..=7]` (already staged in
+    `tables.rs` for the staging audit; the encoder now actually
+    consumes it).
+  - Re-exported from the crate root as `ApcmQuantised` for
+    ergonomic access alongside the existing `LtpParameters` /
+    `LtpAnalyzer` / `RpeGrid` re-exports.
+  Eight unit tests cover the zero-input ⇒ `xmaxc = 0`, `(exp, mant)
+  = (-4, 7)`, and all `xMc[i] = 4` centre-code invariant; the §1.7
+  Table 1.1 codeword-range invariants (`xmaxc ∈ 0..=63`,
+  `xMc[i] ∈ 0..=7`) across an i16 magnitude sweep; the §5.2.15
+  determinism and statelessness contracts; the `(exp, mant)` range
+  check across the peak-magnitude sweep (`exp ∈ -4..=6`,
+  `mant ∈ 0..=7`); the §5.2.15 / §5.2.16 round-trip bound (the
+  reconstructed `xMp[i]` recovered by an independently-written
+  §5.2.16 helper lands within the per-exponent quantiser step of
+  the input `xM[i]`); the `xmaxc` doubling-step lift (a 2× peak
+  shifts `xmaxc` by exactly 8 — one exponent band); the `xmaxc`
+  monotonicity across a 14-step peak sweep; and the sign symmetry
+  check (negating every `xM[i]` keeps `xmaxc` / `(exp, mant)`
+  identical and reflects the `xMc[i]` codes around the centre
+  value 4 within ±1 LSB).
+  `make_encoder` still returns `Unsupported` — §5.2.16 encoder-side
+  APCM inverse, §5.2.17 RPE grid positioning, and §1.7 frame
+  packing arrive in later rounds.
+
 - **§5.2.14 encoder RPE grid selection (2026-06-07).** Lands the
   adaptive sample-rate decimation step that follows §5.2.13. Exposed
   as the stateless free function `analysis::select_rpe_grid` and the

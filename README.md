@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.14 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter + weighting filter + RPE grid selection | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13 weighting filter is in place as the stateless `weighting_filter` free function — an 11-tap FIR block filter with zero padding (5 leading + 5 trailing zeros) convolving `e[0..=39]` with Table 5.4 `H[0..=10]` to produce the block-filtered signal `x[0..=39]` the §5.2.14 RPE grid selection consumes. §5.2.14 RPE grid selection is in place as the stateless `select_rpe_grid` free function returning `RpeGrid { m_c, x_m }` — picks the sub-sampling grid `m ∈ {0, 1, 2, 3}` that maximises the squared-energy proxy `Σ L_mult(x[m+3i] >> 2, x[m+3i] >> 2)` and down-samples to emit `xM[0..=12] = x[Mc + 3*i]`, the 13-pulse sequence §5.2.15 APCM quantisation consumes. §5.2.15..§5.2.17 APCM + RPE grid positioning, and §1.7 frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
+| Encoder   | §5.2.0..§5.2.15 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter + weighting filter + RPE grid selection + APCM forward quantisation | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13 weighting filter is in place as the stateless `weighting_filter` free function — an 11-tap FIR block filter with zero padding (5 leading + 5 trailing zeros) convolving `e[0..=39]` with Table 5.4 `H[0..=10]` to produce the block-filtered signal `x[0..=39]` the §5.2.14 RPE grid selection consumes. §5.2.14 RPE grid selection is in place as the stateless `select_rpe_grid` free function returning `RpeGrid { m_c, x_m }` — picks the sub-sampling grid `m ∈ {0, 1, 2, 3}` that maximises the squared-energy proxy `Σ L_mult(x[m+3i] >> 2, x[m+3i] >> 2)` and down-samples to emit `xM[0..=12] = x[Mc + 3*i]`, the 13-pulse sequence §5.2.15 APCM quantisation consumes. §5.2.15 APCM forward quantisation is in place as the stateless `apcm_quantise_rpe` free function returning `ApcmQuantised { xmaxc, x_mc, exp, mant }` — finds the block peak `xmax`, packs it into the 6-bit `xmaxc` codeword (3-bit exponent + 3-bit mantissa), re-derives the post-normalisation `(exp, mant)` pair the §5.2.16 inverse APCM consumes, and direct-codes the 13 RPE samples via Table 5.5 `NRFAC[mant]` into the 13 × 3-bit `xMc[0..=12]` codewords. §5.2.16 encoder-side APCM inverse + §5.2.17 RPE grid positioning needed to feed §5.2.18, and §1.7 frame packing arrive in later rounds. `make_encoder` still returns `Unsupported`. |
 
 ## Implementation
 
@@ -253,9 +253,54 @@ constant) that §5.2.15 APCM quantisation (a later round) consumes.
 The selector is stateless — `x[]` already carries all §5.2.12 /
 §5.2.13 context, and no §4.5 Table 4.2 entry is owned by §5.2.14.
 
-Until §5.2.15..§5.2.17 (APCM quantisation + APCM inverse + RPE
-grid positioning) and the §1.7 frame packer arrive, `make_encoder`
-still returns `Unsupported`.
+## Encoder APCM forward quantisation (§5.2.15)
+
+The §5.2.15 APCM forward-quantisation step is implemented as the
+stateless free function [`analysis::apcm_quantise_rpe`] in
+`src/encoder.rs`. It consumes the §5.2.14 down-sampled 13-pulse
+sequence `xM[0..=12]` and emits the [`ApcmQuantised`] struct holding
+the encoded codewords plus the `(exp, mant)` pair §5.2.16 needs:
+
+* **Block peak** — `xmax = max |xM[i]|` for `i = 0..=12`. This is
+  the saturating `abs` shape the §5.2.4 autocorrelation already uses.
+* **Coding `xmaxc`** — `exp = 0; temp = xmax >> 9;` then a six-step
+  loop increments `exp` once per step until `temp <= 0` (with the
+  spec's `itest` latch turning further increments into no-ops). The
+  6-bit codeword is `xmaxc = (xmax >> (exp+5)) + (exp << 3)` —
+  3-bit exponent in bits 3..=5, 3-bit mantissa in bits 0..=2. The
+  range is `xmaxc ∈ 0..=63`, matching the `Xmaxc[1..=4]` column of
+  §1.7 Table 1.1.
+* **Decoding back to `(exp, mant)`** — re-derives the same exponent
+  and mantissa the §5.2.16 inverse APCM will recover at the decoder.
+  Spec branch: `exp = (xmaxc > 15) ? (xmaxc >> 3) - 1 : 0`,
+  `mant = xmaxc - (exp << 3)`; then the normalisation loop drops
+  `mant` into the 8..=15 range while decrementing `exp`. The
+  trailing `sub(mant, 8)` lands `mant ∈ 0..=7` for the `NRFAC[..]`
+  / `FAC[..]` table indexing.
+* **Direct coding of `xMc[0..=12]`** — for each `i = 0..=12`:
+  - `temp = xM[i] << (6 - exp)` — Q15-style normalisation by the
+    exponent. The §5.1 `<<` operator with a possibly-negative
+    operand falls through to an arithmetic right shift via
+    [`shl_signed`], matching the spec semantics.
+  - `temp = mult(temp, NRFAC[mant])` — 16×16 → 16 Q15 truncating
+    product against Table 5.5 (the inverse-mantissa column).
+  - `xMc[i] = (temp >> 12) + 4` — round-toward-zero followed by the
+    `+4` bias that maps the signed 3-bit pulse to the unsigned
+    0..=7 code §1.7 Table 1.1 emits as `Xm[1..=4][0..12]`. This is
+    the inverse of the decoder's §5.2.16
+    `temp = sub((xMc[i] << 1), 7)` sign-restoration step.
+
+The function is stateless — `xM[]` already carries all §5.2.13 /
+§5.2.14 context, and no §4.5 Table 4.2 entry is owned by §5.2.15.
+The `(exp, mant)` pair is returned to the caller alongside the
+codewords so the §5.2.16 inverse APCM and §5.2.17 RPE grid
+positioning (later rounds) can consume them directly, matching the
+spec's "Keep in memory exp and mant for the following inverse APCM
+quantizer" note.
+
+Until §5.2.16 encoder-side APCM inverse, §5.2.17 RPE grid
+positioning, and the §1.7 frame packer arrive, `make_encoder` still
+returns `Unsupported`.
 
 ## Codec homing (§4.4)
 

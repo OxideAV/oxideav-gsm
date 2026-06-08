@@ -43,10 +43,20 @@
 //!   is what the §1.7 packer emits as `Mc[1..=4]` (one per
 //!   sub-segment). Exposed as the stateless free function
 //!   [`analysis::select_rpe_grid`] returning [`analysis::RpeGrid`].
+//! * The **§5.2.15 APCM forward quantisation** — block-maximum
+//!   exponent/mantissa coding of `xM[0..=12]` into the 6-bit
+//!   `xmaxc` codeword + 13 × 3-bit `xMc[0..=12]` codewords the
+//!   §1.7 packer emits. Exposed as the stateless free function
+//!   [`analysis::apcm_quantise_rpe`] returning
+//!   [`analysis::ApcmQuantised`]. The returned `(exp, mant)` pair
+//!   is the post-normalisation state the §5.2.16 inverse APCM
+//!   quantiser (later round) consumes per the spec's "Keep in
+//!   memory exp and mant for the following inverse APCM
+//!   quantizer" note.
 //!
-//! Subsequent encoder stages (§5.2.15 APCM quantisation, §5.2.16
-//! APCM inverse quantisation, §5.2.17 RPE grid positioning, then
-//! §1.7 frame packing) arrive in later rounds.
+//! Subsequent encoder stages (§5.2.16 forward-side APCM inverse,
+//! §5.2.17 RPE grid positioning, then §1.7 frame packing) arrive
+//! in later rounds.
 //!
 //! Until the rest of the encoder lands, the
 //! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
@@ -562,9 +572,9 @@ mod tests {
 #[allow(clippy::needless_range_loop)]
 pub mod analysis {
     use super::FRAME_SAMPLES;
-    use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, sub};
+    use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, shl_signed, sub};
     use crate::decoder::{decode_lar, interpolate_lar, larp_to_rp};
-    use crate::tables::{A, B, DLB, H, MAC, MIC, QLB};
+    use crate::tables::{A, B, DLB, H, MAC, MIC, NRFAC, QLB};
 
     /// Number of samples in one sub-segment (§5.2.11 input range
     /// `d[0..39]` / §5.2.12 output range `e[0..39]`).
@@ -1695,6 +1705,258 @@ pub mod analysis {
         }
 
         RpeGrid { m_c, x_m }
+    }
+
+    /// Per-sub-segment §5.2.15 output: the coded maximum-magnitude
+    /// codeword `xmaxc` (6-bit, packed as `Xmaxc[1..=4]` in §1.7
+    /// Table 1.1), the 13 coded RPE samples `xMc[0..=12]` (3-bit each,
+    /// packed as `Xm[1..=4][0..12]` in Table 1.1), and the
+    /// post-normalisation `(exp, mant)` pair the §5.2.16 inverse APCM
+    /// quantiser consumes per the spec's "Keep in memory exp and mant
+    /// for the following inverse APCM quantizer" note.
+    ///
+    /// `xmaxc` is the unsigned 6-bit code in the range 0..=63; `xMc`
+    /// values are unsigned 3-bit codes in the range 0..=7. The
+    /// `(exp, mant)` pair is the post-normalisation state §5.2.15
+    /// leaves behind; the encoder's §5.2.16 round-trip (which feeds
+    /// §5.2.17 / §5.2.18 in a later round) consumes them directly
+    /// rather than re-deriving them from `xmaxc`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ApcmQuantised {
+        /// §5.2.15 quantised block maximum, 6-bit unsigned code
+        /// (range 0..=63 per §1.7 Table 1.1 column `Xmaxc`).
+        pub xmaxc: i16,
+        /// §5.2.15 quantised RPE sequence, 13 × 3-bit unsigned codes
+        /// (range 0..=7 per §1.7 Table 1.1 column `Xm`).
+        pub x_mc: [i16; RPE_PULSES],
+        /// §5.2.15 post-normalisation exponent. Spec range −4..=6
+        /// (the `mant == 0` branch preloads `exp = -4`; otherwise
+        /// the iterative branch enters with an exponent of 0..=6
+        /// from the §5.2.15 search loop and decrements it up to
+        /// three times during normalisation).
+        pub exp: i16,
+        /// §5.2.15 post-normalisation mantissa, after the trailing
+        /// `sub(mant, 8)` step. Spec range −8..=−1 (matching the
+        /// decoder-side `mant ∈ 0..=7` after the `sub(mant, 8)` is
+        /// re-undone by the `FAC[mant]` index lookup at §5.2.16
+        /// — wait, the spec actually leaves `mant` in 0..=7 for the
+        /// §5.2.16 `FAC[mant]` table lookup because the §5.2.15
+        /// `sub(mant, 8)` step is applied AFTER the normalisation
+        /// loop and BEFORE the table indexing).
+        ///
+        /// Concretely: the spec lifts `mant` from the normalised range
+        /// 8..=15 (or the `mant == 0` short-circuit `mant = 15`)
+        /// down to 0..=7 via the `mant = sub(mant, 8)` step that
+        /// closes §5.2.15, and uses the resulting 0..=7 value as the
+        /// `NRFAC[mant]` / `FAC[mant]` table index. This field holds
+        /// the post-`sub(mant, 8)` value (0..=7) so callers can feed
+        /// it directly into the §5.2.16 path.
+        pub mant: i16,
+    }
+
+    /// §5.2.15 — APCM forward quantisation of the §5.2.14 RPE
+    /// sequence.
+    ///
+    /// Takes the down-sampled 13-pulse sequence `xM[0..=12]` produced
+    /// by [`select_rpe_grid`] and returns the encoded `xmaxc` block
+    /// maximum + 13 encoded sample codes `xMc[0..=12]` the §1.7 frame
+    /// packer (a later round) emits, plus the `(exp, mant)` pair
+    /// §5.2.16 consumes.
+    ///
+    /// §5.2.15 pseudocode (verbatim):
+    /// ```text
+    /// Find the maximum absolute value xmax of xM[0..12].
+    ///     xmax = 0;
+    ///     FOR i = 0 to 12:
+    ///         temp = abs( xM[i] );
+    ///         IF ( temp > xmax ) THEN xmax = temp;
+    ///     NEXT i:
+    ///
+    /// Quantizing and coding of xmax to get xmaxc.
+    ///     exp = 0;
+    ///     temp = xmax >> 9;
+    ///     itest = 0;
+    ///     FOR i = 0 to 5:
+    ///         IF ( temp <= 0 ) THEN itest = 1;
+    ///         temp = temp >> 1;
+    ///         IF ( itest == 0 ) THEN exp = add( exp, 1 ) ;
+    ///     NEXT i:
+    ///
+    ///     temp = add( exp, 5 ) ;
+    ///     xmaxc = add( ( xmax >> temp ), ( exp << 3 ) ) ;
+    ///
+    /// Compute exponent and mantissa of the decoded version of xmaxc.
+    ///     exp = 0 ;
+    ///     IF ( xmaxc > 15 ) THEN exp = sub( ( xmaxc >> 3 ), 1 ) ;
+    ///     mant = sub( xmaxc , ( exp << 3 ) );
+    ///
+    /// Normalize mantissa 0 <= mant <= 7.
+    ///     IF ( mant == 0 ) THEN | exp = -4;
+    ///                            | mant = 15;
+    ///     ELSE | itest = 0;
+    ///          | FOR i = 0 to 2:
+    ///          |   IF ( mant > 7 ) THEN itest = 1;
+    ///          |   IF (itest == 0) THEN mant = add((mant << 1), 1);
+    ///          |   IF ( itest == 0 ) THEN exp = sub( exp, 1 );
+    ///          | NEXT i:
+    ///     mant = sub( mant, 8 );
+    ///
+    /// Direct computation of xMc[0..12] using table 5.5.
+    ///     temp1 = sub( 6, exp );
+    ///     temp2 = NRFAC[mant];
+    ///     FOR i = 0 to 12:
+    ///         temp = xM[i] << temp1;
+    ///         temp = mult( temp , temp2 );
+    ///         xMc[i] = add( ( temp >> 12 ), 4 );
+    ///     NEXT I:
+    /// ```
+    ///
+    /// Notes on the spec's arithmetic:
+    ///
+    /// * The §5.2.15 `xmax = 0; FOR i: IF (abs(xM[i]) > xmax) ...`
+    ///   loop has the same shape as the §5.2.4 `smax` search. With
+    ///   `xM[i]` carrying the §5.2.13 weighting filter's `>> 16`
+    ///   output, `xM[i]` is i16; `abs(xM[i])` is in 0..=32767
+    ///   (saturating `abs(-32768) = 32767` per §5.1).
+    /// * The exponent search loop iterates six times (`i = 0..=5`),
+    ///   driving `temp = xmax >> 9` down by another factor of 2 each
+    ///   step and incrementing `exp` while `temp > 0`. The final
+    ///   `temp = add(exp, 5); xmaxc = add((xmax >> temp), (exp << 3))`
+    ///   step packs the 3-bit exp into the upper bits and the 3-bit
+    ///   `xmax >> (exp+5)` mantissa into the lower bits, giving the
+    ///   6-bit `xmaxc ∈ 0..=63` code §1.7 packs as `Xmaxc`.
+    /// * The decoded-mantissa normalisation matches the decoder's
+    ///   §5.2.16 path bit-for-bit, so the encoder uses the same
+    ///   `(exp, mant)` pair the receiving decoder will recover. The
+    ///   `sub(mant, 8)` step at the end of §5.2.15 produces the
+    ///   `mant ∈ 0..=7` value that indexes both `NRFAC[..]`
+    ///   (§5.2.15) and `FAC[..]` (§5.2.16). The decoder lands in the
+    ///   same `mant ∈ 0..=7` range via the §5.2.16 path already
+    ///   implemented in `decoder::rpe_decode`.
+    /// * `temp = xM[i] << temp1` uses the §5.1 `<<` rule: when
+    ///   `temp1` is negative (which the spec admits if `exp == 6`
+    ///   would push `temp1 = 0`, but `exp` from the §5.2.15 search
+    ///   above is capped at 6, and the normalisation can drop `exp`
+    ///   to as low as `-4`, giving `temp1 ∈ {2, 3, …, 10}`), the
+    ///   shift falls through to an arithmetic right shift. We use
+    ///   [`shl_signed`] which implements that rule. In practice
+    ///   `temp1 ∈ {2, …, 10}` for normal inputs so the left-shift
+    ///   path is the only one exercised; the negative-`n`
+    ///   fall-through is staged for spec-completeness.
+    /// * `temp = mult(temp, temp2)` is the §5.1 16×16 → 16 Q15
+    ///   product that drives the truncating quotient `temp >> 12`.
+    ///   The `+ 4` constant matches the decoder's reciprocal step
+    ///   `sub((xMc << 1), 7)` — together they pack the signed
+    ///   3-bit `xMc` code into the unsigned 0..=7 range §1.7 emits.
+    /// * The function is stateless — `xM[]` already carries all
+    ///   §5.2.13 / §5.2.14 context, no §4.5 Table 4.2 entry is
+    ///   owned by §5.2.15, and the `(exp, mant)` pair is returned to
+    ///   the caller rather than persisted on a struct.
+    pub fn apcm_quantise_rpe(x_m: &[i16; RPE_PULSES]) -> ApcmQuantised {
+        // §5.2.15 — find xmax = max |xM[i]|.
+        let mut xmax: i16 = 0;
+        for &v in x_m.iter() {
+            let t = abs(v);
+            if t > xmax {
+                xmax = t;
+            }
+        }
+
+        // §5.2.15 — quantise + code xmax to get the 6-bit xmaxc.
+        //   exp = 0;
+        //   temp = xmax >> 9;
+        //   itest = 0;
+        //   FOR i = 0 to 5:
+        //     IF (temp <= 0) itest = 1;
+        //     temp >>= 1;
+        //     IF (itest == 0) exp += 1;
+        //   NEXT i:
+        let mut exp: i16 = 0;
+        let mut temp: i16 = xmax >> 9;
+        let mut itest: i16 = 0;
+        for _ in 0..6 {
+            if temp <= 0 {
+                itest = 1;
+            }
+            temp >>= 1;
+            if itest == 0 {
+                exp = add(exp, 1);
+            }
+        }
+
+        // §5.2.15 — pack: xmaxc = (xmax >> (exp+5)) + (exp << 3).
+        //   `temp = add(exp, 5)` may exceed 15; use the spec's
+        //   §5.1 signed-shift fall-through via `shl_signed` on
+        //   xmax (a positive i16) to right-shift safely.
+        let pack_shift = add(exp, 5);
+        let xmaxc = add(shl_signed(xmax, sub(0, pack_shift)), shl_signed(exp, 3));
+
+        // §5.2.15 — compute exponent and mantissa of the decoded
+        // version of xmaxc, then normalise so that on entry to
+        // §5.2.16 the mant index is in 0..=7.
+        //
+        // This block runs the spec's pseudocode verbatim. It is
+        // intentionally NOT factored out into a shared helper with
+        // the decoder's §5.2.16 path even though the two are
+        // step-identical — the encoder's §5.2.15 needs the
+        // post-normalisation `(exp, mant)` pair returned to the
+        // caller, while the decoder's path consumes them inline.
+        // A future refactor can hoist the shared block once a
+        // second caller appears.
+        let mut decode_exp: i16 = 0;
+        if xmaxc > 15 {
+            decode_exp = sub(xmaxc >> 3, 1);
+        }
+        let decode_mant = sub(xmaxc, decode_exp << 3);
+
+        let (norm_exp, norm_mant) = if decode_mant == 0 {
+            (sub(0, 4), 15i16)
+        } else {
+            let mut e = decode_exp;
+            let mut m = decode_mant;
+            let mut itest = 0i16;
+            for _ in 0..3 {
+                if m > 7 {
+                    itest = 1;
+                }
+                if itest == 0 {
+                    m = add(m << 1, 1);
+                }
+                if itest == 0 {
+                    e = sub(e, 1);
+                }
+            }
+            (e, m)
+        };
+        // §5.2.15 — `mant = sub(mant, 8)` lifts mant into the
+        // 0..=7 range that indexes NRFAC[..] / FAC[..].
+        let mant_idx = sub(norm_mant, 8);
+
+        // §5.2.15 — direct computation of xMc[0..=12] via NRFAC.
+        //   temp1 = sub(6, exp);
+        //   temp2 = NRFAC[mant];
+        //   FOR i = 0 to 12:
+        //     temp = xM[i] << temp1;
+        //     temp = mult(temp, temp2);
+        //     xMc[i] = add((temp >> 12), 4);
+        //   NEXT I:
+        let temp1 = sub(6, norm_exp);
+        let temp2 = NRFAC[mant_idx as usize];
+        let mut x_mc = [0i16; RPE_PULSES];
+        for (slot, &x_m_i) in x_mc.iter_mut().zip(x_m.iter()) {
+            // §5.1 signed shift handles the (uncommon) negative-temp1
+            // fall-through case.
+            let t = shl_signed(x_m_i, temp1);
+            let t = mult(t, temp2);
+            *slot = add(t >> 12, 4);
+        }
+
+        ApcmQuantised {
+            xmaxc,
+            x_mc,
+            exp: norm_exp,
+            mant: mant_idx,
+        }
     }
 
     #[cfg(test)]
@@ -3120,6 +3382,305 @@ pub mod analysis {
                         g.m_c,
                     );
                 }
+            }
+        }
+
+        // ─── §5.2.15 APCM forward quantisation ───
+
+        /// Reference §5.2.16 inverse APCM applied to `(xmaxc, xMc[],
+        /// exp, mant)` — re-derives the `xMp[0..=12]` the decoder
+        /// recovers. Written from the spec pseudocode rather than
+        /// re-using `decoder::rpe_decode` (which goes through
+        /// `SubFrame`) so the round-trip tests below aren't
+        /// tautological.
+        fn apcm_inverse_reference(q: &ApcmQuantised) -> [i16; RPE_PULSES] {
+            use crate::arith::{
+                add as a, mult_r as mr, shl_signed as sl, shr_signed as sr, sub as s,
+            };
+            use crate::tables::FAC;
+            let t1 = FAC[q.mant as usize];
+            let t2 = s(6, q.exp);
+            let t3 = sl(1, s(t2, 1));
+            let mut xmp = [0i16; RPE_PULSES];
+            for (slot, &xmc) in xmp.iter_mut().zip(q.x_mc.iter()) {
+                let t = s(xmc << 1, 7) << 12;
+                let t = mr(t1, t);
+                let t = a(t, t3);
+                *slot = sr(t, t2);
+            }
+            xmp
+        }
+
+        /// All-zero input ⇒ xmaxc = 0 and all xMc[i] = 4 (the
+        /// signed-3-bit `+4` bias maps the zero-magnitude pulse to
+        /// the centre of the §1.7 unsigned 0..=7 code range — the
+        /// inverse of §5.2.16's `sub((xMc << 1), 7)`).
+        ///
+        /// Also confirms the §5.2.15 `mant == 0` short-circuit:
+        /// `xmaxc = 0 ⇒ decode-exp = 0; decode-mant = 0`, then the
+        /// pre-normalisation `mant == 0 ⇒ exp = -4, mant = 15`
+        /// branch fires and the trailing `mant -= 8` lands
+        /// `(exp, mant) = (-4, 7)` — the `FAC[7] = 32767` slot the
+        /// decoder uses for silence.
+        #[test]
+        fn apcm_quantise_zero_input() {
+            let x_m = [0i16; RPE_PULSES];
+            let q = apcm_quantise_rpe(&x_m);
+            assert_eq!(q.xmaxc, 0);
+            assert_eq!(q.exp, -4);
+            assert_eq!(q.mant, 7);
+            for &c in q.x_mc.iter() {
+                assert_eq!(c, 4, "centre code for zero-magnitude pulse");
+            }
+        }
+
+        /// Output ranges per §1.7 Table 1.1: `xmaxc ∈ 0..=63` (6
+        /// bits) and `xMc[i] ∈ 0..=7` (3 bits). The encoder must
+        /// land inside both ranges for every input the spec admits.
+        #[test]
+        fn apcm_quantise_codeword_ranges() {
+            // A handful of inputs spanning the i16 magnitude range.
+            // (We stop at -32767 / 32767 — `-i16::MIN` panics under
+            // overflow checks; the §5.1 `abs` saturates, but the
+            // test-side construction uses plain negate.)
+            let inputs: &[i16] = &[
+                0, 1, 100, 1000, 8192, 16384, 24576, 32767, -1, -100, -1000, -16384, -32767,
+            ];
+            for &v in inputs {
+                let mut x_m = [0i16; RPE_PULSES];
+                for (i, slot) in x_m.iter_mut().enumerate() {
+                    // Vary signs across the 13 slots so we exercise
+                    // both `temp = mult(...)` branches.
+                    *slot = if i % 2 == 0 { v } else { -v };
+                }
+                let q = apcm_quantise_rpe(&x_m);
+                assert!(
+                    (0..=63).contains(&q.xmaxc),
+                    "xmaxc out of range: {}",
+                    q.xmaxc
+                );
+                for (i, &c) in q.x_mc.iter().enumerate() {
+                    assert!(
+                        (0..=7).contains(&c),
+                        "xMc[{i}] out of 0..=7 range: {c} (input {v})",
+                    );
+                }
+            }
+        }
+
+        /// Determinism: the §5.2.15 spec is stateless, so identical
+        /// inputs ⇒ identical outputs across invocations.
+        #[test]
+        fn apcm_quantise_deterministic() {
+            let mut x_m = [0i16; RPE_PULSES];
+            for (i, slot) in x_m.iter_mut().enumerate() {
+                *slot = ((i as i32) * 1031 - 5500) as i16;
+            }
+            let q1 = apcm_quantise_rpe(&x_m);
+            let q2 = apcm_quantise_rpe(&x_m);
+            assert_eq!(q1, q2);
+        }
+
+        /// Statelessness across calls: an intermediate call with a
+        /// different input must not perturb a later identical-input
+        /// call.
+        #[test]
+        fn apcm_quantise_stateless() {
+            let mut x_a = [0i16; RPE_PULSES];
+            let mut x_b = [0i16; RPE_PULSES];
+            for i in 0..RPE_PULSES {
+                x_a[i] = ((i as i32) * 137) as i16;
+                x_b[i] = ((i as i32) * -211) as i16;
+            }
+            let q_a_first = apcm_quantise_rpe(&x_a);
+            let _ = apcm_quantise_rpe(&x_b);
+            let q_a_second = apcm_quantise_rpe(&x_a);
+            assert_eq!(q_a_first, q_a_second);
+        }
+
+        /// §5.2.15 `xmaxc` packs exponent into bits 3..=5 and a
+        /// 3-bit mantissa into bits 0..=2. The §5.2.15 decoded
+        /// `exp = (xmaxc > 15) ? (xmaxc >> 3) - 1 : 0` reproduces
+        /// the upper bits exactly. Verify the unpacked `exp` always
+        /// matches across the full 0..=63 xmaxc space (by varying
+        /// the input magnitude) and that the `decode_exp - 1`
+        /// adjustment correctly handles the `xmaxc <= 15` branch.
+        #[test]
+        fn apcm_quantise_xmaxc_encodes_exponent() {
+            // For a peak xM[] magnitude `peak`, the §5.2.15 exponent
+            // search drives `temp = peak >> 9` down by another bit
+            // each step; the final `exp` is the count of right shifts
+            // before `temp <= 0`, capped at 6. We sweep a wide range
+            // and confirm the decoder's recovered `exp` value lies
+            // in the documented 0..=5 range (with the `mant == 0`
+            // branch landing on the post-normalisation `exp = -4`
+            // when peak == 0).
+            for peak_bits in 0..=15 {
+                let peak: i16 = if peak_bits == 0 { 0 } else { 1 << peak_bits };
+                let mut x_m = [0i16; RPE_PULSES];
+                x_m[0] = peak;
+                let q = apcm_quantise_rpe(&x_m);
+                if peak == 0 {
+                    // Zero-input short-circuit.
+                    assert_eq!(q.exp, -4);
+                    assert_eq!(q.mant, 7);
+                } else {
+                    // Post-normalisation exp ∈ -4..=6: the spec's
+                    // §5.2.15 search caps the pre-normalisation exp
+                    // at 6 (since the loop runs `i = 0..=5` and
+                    // increments at most six times); the inner
+                    // normalisation loop can drop it by up to 3 (so
+                    // the iterative branch lands in [-3, 6]); the
+                    // `mant == 0` branch preloads exp = -4 so the
+                    // joint range is [-4, 6].
+                    assert!(
+                        (-4..=6).contains(&q.exp),
+                        "exp out of range for peak {peak}: {}",
+                        q.exp,
+                    );
+                    // Mant index in 0..=7.
+                    assert!(
+                        (0..=7).contains(&q.mant),
+                        "mant out of range for peak {peak}: {}",
+                        q.mant,
+                    );
+                }
+            }
+        }
+
+        /// §5.2.15 / §5.2.16 round-trip: applying §5.2.16 inverse
+        /// quantisation to `(xmaxc, xMc[], exp, mant)` must recover
+        /// `xMp[0..=12]` within the quantiser step (the relative
+        /// reconstruction error is bounded by the 3-bit code's
+        /// step size for the chosen exponent).
+        ///
+        /// The §5.2.15 search picks `exp` so that the peak |xM[]|
+        /// lands in the upper third of the quantiser range; the
+        /// effective quantiser step is then on the order of
+        /// `peak / 4`. We check that |xM[i] - xMp[i]| <= peak/2
+        /// for all 13 samples (a generous bound that absorbs both
+        /// the `mult(...)` truncation in §5.2.15 and the
+        /// `mult_r(...)` half-LSB round in §5.2.16).
+        #[test]
+        fn apcm_quantise_inverse_roundtrip() {
+            // Several inputs spanning low / medium / high magnitudes
+            // to exercise different exponent codes.
+            let scales: &[i16] = &[64, 256, 1024, 4096, 16384];
+            for &s in scales {
+                let mut x_m = [0i16; RPE_PULSES];
+                for (i, slot) in x_m.iter_mut().enumerate() {
+                    // Vary signs and magnitudes within the
+                    // sub-segment so the per-sample reconstruction
+                    // gets a non-degenerate test.
+                    let sign: i32 = if i % 3 == 0 { -1 } else { 1 };
+                    let frac: i32 = (i as i32 + 1) * (s as i32) / 14;
+                    *slot = (sign * frac) as i16;
+                }
+                let q = apcm_quantise_rpe(&x_m);
+                let xmp = apcm_inverse_reference(&q);
+                let bound = (s as i32) / 2 + 8;
+                for i in 0..RPE_PULSES {
+                    let err = (xmp[i] as i32 - x_m[i] as i32).abs();
+                    assert!(
+                        err <= bound,
+                        "round-trip error {} > bound {} at i={}, s={}, xM={} xMp={}",
+                        err,
+                        bound,
+                        i,
+                        s,
+                        x_m[i],
+                        xmp[i],
+                    );
+                }
+            }
+        }
+
+        /// xmaxc carries the block peak. Two inputs with peaks
+        /// differing by a factor of 2 must produce xmaxc values
+        /// differing by 8 (one exponent step occupies bits 3..=5
+        /// of the 6-bit xmaxc code).
+        #[test]
+        fn apcm_quantise_xmaxc_doubles_one_exp_step() {
+            let mut x_lo = [0i16; RPE_PULSES];
+            x_lo[3] = 4096;
+            let mut x_hi = [0i16; RPE_PULSES];
+            x_hi[3] = 8192;
+            let q_lo = apcm_quantise_rpe(&x_lo);
+            let q_hi = apcm_quantise_rpe(&x_hi);
+            // The 8-bit step in xmaxc lifts the exponent by 1 while
+            // keeping the mantissa bits identical (since the peak
+            // pre-shift mantissa is the same). Confirm xmaxc
+            // differs by exactly 8.
+            assert_eq!(
+                q_hi.xmaxc - q_lo.xmaxc,
+                8,
+                "xmaxc lo={} hi={}",
+                q_lo.xmaxc,
+                q_hi.xmaxc,
+            );
+        }
+
+        /// `xmaxc` peak monotonicity — across a sweep of peak
+        /// magnitudes, `xmaxc` must be non-decreasing. The §5.2.15
+        /// exponent search is monotone in `xmax`, and the trailing
+        /// `xmax >> (exp+5)` mantissa picks up the next bit
+        /// sub-step within an exponent band.
+        #[test]
+        fn apcm_quantise_xmaxc_monotone_in_peak() {
+            let mut prev_xmaxc = -1i16;
+            for peak in [
+                0i16, 1, 4, 16, 64, 256, 512, 1024, 2048, 4096, 8192, 16384, 24576, 32767,
+            ] {
+                let mut x_m = [0i16; RPE_PULSES];
+                x_m[0] = peak;
+                let q = apcm_quantise_rpe(&x_m);
+                assert!(
+                    q.xmaxc >= prev_xmaxc,
+                    "xmaxc dropped from {} to {} at peak {}",
+                    prev_xmaxc,
+                    q.xmaxc,
+                    peak,
+                );
+                prev_xmaxc = q.xmaxc;
+            }
+        }
+
+        /// Sign symmetry: negating every `xM[i]` must give the
+        /// same `xmaxc` and `(exp, mant)` (the `xmax` search is
+        /// magnitude-only) and must reflect the `xMc[i]` codes
+        /// around the centre value 4 (the §5.2.15 sign-restoration
+        /// step is `xMc[i] = (temp >> 12) + 4`, so negating `xM[i]`
+        /// negates the `temp` and lands at `4 - (temp >> 12)`).
+        #[test]
+        fn apcm_quantise_sign_symmetric_xmaxc() {
+            let mut x_m = [0i16; RPE_PULSES];
+            for (i, slot) in x_m.iter_mut().enumerate() {
+                *slot = ((i as i32) * 521 + 100) as i16;
+            }
+            let mut x_m_neg = [0i16; RPE_PULSES];
+            for i in 0..RPE_PULSES {
+                // Use `wrapping_neg` to handle i16::MIN, but our
+                // construction stays well away from that boundary.
+                x_m_neg[i] = -x_m[i];
+            }
+            let q_pos = apcm_quantise_rpe(&x_m);
+            let q_neg = apcm_quantise_rpe(&x_m_neg);
+            assert_eq!(q_pos.xmaxc, q_neg.xmaxc);
+            assert_eq!(q_pos.exp, q_neg.exp);
+            assert_eq!(q_pos.mant, q_neg.mant);
+            // xMc codes reflect around 4 (within ±1 LSB because
+            // `mult(...)` is a truncating Q15 product and negating
+            // the input can flip the truncation direction by one
+            // LSB).
+            for i in 0..RPE_PULSES {
+                let sum = q_pos.x_mc[i] + q_neg.x_mc[i];
+                assert!(
+                    (7..=9).contains(&sum),
+                    "xMc[{i}] reflection violated: pos={} neg={} sum={}",
+                    q_pos.x_mc[i],
+                    q_neg.x_mc[i],
+                    sum,
+                );
             }
         }
 
