@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.2.16 + §5.2.17 encoder APCM inverse + RPE grid positioning
+  (2026-06-10).** Lands the encoder's local-decoder feedback path
+  that closes the §5.2.18 LTP delay-line loop. Exposed as the
+  stateless free function `analysis::apcm_inverse_and_position` plus
+  the `analysis::LtpAnalyzer::reconstruct_and_update` method:
+  - `apcm_inverse_and_position(x_mc: &[i16; 13], exp, mant, m_c)
+    -> [i16; 40]` runs §5.2.16 (`temp1 = FAC[mant]; temp2 =
+    sub(6, exp); temp3 = 1 << sub(temp2, 1)`, then per pulse
+    `temp = sub((xMc[i] << 1), 7) << 12; temp = mult_r(temp1, temp);
+    temp = add(temp, temp3); xMp[i] = temp >> temp2`) followed by
+    §5.2.17 grid positioning (`ep[Mc + 3*i] = xMp[i]` in an
+    otherwise-zero 40-sample buffer). Consumes the post-normalisation
+    `(exp, mant)` pair §5.2.15 returns directly rather than
+    re-deriving them from `xmaxc`, per the §5.2.15 "Keep in memory
+    exp and mant for the following inverse APCM quantizer" note. The
+    §5.2.16 arithmetic is bit-identical to the decoder's §5.3.1
+    `decoder::rpe_decode` path.
+  - `LtpAnalyzer::reconstruct_and_update(apcm, m_c, dpp) -> [i16; 40]`
+    runs §5.2.16 → §5.2.17 → §5.2.18 in one call: reconstructs
+    `ep[0..=39]`, then folds `add(ep[k], dpp[k])` back into the §4.5
+    `dp[-120..=-1]` delay line via the existing
+    `update_dp_after_subframe`. This is the encoder's local-decoder
+    history; a `bc = 0` first-sub-segment test confirms the resulting
+    `dp[..]` is bit-exact with the decoder's reconstructed residual.
+  - With §5.2.16/§5.2.17 in place the per-sub-segment §5.2.11..§5.2.18
+    LTP feedback loop is now closeable end-to-end; only the §1.7 frame
+    packer remains before `make_encoder` can land.
+
 - **§5.2.15 encoder APCM forward quantisation (2026-06-08).** Lands
   the §5.2.15 block-maximum + 3-bit pulse coding step that follows
   §5.2.14. Exposed as the stateless free function

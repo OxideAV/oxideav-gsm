@@ -65,11 +65,17 @@
 //! codeword `xmaxc` and the 13 3-bit codewords `xMc[0..=12]` the
 //! §1.7 frame packer emits, plus the post-normalisation
 //! `(exp, mant)` pair §5.2.16 inverse APCM quantisation consumes.
-//! The remaining stages (§5.2.16 encoder-side APCM inverse +
-//! §5.2.17 RPE grid positioning needed to feed §5.2.18, then §1.7
-//! frame packing) arrive in later rounds.
-//! Calling [`make_encoder`] still returns an `Unsupported` error
-//! while those stages land.
+//! §5.2.16 encoder-side APCM inverse + §5.2.17 RPE grid positioning
+//! are exposed as the stateless free function
+//! [`analysis::apcm_inverse_and_position`]: it dequantises
+//! `xMc[0..=12]` back to `xMp[0..=12]` via Table 5.6 `FAC[mant]`
+//! (bit-identical to the decoder's §5.3.1 path) and scatters them
+//! into the reconstructed long-term residual `ep[Mc + 3*i]`.
+//! [`analysis::LtpAnalyzer::reconstruct_and_update`] chains
+//! §5.2.16 → §5.2.17 → §5.2.18 to close the per-sub-segment LTP
+//! delay-line feedback loop. Only the §1.7 frame packer remains
+//! before [`make_encoder`] can land; it still returns an
+//! `Unsupported` error while that stage lands.
 //!
 //! ## Carriage format
 //!

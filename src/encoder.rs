@@ -50,13 +50,22 @@
 //!   [`analysis::apcm_quantise_rpe`] returning
 //!   [`analysis::ApcmQuantised`]. The returned `(exp, mant)` pair
 //!   is the post-normalisation state the §5.2.16 inverse APCM
-//!   quantiser (later round) consumes per the spec's "Keep in
-//!   memory exp and mant for the following inverse APCM
-//!   quantizer" note.
+//!   quantiser consumes per the spec's "Keep in memory exp and
+//!   mant for the following inverse APCM quantizer" note.
+//! * The **§5.2.16 APCM inverse + §5.2.17 RPE grid positioning** —
+//!   the encoder's local-decoder feedback path. Dequantises the
+//!   §5.2.15 `xMc[0..=12]` codewords back to `xMp[0..=12]` via
+//!   Table 5.6 `FAC[mant]` (bit-identical to the decoder's §5.3.1
+//!   path) and scatters them into the reconstructed long-term
+//!   residual `ep[Mc + 3*i]`. Exposed as the stateless free
+//!   function [`analysis::apcm_inverse_and_position`];
+//!   [`analysis::LtpAnalyzer::reconstruct_and_update`] chains
+//!   §5.2.16 → §5.2.17 → §5.2.18 to fold `add(ep[k], dpp[k])` back
+//!   into the §4.5 `dp[-120..=-1]` delay line, closing the
+//!   per-sub-segment LTP feedback loop.
 //!
-//! Subsequent encoder stages (§5.2.16 forward-side APCM inverse,
-//! §5.2.17 RPE grid positioning, then §1.7 frame packing) arrive
-//! in later rounds.
+//! The remaining encoder stage — §1.7 frame packing — arrives in a
+//! later round.
 //!
 //! Until the rest of the encoder lands, the
 //! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
@@ -572,9 +581,11 @@ mod tests {
 #[allow(clippy::needless_range_loop)]
 pub mod analysis {
     use super::FRAME_SAMPLES;
-    use crate::arith::{abs, add, div, l_add, l_mult, mult, mult_r, norm, shl_signed, sub};
+    use crate::arith::{
+        abs, add, div, l_add, l_mult, mult, mult_r, norm, shl_signed, shr_signed, sub,
+    };
     use crate::decoder::{decode_lar, interpolate_lar, larp_to_rp};
-    use crate::tables::{A, B, DLB, H, MAC, MIC, NRFAC, QLB};
+    use crate::tables::{A, B, DLB, FAC, H, MAC, MIC, NRFAC, QLB};
 
     /// Number of samples in one sub-segment (§5.2.11 input range
     /// `d[0..39]` / §5.2.12 output range `e[0..39]`).
@@ -1514,6 +1525,37 @@ pub mod analysis {
                 self.dp_hist[SUBFRAME_SAMPLES - 1 - k] = add(ep[k], dpp[k]);
             }
         }
+
+        /// Close the §5.2.16 → §5.2.17 → §5.2.18 local-decoder loop for
+        /// one sub-segment.
+        ///
+        /// Given the §5.2.15 [`ApcmQuantised`] codewords + the §5.2.14
+        /// grid offset `m_c` + the §5.2.12 long-term prediction estimate
+        /// `dpp[0..=39]`, this method:
+        ///
+        /// 1. runs §5.2.16 + §5.2.17 ([`apcm_inverse_and_position`]) to
+        ///    reconstruct the long-term residual `ep[0..=39]`, then
+        /// 2. runs §5.2.18 ([`Self::update_dp_after_subframe`]) to fold
+        ///    `add(ep[k], dpp[k])` back into the §4.5 `dp[-120..=-1]`
+        ///    delay line.
+        ///
+        /// This is the encoder's local-decoder feedback path: the
+        /// reconstructed `dp[..]` history it builds here is bit-identical
+        /// to the `drp[..]` the receiving decoder builds in §5.3.2, so
+        /// the next sub-segment's §5.2.11 cross-correlation search runs
+        /// on the same history the decoder will see. It returns the
+        /// reconstructed `ep[0..=39]` in case the caller wants to
+        /// inspect it (e.g. for a per-sub-segment trace comparison).
+        pub fn reconstruct_and_update(
+            &mut self,
+            apcm: &ApcmQuantised,
+            m_c: i16,
+            dpp: &[i16; SUBFRAME_SAMPLES],
+        ) -> [i16; SUBFRAME_SAMPLES] {
+            let ep = apcm_inverse_and_position(&apcm.x_mc, apcm.exp, apcm.mant, m_c);
+            self.update_dp_after_subframe(&ep, dpp);
+            ep
+        }
     }
 
     impl LtpAnalyzer {
@@ -1957,6 +1999,116 @@ pub mod analysis {
             exp: norm_exp,
             mant: mant_idx,
         }
+    }
+
+    /// §5.2.16 + §5.2.17 — encoder-side APCM inverse quantisation and
+    /// RPE grid positioning, producing the reconstructed long-term
+    /// residual `ep[0..=39]` the §5.2.18 dp-update folds back into the
+    /// LTP delay line.
+    ///
+    /// The encoder runs the **same** inverse-quantisation arithmetic
+    /// the decoder applies in §5.3.1 (`decoder::rpe_decode`), but it
+    /// already holds the post-normalisation `(exp, mant)` pair from
+    /// §5.2.15 ([`apcm_quantise_rpe`]'s [`ApcmQuantised`] return) per
+    /// the §5.2.15 "Keep in memory exp and mant for the following
+    /// inverse APCM quantizer" note — so unlike the decoder it does
+    /// **not** re-derive `(exp, mant)` from `xmaxc`. The
+    /// `mant` argument is the `mant ∈ 0..=7` index that drives
+    /// `FAC[mant]`; the `exp` argument is the post-normalisation
+    /// exponent (spec range −4..=6); `x_mc[0..=12]` are the 3-bit RPE
+    /// codewords (0..=7); and `m_c ∈ {0, 1, 2, 3}` is the §5.2.14
+    /// grid offset.
+    ///
+    /// §5.2.16 pseudocode (verbatim):
+    /// ```text
+    /// temp1 = FAC[mant];               see 5.2.15 for mant
+    /// temp2 = sub( 6, exp );           see 5.2.15 for exp
+    /// temp3 = 1 << sub( temp2, 1 );
+    ///
+    /// FOR i = 0 to 12:
+    ///     temp = sub( ( xMc[i] << 1 ), 7 );   /restore the sign/
+    ///     temp = temp << 12;
+    ///     temp = mult_r( temp1, temp );
+    ///     temp = add( temp, temp3 );
+    ///     xMp[i] = temp >> temp2;
+    /// NEXT i:
+    /// ```
+    ///
+    /// §5.2.17 pseudocode (verbatim):
+    /// ```text
+    /// FOR k = 0 to 39:
+    ///     ep[k] = 0;
+    /// NEXT k:
+    /// FOR i = 0 to 12:
+    ///     ep[Mc + (3*i)] = xMp[i];
+    /// NEXT i:
+    /// ```
+    ///
+    /// Notes on the spec's arithmetic:
+    ///
+    /// * `temp = sub((xMc[i] << 1), 7)` is the §5.2.16 NOTE
+    ///   sign-restoration step: it is the exact inverse of the §5.2.15
+    ///   `xMc[i] = add((temp >> 12), 4)` pack — the §5.2.15 `+ 4`
+    ///   biased the signed 3-bit pulse into the unsigned 0..=7 code,
+    ///   and `(xMc << 1) - 7` re-centres it.
+    /// * `temp2 = sub(6, exp)` is the §5.2.16 right-shift count; with
+    ///   `exp ∈ −4..=6` it lies in `0..=10`. The §5.1 `>>` operator
+    ///   handles the non-negative count directly, so [`shr_signed`]
+    ///   covers the (unreachable for valid `exp`) negative-count
+    ///   fall-through for spec completeness.
+    /// * `temp3 = 1 << (temp2 - 1)` is the §5.2.16 rounding constant.
+    ///   For `temp2 ∈ 1..=10` this is `1, 2, … 512`; the
+    ///   `temp2 == 0` case (`exp == 6`) would make `temp2 - 1 == -1`,
+    ///   which the §5.1 `<<` rule turns into `1 >> 1 == 0` via
+    ///   [`shl_signed`] — i.e. no rounding, matching the decoder's
+    ///   identical step.
+    /// * The function is stateless — it owns no §4.5 Table 4.2 entry.
+    ///   The §4.5 `dp[-120..=-1]` delay line that §5.2.18 updates is
+    ///   held by [`LtpAnalyzer`]; this routine only produces the
+    ///   `ep[..]` input to that update.
+    ///
+    /// Returns the reconstructed long-term residual `ep[0..=39]`. Feed
+    /// it (together with the §5.2.12 `dpp[0..=39]`) into
+    /// [`LtpAnalyzer::update_dp_after_subframe`] to close the §5.2.18
+    /// loop, or use [`LtpAnalyzer::reconstruct_and_update`] which runs
+    /// this step and the dp-update together.
+    pub fn apcm_inverse_and_position(
+        x_mc: &[i16; RPE_PULSES],
+        exp: i16,
+        mant: i16,
+        m_c: i16,
+    ) -> [i16; SUBFRAME_SAMPLES] {
+        // §5.2.16 — APCM inverse quantisation: xMc[0..=12] → xMp[0..=12].
+        let temp1 = FAC[mant as usize];
+        let temp2 = sub(6, exp);
+        // `temp3 = 1 << sub(temp2, 1)`; the §5.1 `<<` rule (via
+        // shl_signed) turns the `temp2 == 0` ⇒ shift-by-(-1) case into
+        // a right shift, matching the decoder's identical §5.2.16 step.
+        let temp3 = shl_signed(1, sub(temp2, 1));
+
+        let mut x_mp = [0i16; RPE_PULSES];
+        for (slot, &xmc_raw) in x_mp.iter_mut().zip(x_mc.iter()) {
+            // §5.2.16: temp = sub((xMc[i] << 1), 7); temp <<= 12;
+            //          temp = mult_r(temp1, temp); temp = add(temp, temp3);
+            //          xMp[i] = temp >> temp2.
+            let t = sub(xmc_raw << 1, 7) << 12;
+            let t = mult_r(temp1, t);
+            let t = add(t, temp3);
+            *slot = shr_signed(t, temp2);
+        }
+
+        // §5.2.17 — RPE grid positioning: drop the 13 dequantised
+        // pulses at Mc, Mc+3, …, Mc+36 in an otherwise-zero 40-sample
+        // buffer.
+        let mut ep = [0i16; SUBFRAME_SAMPLES];
+        let mc = m_c as usize;
+        for (i, &pulse) in x_mp.iter().enumerate() {
+            let idx = mc + 3 * i;
+            if idx < SUBFRAME_SAMPLES {
+                ep[idx] = pulse;
+            }
+        }
+        ep
     }
 
     #[cfg(test)]
@@ -3701,6 +3853,167 @@ pub mod analysis {
             let _ = select_rpe_grid(&x1);
             let g2_after = select_rpe_grid(&x2);
             assert_eq!(g2_before, g2_after);
+        }
+
+        // ─── §5.2.16 + §5.2.17 APCM inverse + RPE grid positioning ───
+
+        /// §5.2.16 half of [`apcm_inverse_and_position`] must produce
+        /// exactly the `xMp[0..=12]` the independent
+        /// [`apcm_inverse_reference`] helper recovers — and, by
+        /// construction, the same pulses the decoder's `rpe_decode`
+        /// builds. The §5.2.17 grid-positioning step then scatters
+        /// those 13 `xMp` values into the `ep[Mc + 3*i]` slots, so we
+        /// read them back out of `ep[]` at those positions.
+        #[test]
+        fn apcm_inverse_matches_reference_xmp() {
+            // A spread of magnitudes so several different (exp, mant)
+            // pairs are exercised.
+            let inputs: &[i16] = &[0, 1, 100, 1000, 8192, 16384, 24576, 32767, -1000, -16384];
+            for &v in inputs {
+                let mut x_m = [0i16; RPE_PULSES];
+                for (i, slot) in x_m.iter_mut().enumerate() {
+                    *slot = if i % 2 == 0 { v } else { -v };
+                }
+                let q = apcm_quantise_rpe(&x_m);
+                let xmp_ref = apcm_inverse_reference(&q);
+                // Run §5.2.16 + §5.2.17 with Mc = 0 so the pulses land
+                // at indices 0, 3, …, 36 and are directly comparable
+                // to the reference xMp[].
+                let ep = apcm_inverse_and_position(&q.x_mc, q.exp, q.mant, 0);
+                for i in 0..RPE_PULSES {
+                    assert_eq!(
+                        ep[3 * i],
+                        xmp_ref[i],
+                        "xMp[{i}] mismatch (input {v}): pipeline={} ref={}",
+                        ep[3 * i],
+                        xmp_ref[i],
+                    );
+                }
+            }
+        }
+
+        /// §5.2.17 grid positioning: with grid offset `Mc`, the 13
+        /// reconstructed pulses land at `Mc, Mc+3, …, Mc+36` and every
+        /// other slot is zero. Verify the non-zero footprint for each
+        /// of the four grids.
+        #[test]
+        fn rpe_grid_positioning_footprint() {
+            // A non-silent input so the dequantised pulses are non-zero
+            // for at least some positions.
+            let mut x_m = [0i16; RPE_PULSES];
+            for (i, slot) in x_m.iter_mut().enumerate() {
+                *slot = ((i as i32) * 1700 - 9000) as i16;
+            }
+            let q = apcm_quantise_rpe(&x_m);
+            for m_c in 0..4i16 {
+                let ep = apcm_inverse_and_position(&q.x_mc, q.exp, q.mant, m_c);
+                let mc = m_c as usize;
+                // The 13 pulse positions are exactly {Mc + 3*i}.
+                let pulse_positions: std::collections::HashSet<usize> =
+                    (0..RPE_PULSES).map(|i| mc + 3 * i).collect();
+                for k in 0..SUBFRAME_SAMPLES {
+                    if !pulse_positions.contains(&k) {
+                        assert_eq!(ep[k], 0, "off-grid sample ep[{k}] must be zero (Mc={m_c})");
+                    }
+                }
+                // The deepest pulse position is Mc + 36; for Mc=3 that
+                // is index 39, the last sample — still in-bounds.
+                assert_eq!(mc + 3 * (RPE_PULSES - 1), mc + 36);
+            }
+        }
+
+        /// §5.2.15 → §5.2.16 round-trip: the dequantised pulse train
+        /// `xMp[i]` tracks the sign and rough magnitude of the original
+        /// `xM[i]`. The quantiser is lossy, but for a clearly non-zero
+        /// pulse the reconstructed value must share its sign.
+        #[test]
+        fn apcm_inverse_roundtrip_tracks_sign() {
+            let mut x_m = [0i16; RPE_PULSES];
+            for (i, slot) in x_m.iter_mut().enumerate() {
+                // Alternating, clearly non-zero magnitudes well away
+                // from the quantiser's dead zone.
+                *slot = if i % 2 == 0 { 6000 } else { -6000 };
+            }
+            let q = apcm_quantise_rpe(&x_m);
+            let ep = apcm_inverse_and_position(&q.x_mc, q.exp, q.mant, 0);
+            for i in 0..RPE_PULSES {
+                let recon = ep[3 * i];
+                if x_m[i] > 0 {
+                    assert!(recon > 0, "pulse {i}: +input ⇒ +recon, got {recon}");
+                } else {
+                    assert!(recon < 0, "pulse {i}: -input ⇒ -recon, got {recon}");
+                }
+            }
+        }
+
+        /// Determinism + statelessness of [`apcm_inverse_and_position`]:
+        /// identical arguments ⇒ identical output, and an intervening
+        /// call with other arguments does not perturb a later call.
+        #[test]
+        fn apcm_inverse_stateless() {
+            let x_mc_a = [4i16, 0, 7, 1, 6, 2, 5, 3, 4, 0, 7, 1, 6];
+            let x_mc_b = [0i16, 7, 4, 6, 1, 5, 2, 4, 3, 7, 0, 6, 1];
+            let a1 = apcm_inverse_and_position(&x_mc_a, 3, 5, 1);
+            let _ = apcm_inverse_and_position(&x_mc_b, -2, 0, 2);
+            let a2 = apcm_inverse_and_position(&x_mc_a, 3, 5, 1);
+            assert_eq!(a1, a2);
+        }
+
+        /// §5.2.16 → §5.2.17 → §5.2.18 closed loop: the encoder's
+        /// local-decoder `dp[..]` history built by
+        /// [`LtpAnalyzer::reconstruct_and_update`] must match the
+        /// reconstructed long-term residual the **receiving decoder**
+        /// recovers from the identical parameters.
+        ///
+        /// For the very first sub-segment from the §4.5 / §4.6 home
+        /// state with `bc = 0`, the §5.3.2 long-term predictor adds
+        /// nothing (`drp[k] = add(erp[k], mult_r(QLB[0], drp[k - Nr]))`
+        /// and the delay line is all-zero), so the decoder's
+        /// reconstructed short-term residual `drp[k]` equals the §5.2.17
+        /// `erp[k]`. We reconstruct the decoder's `erp[..]` here from
+        /// the independent [`apcm_inverse_reference`] helper (which
+        /// mirrors `decoder::rpe_decode`'s §5.2.16 math) plus §5.2.17
+        /// grid positioning, and confirm the encoder's freshly-pushed
+        /// `dp[-1..=-40]` slot matches it sample-for-sample.
+        #[test]
+        fn closed_loop_dp_matches_decoder_residual() {
+            // A non-silent RPE input.
+            let mut x_m = [0i16; RPE_PULSES];
+            for (i, slot) in x_m.iter_mut().enumerate() {
+                *slot = ((i as i32) * 1300 - 7000) as i16;
+            }
+            let q = apcm_quantise_rpe(&x_m);
+            let m_c = 2i16;
+
+            // Encoder side: dpp = 0 (bc = 0 ⇒ no long-term prediction),
+            // so dp[k] = add(ep[k], 0) = ep[k].
+            let dpp = [0i16; SUBFRAME_SAMPLES];
+            let mut enc = LtpAnalyzer::new();
+            let ep = enc.reconstruct_and_update(&q, m_c, &dpp);
+
+            // Decoder-side reference erp[..]: §5.2.16 (via the
+            // reference helper) + §5.2.17 grid positioning with the
+            // same Mc.
+            let xmp_ref = apcm_inverse_reference(&q);
+            let mut erp_ref = [0i16; SUBFRAME_SAMPLES];
+            for (i, &p) in xmp_ref.iter().enumerate() {
+                let idx = (m_c as usize) + 3 * i;
+                if idx < SUBFRAME_SAMPLES {
+                    erp_ref[idx] = p;
+                }
+            }
+
+            // The §5.2.17 ep[..] the encoder produced must equal the
+            // decoder's erp[..], and the §5.2.18 dp-update (bc = 0 ⇒
+            // dpp = 0) lands dp[-1..=-40] = ep[39..=0] in dp_hist[0..=39].
+            for k in 0..SUBFRAME_SAMPLES {
+                assert_eq!(ep[k], erp_ref[k], "ep/erp mismatch at k={k}");
+                assert_eq!(
+                    enc.dp_hist()[SUBFRAME_SAMPLES - 1 - k],
+                    erp_ref[k],
+                    "dp/drp mismatch at k={k}",
+                );
+            }
         }
 
         // Silence unused-import warning when this private inner
