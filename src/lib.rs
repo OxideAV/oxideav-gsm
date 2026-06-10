@@ -16,10 +16,12 @@
 //! Two API tiers per the workspace's dual-API convention:
 //!
 //! * **Registry path**: [`register`] / [`codec::register_codecs`]
-//!   install a `Decoder` factory under the canonical codec id
-//!   `"gsm"` in the workspace [`oxideav_core::CodecRegistry`].
-//! * **Direct factory**: [`make_decoder`] returns a boxed
-//!   `Decoder` for a given [`oxideav_core::CodecParameters`].
+//!   install `Decoder` + `Encoder` factories under the canonical
+//!   codec id `"gsm"` in the workspace
+//!   [`oxideav_core::CodecRegistry`].
+//! * **Direct factories**: [`make_decoder`] / [`make_encoder`]
+//!   return a boxed `Decoder` / `Encoder` for a given
+//!   [`oxideav_core::CodecParameters`].
 //!
 //! Beneath those, the lower-level building blocks are also public
 //! for callers who want to drive the decode pipeline without going
@@ -73,9 +75,12 @@
 //! into the reconstructed long-term residual `ep[Mc + 3*i]`.
 //! [`analysis::LtpAnalyzer::reconstruct_and_update`] chains
 //! §5.2.16 → §5.2.17 → §5.2.18 to close the per-sub-segment LTP
-//! delay-line feedback loop. Only the §1.7 frame packer remains
-//! before [`make_encoder`] can land; it still returns an
-//! `Unsupported` error while that stage lands.
+//! delay-line feedback loop. The §1.7 Table 1.1 frame packer
+//! ([`UnpackedFrame::to_bit_stream_msb_first`]) and the frame-level
+//! driver [`EncoderState`] complete the chain: [`make_encoder`] now
+//! returns a working [`oxideav_core::Encoder`] that turns mono S16
+//! 8 kHz input into 33-byte coded frames, and the registry entry
+//! advertises both directions.
 //!
 //! ## Carriage format
 //!
@@ -101,26 +106,18 @@ pub mod error;
 pub mod tables;
 
 pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
-pub use codec::{make_decoder, CODEC_ID};
+pub use codec::{make_decoder, make_encoder, CODEC_ID};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
 pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
-pub use encoder::{analysis, PreProcessor};
+pub use encoder::{analysis, EncoderState, PreProcessor};
 pub use error::Error;
 
-use oxideav_core::{CodecParameters, Encoder, Result, RuntimeContext};
+use oxideav_core::RuntimeContext;
 
-/// Direct-factory placeholder for the GSM 06.10 encoder. Returns an
-/// unsupported-error for now — the §3.1 / §5.2 encoder lands in a
-/// later round.
-pub fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(oxideav_core::Error::unsupported(
-        "oxideav-gsm: encoder not yet implemented; decoder only in this round",
-    ))
-}
-
-/// Install the GSM 06.10 RPE-LTP decoder into the runtime context.
+/// Install the GSM 06.10 RPE-LTP decoder + encoder into the runtime
+/// context.
 pub fn register(ctx: &mut RuntimeContext) {
     codec::register_codecs(&mut ctx.codecs);
 }
@@ -138,8 +135,8 @@ mod tests {
     }
 
     #[test]
-    fn make_encoder_returns_unsupported() {
-        let p = CodecParameters::audio(oxideav_core::CodecId::new("gsm"));
-        assert!(make_encoder(&p).is_err());
+    fn make_encoder_builds_for_default_audio_params() {
+        let p = oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("gsm"));
+        assert!(make_encoder(&p).is_ok());
     }
 }

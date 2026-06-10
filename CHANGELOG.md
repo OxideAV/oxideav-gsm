@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§1.7 frame packer + frame-level encoder driver + `make_encoder`
+  (2026-06-11).** Completes the encode path end-to-end:
+  - `UnpackedFrame::to_bit_stream_msb_first() -> [u8; 33]` packs the
+    76 codewords into the 260-bit `b1..b260` stream per §1.7
+    Table 1.1 — parameters in order of occurrence (eight LARc with
+    widths 6/6/5/5/4/4/3/3, then four 56-bit sub-frames of `Nc`/`bc`/
+    `Mc`/`xmaxc`/`xMc[0..=12]`), each parameter LSB-first within its
+    bit range per the table's "(LSB-MSB)" column, `b1` in the MSB of
+    byte 0. The 4 spare bits (b261..b264) of byte 32 stay zero. The
+    exact mirror of `from_bit_stream_msb_first`; pack∘unpack and
+    unpack∘pack identities are tested at both the struct and byte
+    level.
+  - `EncoderState` — the frame-level §5.2 driver aggregating
+    `PreProcessor` (§5.2.0..§5.2.3), `analysis::Analyzer`
+    (§5.2.4..§5.2.10), and `analysis::LtpAnalyzer`
+    (§5.2.11..§5.2.18). `encode_frame(&[i16; 160]) -> UnpackedFrame`
+    runs pre-processing, LPC analysis + LAR quantisation, then the
+    four per-sub-segment LTP → weighting → RPE grid → APCM →
+    local-decoder-feedback passes and emits the 76 codewords.
+    `new`/`reset` restore the complete §4.5 Table 4.2 encoder home
+    state in one call.
+  - `make_encoder` — real `oxideav_core::Encoder` factory (mono S16
+    8 kHz in, one 33-byte packet per 160-sample frame out, with
+    sample-accurate pts/duration in the 1/8000 time base; input
+    framing need not align to the 20 ms codec frame; `flush`
+    zero-pads a trailing partial frame). The registry entry now
+    advertises `encode = true` alongside the decoder. Tested with
+    silence/loud-input codeword-range checks, reset-determinism,
+    a ≥6 dB encode→decode roundtrip floor on a periodic signal, and
+    a bit-level encode → pack → unpack → decode equivalence test.
+
 - **§5.2.16 + §5.2.17 encoder APCM inverse + RPE grid positioning
   (2026-06-10).** Lands the encoder's local-decoder feedback path
   that closes the §5.2.18 LTP delay-line loop. Exposed as the

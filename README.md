@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2.0..§5.2.17 pre-processing + LPC analysis + LAR quantisation + short-term analysis filter + LTP analysis + long-term analysis filter + weighting filter + RPE grid selection + APCM forward quantisation + APCM inverse + RPE grid positioning | `PreProcessor` lands §5.2.1 downscaling + §5.2.2 offset-compensation high-pass IIR (32-bit recursive arm) + §5.2.3 first-order FIR pre-emphasis. State (`z1`, `L_z2`, `mp`) carried across frames per §5.2.2/§5.2.3 + §4.5 Table 4.2 home values. The `analysis` sub-module lands §5.2.4 autocorrelation (with dynamic input scaling), §5.2.5 Schur recursion (reflection coefficients `r[1..=8]`), §5.2.6 reflection → Log-Area Ratio transform, §5.2.7 LAR quantisation + coding (`quantise_lar` produces the `LARc[1..=8]` codewords the §1.7 bit packer consumes), and §5.2.10 short-term analysis filter (8-stage lattice). The `Analyzer` struct runs §5.2.7 → §5.2.8 → §5.2.9.1 → §5.2.9.2 → §5.2.10 end-to-end on a pre-processed frame, persisting `LARpp(j-1)[1..=8]` and `u[0..=7]` per §4.5 Table 4.2 across the four sub-blocks and across frames; it returns `(LARc[1..=8], d[0..=159])` where `d` is the short-term residual §5.2.11 LTP analysis consumes. The `LtpAnalyzer` struct lands §5.2.11 LTP parameter calculation (cross-correlation peak search across lags 40..=120 with dynamic scaling, `bc` decision tree via Table 5.3a `DLB`), §5.2.12 long-term analysis filter (`dpp[k] = mult_r(QLB[bc], dp[k-Nc])`, `e[k] = sub(d[k], dpp[k])`), and §5.2.18 `dp[-120..=-1]` delay-line update; per sub-segment it emits `(LtpParameters, dpp[0..=39], e[0..=39])`. §5.2.13 weighting filter is in place as the stateless `weighting_filter` free function — an 11-tap FIR block filter with zero padding (5 leading + 5 trailing zeros) convolving `e[0..=39]` with Table 5.4 `H[0..=10]` to produce the block-filtered signal `x[0..=39]` the §5.2.14 RPE grid selection consumes. §5.2.14 RPE grid selection is in place as the stateless `select_rpe_grid` free function returning `RpeGrid { m_c, x_m }` — picks the sub-sampling grid `m ∈ {0, 1, 2, 3}` that maximises the squared-energy proxy `Σ L_mult(x[m+3i] >> 2, x[m+3i] >> 2)` and down-samples to emit `xM[0..=12] = x[Mc + 3*i]`, the 13-pulse sequence §5.2.15 APCM quantisation consumes. §5.2.15 APCM forward quantisation is in place as the stateless `apcm_quantise_rpe` free function returning `ApcmQuantised { xmaxc, x_mc, exp, mant }` — finds the block peak `xmax`, packs it into the 6-bit `xmaxc` codeword (3-bit exponent + 3-bit mantissa), re-derives the post-normalisation `(exp, mant)` pair the §5.2.16 inverse APCM consumes, and direct-codes the 13 RPE samples via Table 5.5 `NRFAC[mant]` into the 13 × 3-bit `xMc[0..=12]` codewords. §5.2.16 encoder-side APCM inverse + §5.2.17 RPE grid positioning land as the stateless `apcm_inverse_and_position` free function — re-using the §5.2.15 `(exp, mant)` pair to dequantise `xMc[0..=12]` back to `xMp[0..=12]` via Table 5.6 `FAC[mant]` (bit-identical to the decoder's §5.3.1 path) and scatter them into the reconstructed long-term residual `ep[Mc + 3*i]`. `LtpAnalyzer::reconstruct_and_update` chains §5.2.16 → §5.2.17 → §5.2.18 to close the per-sub-segment LTP delay-line feedback loop. Only the §1.7 frame packer now remains before `make_encoder` can land; it still returns `Unsupported`. |
+| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out). §4.3 encoder homing and §6 conformance sequences (not staged) are the remaining gaps. |
 
 ## Implementation
 
@@ -338,9 +338,29 @@ next sub-segment's §5.2.11 cross-correlation search runs on the same
 history the decoder sees.
 
 With §5.2.16/§5.2.17 in place the per-sub-segment §5.2.11..§5.2.18
-LTP feedback loop is now closeable end-to-end. Only the §1.7 frame
-packer remains before `make_encoder` can land; it still returns
-`Unsupported`.
+LTP feedback loop closes end-to-end.
+
+## Encoder frame packing + frame-level driver (§1.7)
+
+`UnpackedFrame::to_bit_stream_msb_first` packs the 76 codewords into
+the 260-bit `b1..b260` stream per §1.7 Table 1.1 — the exact mirror of
+the unpacker (parameters in order of occurrence, each LSB-first within
+its bit range per the table's "(LSB-MSB)" column, `b1` in the MSB of
+byte 0; the 4 spare bits of byte 32 stay zero). Both pack∘unpack and
+unpack∘pack identities are tested at the struct and byte level.
+
+`EncoderState` is the frame-level driver: it aggregates the
+`PreProcessor`, `analysis::Analyzer`, and `analysis::LtpAnalyzer`
+stages (i.e. the complete §4.5 Table 4.2 encoder state) and
+`encode_frame(&[i16; 160]) -> UnpackedFrame` runs §5.2.1..§5.2.3 →
+§5.2.4..§5.2.10 → four per-sub-segment §5.2.11..§5.2.18 passes per
+frame. `make_encoder` wraps it behind the `oxideav_core::Encoder`
+trait: mono S16 8 kHz input (any framing — samples are rebuffered to
+the 20 ms codec frame), one 33-byte packet per 160 samples with
+sample-accurate pts/duration in the 1/8000 time base, and `flush`
+zero-pads a trailing partial frame. Roundtrip tests pin a ≥6 dB
+encode→decode error floor on a periodic signal and bit-level
+equivalence of the packed and unpacked decode paths.
 
 ## Codec homing (§4.4)
 
@@ -369,16 +389,21 @@ Two API tiers (the workspace's dual-API convention):
 let mut ctx = oxideav_core::RuntimeContext::new();
 oxideav_gsm::register(&mut ctx);
 
-// Direct factory — bypass the registry.
+// Direct factories — bypass the registry.
 let params = oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("gsm"));
 let mut decoder = oxideav_gsm::make_decoder(&params).unwrap();
+let mut encoder = oxideav_gsm::make_encoder(&params).unwrap();
 ```
 
 The lower-level building blocks are public for callers who want to drive
 the pipeline directly:
 
 ```rust
-use oxideav_gsm::{DecoderState, UnpackedFrame};
+use oxideav_gsm::{DecoderState, EncoderState, UnpackedFrame};
+
+let mut enc = EncoderState::new();
+let coded: UnpackedFrame = enc.encode_frame(&pcm_in_160);
+let bytes_33: [u8; 33] = coded.to_bit_stream_msb_first();
 
 let frame = UnpackedFrame::from_bit_stream_msb_first(&bytes_33).unwrap();
 let mut dec = DecoderState::new();
@@ -387,7 +412,8 @@ let pcm: [i16; 160] = dec.decode_frame(&frame);
 
 ## Carriage format
 
-`UnpackedFrame::from_bit_stream_msb_first` accepts a 33-byte buffer
+`UnpackedFrame::from_bit_stream_msb_first` accepts — and
+`UnpackedFrame::to_bit_stream_msb_first` produces — a 33-byte buffer
 holding the spec's `b1..b260` stream packed MSB-first. That bit numbering
 matches §1.7 Table 1.1 verbatim. The specific 33-byte container variants
 used in the wild (the `.gsm` byte format, RTP payload type 3, MS-GSM WAV

@@ -64,15 +64,15 @@
 //!   into the §4.5 `dp[-120..=-1]` delay line, closing the
 //!   per-sub-segment LTP feedback loop.
 //!
-//! The remaining encoder stage — §1.7 frame packing — arrives in a
-//! later round.
-//!
-//! Until the rest of the encoder lands, the
-//! [`oxideav_core::Encoder`]-trait factory `make_encoder` still
-//! returns `Unsupported` from `lib.rs`. The pre-processing primitives
-//! are exposed as a public sub-module so that future rounds can pick
-//! them up on a stable surface (and so callers who want just the
-//! input-shaping pass can drive it directly).
+//! * The **frame-level driver** — [`EncoderState`] chains
+//!   §5.2.0..§5.2.3 pre-processing → §5.2.4..§5.2.10 LPC analysis →
+//!   the four per-sub-segment §5.2.11..§5.2.18 LTP/RPE/APCM passes
+//!   and emits one [`crate::bitstream::UnpackedFrame`] of 76
+//!   codewords per 160-sample input frame. Combined with
+//!   [`crate::bitstream::UnpackedFrame::to_bit_stream_msb_first`]
+//!   (the §1.7 Table 1.1 packer) this completes the encode path;
+//!   the [`oxideav_core::Encoder`]-trait factory
+//!   [`crate::make_encoder`] is built on it.
 //!
 //! ## §4.5 Table 4.2 home-state mapping
 //!
@@ -94,11 +94,13 @@
 //!   all-zero (§4.5 + §5.2.10 "Initial value: u[0..7] = 0").
 //!
 //! The remaining §4.5 entry — the LTP delay-line `dp[-120..-1]` —
-//! belongs to the §5.2.11..§5.2.17 LTP / RPE stages that arrive in
-//! later rounds.
+//! is owned by [`analysis::LtpAnalyzer`] (home value all-zero per
+//! §4.5 + §5.2.11). [`EncoderState`] aggregates all of the above so
+//! [`EncoderState::reset`] restores the complete §4.5 Table 4.2
+//! encoder home state in one call.
 
 use crate::arith::{add, l_add, l_mult, l_sub, mult_r, sub};
-use crate::bitstream::FRAME_SAMPLES;
+use crate::bitstream::{SubFrame, UnpackedFrame, FRAME_SAMPLES, SUBFRAMES};
 
 /// Persistent encoder pre-processing state across frames.
 ///
@@ -4023,6 +4025,285 @@ pub mod analysis {
         fn _exercise_unused() {
             let _ = l_add(0, 0);
             let _ = l_mult(0, 0);
+        }
+    }
+}
+
+/// Frame-level §5.2 encoder driver.
+///
+/// Aggregates the three stateful pipeline stages — the
+/// §5.2.0..§5.2.3 [`PreProcessor`], the §5.2.4..§5.2.10
+/// [`analysis::Analyzer`], and the §5.2.11..§5.2.18
+/// [`analysis::LtpAnalyzer`] — and runs one complete encode pass
+/// per 160-sample input frame, emitting the 76 codewords of an
+/// [`UnpackedFrame`] ready for the §1.7 Table 1.1 bit packer
+/// ([`UnpackedFrame::to_bit_stream_msb_first`]).
+///
+/// The aggregated state is exactly the §4.5 Table 4.2 "Initial
+/// values of the encoder state variables" set: `z1`, `L_z2`, `mp`
+/// (pre-processing), `LARpp(j-1)[1..=8]`, `u[0..=7]` (short-term
+/// analysis), and `dp[-120..=-1]` (LTP delay line). [`Self::new`] /
+/// [`Self::reset`] put every entry in its all-zero home value.
+#[derive(Debug, Clone)]
+pub struct EncoderState {
+    pre: PreProcessor,
+    analyzer: analysis::Analyzer,
+    ltp: analysis::LtpAnalyzer,
+}
+
+impl Default for EncoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EncoderState {
+    /// Build a fresh encoder in the §4.5 Table 4.2 home state.
+    pub fn new() -> Self {
+        Self {
+            pre: PreProcessor::new(),
+            analyzer: analysis::Analyzer::new(),
+            ltp: analysis::LtpAnalyzer::new(),
+        }
+    }
+
+    /// Restore the §4.5 Table 4.2 home state on every stage.
+    pub fn reset(&mut self) {
+        self.pre.reset();
+        self.analyzer.reset();
+        self.ltp.reset();
+    }
+
+    /// Encode one 160-sample input frame `sop[0..=159]` into the 76
+    /// codewords of the §1.7 frame.
+    ///
+    /// Pipeline order per §5.2 (fig 3.1 numbering):
+    ///
+    /// 1. §5.2.1..§5.2.3 — pre-processing (`sop` → `s`).
+    /// 2. §5.2.4..§5.2.10 — LPC analysis + LAR quantisation + short-
+    ///    term analysis filter (`s` → `LARc[1..=8]`, `d[0..=159]`).
+    /// 3. For each of the four 40-sample sub-segments `j = 0..=3`:
+    ///    §5.2.11 LTP parameters (`Ncj`, `bcj`), §5.2.12 long-term
+    ///    analysis filter, §5.2.13 weighting filter, §5.2.14 RPE grid
+    ///    selection (`Mcj`), §5.2.15 APCM quantisation (`xmaxcj`,
+    ///    `xMcj[0..=12]`), then the §5.2.16..§5.2.18 local-decoder
+    ///    feedback pass that folds the reconstructed long-term
+    ///    residual back into the `dp[-120..=-1]` delay line so the
+    ///    next sub-segment's LTP search runs on the same history the
+    ///    receiving decoder will build.
+    pub fn encode_frame(&mut self, sop: &[i16; FRAME_SAMPLES]) -> UnpackedFrame {
+        // §5.2.1..§5.2.3 — pre-processing.
+        let s = self.pre.process_frame(sop);
+
+        // §5.2.4..§5.2.10 — LARc codewords + short-term residual d[].
+        let (lar_c, d) = self.analyzer.analyse_frame(&s);
+
+        let mut frame = UnpackedFrame {
+            lar_c,
+            ..UnpackedFrame::default()
+        };
+
+        // §5.2.11..§5.2.18 — four sub-segments.
+        for (j, sub_out) in frame.sub.iter_mut().enumerate().take(SUBFRAMES) {
+            let mut d_sub = [0i16; analysis::SUBFRAME_SAMPLES];
+            d_sub.copy_from_slice(
+                &d[j * analysis::SUBFRAME_SAMPLES..(j + 1) * analysis::SUBFRAME_SAMPLES],
+            );
+
+            // §5.2.11 + §5.2.12 — LTP parameters + long-term residual.
+            let (ltp_params, dpp, e) = self.ltp.analyse_subframe(&d_sub);
+            // §5.2.13 — weighting filter.
+            let x = analysis::weighting_filter(&e);
+            // §5.2.14 — RPE grid selection.
+            let grid = analysis::select_rpe_grid(&x);
+            // §5.2.15 — APCM forward quantisation.
+            let apcm = analysis::apcm_quantise_rpe(&grid.x_m);
+            // §5.2.16..§5.2.18 — local-decoder feedback (dp update).
+            self.ltp.reconstruct_and_update(&apcm, grid.m_c, &dpp);
+
+            *sub_out = SubFrame {
+                n_c: ltp_params.n_c as u8,
+                b_c: ltp_params.b_c as u8,
+                m_c: grid.m_c as u8,
+                xmax_c: apcm.xmaxc as u8,
+                x_mc: core::array::from_fn(|i| apcm.x_mc[i] as u8),
+            };
+        }
+
+        frame
+    }
+}
+
+#[cfg(test)]
+mod encoder_state_tests {
+    use super::*;
+    use crate::decoder::DecoderState;
+
+    /// Silence in ⇒ a frame whose codewords are all within their
+    /// Table 1.1 field widths and whose decode stays at the
+    /// quantiser floor. Note the §5.2.16 3-bit RPE dequantiser has
+    /// no exact-zero reconstruction level — `sub((xMc[i] << 1), 7)`
+    /// maps the 8 codes onto the odd values −7, −5, …, +7 — so an
+    /// all-zero input decodes to a tiny residual dither, not exact
+    /// zeros. With `xmaxc = 0` the dequant scale is minimal; after
+    /// the §5.3.4 synthesis lattice, §5.3.6 upscale (×2) and §5.3.7
+    /// truncation (low 3 bits cleared) the dither stays within a few
+    /// 13-bit LSB steps of zero.
+    #[test]
+    fn silence_encodes_to_in_range_codewords_and_decodes_to_silence() {
+        let mut enc = EncoderState::new();
+        let frame = enc.encode_frame(&[0i16; FRAME_SAMPLES]);
+
+        // Range checks per Table 1.1 field widths.
+        let lar_max: [i16; 8] = [63, 63, 31, 31, 15, 15, 7, 7];
+        for i in 1..=8 {
+            assert!(
+                (0..=lar_max[i - 1]).contains(&frame.lar_c[i]),
+                "LARc[{i}] out of range: {}",
+                frame.lar_c[i]
+            );
+        }
+        for (j, sf) in frame.sub.iter().enumerate() {
+            assert!((40..=120).contains(&sf.n_c), "Nc{j} = {}", sf.n_c);
+            assert!(sf.b_c <= 3, "bc{j} = {}", sf.b_c);
+            assert!(sf.m_c <= 3, "Mc{j} = {}", sf.m_c);
+            assert!(sf.xmax_c <= 63, "xmaxc{j} = {}", sf.xmax_c);
+            for (i, &p) in sf.x_mc.iter().enumerate() {
+                assert!(p <= 7, "xMc{j}[{i}] = {p}");
+            }
+        }
+
+        let mut dec = DecoderState::new();
+        let pcm = dec.decode_frame(&frame);
+        for (k, &v) in pcm.iter().enumerate() {
+            assert!(
+                v.abs() <= 32,
+                "silence must stay at the quantiser floor at k={k}, got {v}"
+            );
+        }
+    }
+
+    /// Every codeword stays within its Table 1.1 field width on a
+    /// loud full-scale-ish square-ish input (stresses the saturating
+    /// arithmetic + APCM exponent paths).
+    #[test]
+    fn loud_input_codewords_stay_in_field_ranges() {
+        let mut enc = EncoderState::new();
+        let mut sop = [0i16; FRAME_SAMPLES];
+        for (k, slot) in sop.iter_mut().enumerate() {
+            *slot = if (k / 20) % 2 == 0 { 20000 } else { -20000 };
+        }
+        for _ in 0..4 {
+            let frame = enc.encode_frame(&sop);
+            for i in 1..=8 {
+                let widths: [i16; 8] = [63, 63, 31, 31, 15, 15, 7, 7];
+                assert!((0..=widths[i - 1]).contains(&frame.lar_c[i]));
+            }
+            for sf in &frame.sub {
+                assert!((40..=120).contains(&sf.n_c));
+                assert!(sf.b_c <= 3 && sf.m_c <= 3 && sf.xmax_c <= 63);
+                assert!(sf.x_mc.iter().all(|&p| p <= 7));
+            }
+            // Loud input must produce non-trivial block amplitudes.
+            assert!(frame.sub.iter().any(|sf| sf.xmax_c > 0));
+        }
+    }
+
+    /// reset() returns the encoder to the §4.5 home state: encoding
+    /// the same frame sequence after a reset reproduces the same
+    /// codewords as a freshly-built encoder.
+    #[test]
+    fn reset_restores_home_state() {
+        let mut sop = [0i16; FRAME_SAMPLES];
+        for (k, slot) in sop.iter_mut().enumerate() {
+            *slot = (((k as i32 * 37) % 401) - 200) as i16 * 8;
+        }
+
+        let mut fresh = EncoderState::new();
+        let want = fresh.encode_frame(&sop);
+
+        let mut stale = EncoderState::new();
+        let _ = stale.encode_frame(&sop);
+        let _ = stale.encode_frame(&sop);
+        stale.reset();
+        let got = stale.encode_frame(&sop);
+
+        assert_eq!(want, got);
+    }
+
+    /// Encode→decode roundtrip fidelity on a periodic, speech-band
+    /// signal. RPE-LTP is lossy, so we do not expect sample
+    /// equality; instead require that after the first (warm-up)
+    /// frame the decoded signal tracks the §5.2.1-downscaled,
+    /// §5.2.3-pre-emphasised-then-§5.3.5-de-emphasised input well
+    /// enough that the error energy is clearly below the signal
+    /// energy. A codec bug (wrong table, swapped codeword, packing
+    /// slip) destroys this margin immediately.
+    #[test]
+    fn sine_roundtrip_preserves_signal_shape() {
+        // 8 kHz sample rate, ~250 Hz periodic ramp-ish wave at
+        // moderate amplitude (within the 13-bit input convention of
+        // §5.2.1 — low 3 bits zero, |x| <= 2^15 - 8).
+        let mut enc = EncoderState::new();
+        let mut dec = DecoderState::new();
+
+        const FRAMES: usize = 6;
+        let mut input = Vec::with_capacity(FRAMES * FRAME_SAMPLES);
+        for n in 0..FRAMES * FRAME_SAMPLES {
+            // Triangle wave, period 32 samples (= 250 Hz), peak 8192.
+            let phase = (n % 32) as i32;
+            let tri = if phase < 16 { phase - 8 } else { 23 - phase }; // -8..=8
+            input.push((tri * 1024) as i16); // multiples of 8: 13-bit clean
+        }
+
+        let mut signal_energy: i64 = 0;
+        let mut error_energy: i64 = 0;
+        for f in 1..FRAMES {
+            // skip frame 0: filters warming up from home state
+            let mut sop = [0i16; FRAME_SAMPLES];
+            sop.copy_from_slice(&input[f * FRAME_SAMPLES..(f + 1) * FRAME_SAMPLES]);
+            let coded = enc.encode_frame(&sop);
+            let pcm = dec.decode_frame(&coded);
+            for k in 0..FRAME_SAMPLES {
+                let s = sop[k] as i64;
+                let e = (sop[k] as i64) - (pcm[k] as i64);
+                signal_energy += s * s;
+                error_energy += e * e;
+            }
+        }
+
+        assert!(signal_energy > 0);
+        // Demand at least ~6 dB SNR — far below what a correct
+        // RPE-LTP achieves on this signal, far above what any
+        // mis-wired pipeline produces.
+        assert!(
+            error_energy * 4 < signal_energy,
+            "roundtrip error too large: signal={signal_energy} error={error_energy}"
+        );
+    }
+
+    /// Full bit-level path: encode → pack (§1.7) → unpack → decode
+    /// must equal encode → decode without the bitstream in between.
+    #[test]
+    fn packed_roundtrip_matches_unpacked_roundtrip() {
+        let mut enc = EncoderState::new();
+        let mut dec_direct = DecoderState::new();
+        let mut dec_packed = DecoderState::new();
+
+        let mut sop = [0i16; FRAME_SAMPLES];
+        for (k, slot) in sop.iter_mut().enumerate() {
+            let phase = (k % 40) as i32;
+            *slot = ((phase - 20) * 300) as i16;
+        }
+
+        for _ in 0..3 {
+            let coded = enc.encode_frame(&sop);
+            let bytes = coded.to_bit_stream_msb_first();
+            let reparsed = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+            assert_eq!(coded, reparsed, "§1.7 pack/unpack must be lossless");
+            let a = dec_direct.decode_frame(&coded);
+            let b = dec_packed.decode_frame(&reparsed);
+            assert_eq!(a, b);
         }
     }
 }
