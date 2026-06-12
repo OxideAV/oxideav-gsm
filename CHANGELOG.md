@@ -6,6 +6,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§4.3 encoder homing (2026-06-12).**
+  - `is_encoder_homing_frame` — §4.2 predicate for the
+    encoder-homing-frame (160 identical samples of `0x0008`, the
+    13-bit value with only its least significant bit set, written
+    left-justified into a 16-bit word).
+  - `EncoderState::encode_frame_with_homing` — §4.3 protocol: the
+    frame encodes through the normal §5.2 pipeline (no output
+    substitution on the encode side), then, if the input was the
+    encoder-homing-frame, every §4.5 Table 4.2 state variable is
+    reset to its home value so the next frame starts from the home
+    state. Wired into the `oxideav_core::Encoder` adapter behind
+    `make_encoder`, mirroring the §4.4 decoder-side homing already
+    applied behind `make_decoder`.
+  - Tests pin the §4.3 Step 1 construction sentence — from the home
+    state the encoder-homing-frame encodes **bit-exactly** to the
+    §4.4 Table 4.1a/b decoder-homing-frame, a spec-supplied
+    conformance vector covering the whole §5.2 pipeline — plus the
+    §4.3 NOTE "N homing frames in → N−1 decoder-homing-frames out"
+    property, the home-state reset (post-homing encode equals a
+    fresh encoder bit-for-bit), and the §4.1 loop-back interplay
+    (encoder homing output → §1.7 bitstream → §4.4 homing decoder →
+    encoder-homing-frame again).
+
+### Documentation
+
+- **`docs/audio/gsm/etsi-gsm-06.12-comfort-noise.pdf` staging
+  erratum (2026-06-12).** The staged PDF is, per its own title page
+  and clause structure, ETSI EN 300 969 V8.0.1 (2000-11) *Half rate
+  speech; Half rate speech transcoding (GSM 06.20)* — not the GSM
+  06.12 full-rate comfort-noise spec the filename suggests. It
+  contains no comfort-noise/SID/DTX material, so comfort-noise
+  support remains docs-blocked; the README spec-reference list now
+  records this.
+
 - **§1.7 frame packer + frame-level encoder driver + `make_encoder`
   (2026-06-11).** Completes the encode path end-to-end:
   - `UnpackedFrame::to_bit_stream_msb_first() -> [u8; 33]` packs the

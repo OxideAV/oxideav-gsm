@@ -209,7 +209,10 @@ impl GsmEncoder {
     }
 
     fn emit_frame(&mut self, sop: &[i16; FRAME_SAMPLES]) {
-        let coded = self.state.encode_frame(sop);
+        // §4.3 encoder homing: an encoder-homing-frame input encodes
+        // normally and then resets the encoder to its §4.5 home
+        // state (mirroring the §4.4 path `decode` already applies).
+        let coded = self.state.encode_frame_with_homing(sop);
         let bytes = coded.to_bit_stream_msb_first();
         let mut pkt = Packet::new(0, TimeBase::new(1, 8000), bytes.to_vec());
         pkt.pts = self.next_pts;

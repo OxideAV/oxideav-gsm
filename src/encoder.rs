@@ -4132,6 +4132,63 @@ impl EncoderState {
 
         frame
     }
+
+    /// Encode one frame applying the §4.3 encoder-homing protocol.
+    ///
+    /// §4.3 Step 1 — the encoder "performs its normal operation"
+    /// on the input frame; the resulting speech parameter frame is
+    /// returned unmodified (unlike the §4.4 decoder side, no output
+    /// substitution happens on the encode side). §4.3 Step 2 — when
+    /// the input frame *is* the §4.2 encoder-homing-frame "exactly
+    /// aligned with its internal speech frame segmentation", every
+    /// state variable is then reset to its §4.5 Table 4.2 home
+    /// value, so the *next* frame starts from the home state.
+    ///
+    /// Two spec-stated consequences follow (both pinned by tests):
+    ///
+    /// * §4.3 Step 1: "If the speech encoder is already in its home
+    ///   state at the beginning of that frame, then the resulting
+    ///   speech parameter frame is identical to the
+    ///   decoder-homing-frame. This is how the decoder-homing-frame
+    ///   was constructed." — i.e. from the home state this method
+    ///   returns exactly the §4.4 Table 4.1a/b frame.
+    /// * §4.3 NOTE: "Applying a sequence of N encoder-homing-frames
+    ///   will cause at least N-1 decoder-homing-frames at the output
+    ///   of the speech encoder." — the first homing frame may arrive
+    ///   in an arbitrary state (unknown output) but resets the
+    ///   encoder, so homing frames 2..N each produce the
+    ///   decoder-homing-frame.
+    ///
+    /// §4.3 Step 2 also names VAD and DTX among the sub-modules to
+    /// home; this crate implements neither (GSM 06.32 / GSM 06.31
+    /// are separate specifications, not staged), so the reset covers
+    /// the complete §4.5 Table 4.2 set this encoder owns.
+    ///
+    /// For raw §5.2 encoding without the §4.3 reset, use
+    /// [`Self::encode_frame`] directly.
+    pub fn encode_frame_with_homing(&mut self, sop: &[i16; FRAME_SAMPLES]) -> UnpackedFrame {
+        // §4.3 Step 1 — normal operation.
+        let frame = self.encode_frame(sop);
+        if is_encoder_homing_frame(sop) {
+            // §4.3 Step 2 — reset all state variables to home.
+            self.reset();
+        }
+        frame
+    }
+}
+
+/// Returns `true` if `sop` exactly matches the §4.2
+/// encoder-homing-frame.
+///
+/// §4.2 definition: "The encoder-homing-frame consists of 160
+/// identical samples, each 13 bits long, with the least significant
+/// bit set to 'one' and all other bits set to 'zero'. When written
+/// to 16-bit words with left justification, the samples have a
+/// value of 0008 hex." The comparison is against the exact 16-bit
+/// word value the spec gives (`0x0008`), i.e. the three padding
+/// bits below the 13-bit sample are zero as written.
+pub fn is_encoder_homing_frame(sop: &[i16; FRAME_SAMPLES]) -> bool {
+    *sop == crate::decoder::encoder_homing_frame_pcm()
 }
 
 #[cfg(test)]
@@ -4305,5 +4362,124 @@ mod encoder_state_tests {
             let b = dec_packed.decode_frame(&reparsed);
             assert_eq!(a, b);
         }
+    }
+
+    /// §4.2 predicate: only the exact 160 × `0x0008` frame is the
+    /// encoder-homing-frame.
+    #[test]
+    fn encoder_homing_predicate_matches_only_homing_frame() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+        assert!(is_encoder_homing_frame(&ehf));
+        assert!(!is_encoder_homing_frame(&[0i16; FRAME_SAMPLES]));
+        let mut m = ehf;
+        m[159] = 0x0010;
+        assert!(!is_encoder_homing_frame(&m));
+        let mut m = ehf;
+        m[0] = 0x0009; // a non-zero padding bit below the 13-bit sample
+        assert!(!is_encoder_homing_frame(&m));
+    }
+
+    /// §4.3 Step 1: "If the speech encoder is already in its home
+    /// state at the beginning of that frame, then the resulting
+    /// speech parameter frame is identical to the
+    /// decoder-homing-frame. This is how the decoder-homing-frame
+    /// was constructed."
+    ///
+    /// This doubles as a spec-supplied conformance vector for the
+    /// whole §5.2 pipeline: from the §4.5 Table 4.2 home state, the
+    /// 160 × `0x0008` input must encode bit-exactly to the §4.4
+    /// Table 4.1a/b parameter set — every LARc, Nc, bc, Mc, xmaxc
+    /// and RPE pulse (including the lone `xMc[4] = 0x0003` deviation
+    /// in sub-frame 4).
+    #[test]
+    fn homing_frame_from_home_state_encodes_to_decoder_homing_frame() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+        let dhf = crate::decoder::decoder_homing_frame();
+
+        let mut enc = EncoderState::new();
+        assert_eq!(enc.encode_frame_with_homing(&ehf), dhf);
+        // §4.3 Step 2 reset ⇒ the next homing frame again starts
+        // from the home state and reproduces the same output.
+        assert_eq!(enc.encode_frame_with_homing(&ehf), dhf);
+
+        // §4.3 Step 1 substitutes nothing on the encode side — the
+        // raw §5.2 pipeline output *is* the returned frame.
+        let mut raw = EncoderState::new();
+        assert_eq!(raw.encode_frame(&ehf), dhf);
+    }
+
+    /// §4.3 NOTE: "Applying a sequence of N encoder-homing-frames
+    /// will cause at least N-1 decoder-homing-frames at the output
+    /// of the speech encoder." — starting from an arbitrary state,
+    /// the first homing frame's output is unspecified, but it homes
+    /// the encoder, so homing frames 2..N each yield the Table
+    /// 4.1a/b frame. Without the §4.3 Step 2 reset this fails (the
+    /// filter memories carry across frames).
+    #[test]
+    fn n_homing_frames_yield_n_minus_one_decoder_homing_frames() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+        let dhf = crate::decoder::decoder_homing_frame();
+
+        let mut enc = EncoderState::new();
+        // Drive the encoder into an arbitrary (non-home) state.
+        let mut sop = [0i16; FRAME_SAMPLES];
+        for (k, slot) in sop.iter_mut().enumerate() {
+            *slot = (((k as i32 * 53) % 301) - 150) as i16 * 16;
+        }
+        let _ = enc.encode_frame_with_homing(&sop);
+        let _ = enc.encode_frame_with_homing(&sop);
+
+        const N: usize = 4;
+        let mut outputs = Vec::with_capacity(N);
+        for _ in 0..N {
+            outputs.push(enc.encode_frame_with_homing(&ehf));
+        }
+        for (i, f) in outputs.iter().enumerate().skip(1) {
+            assert_eq!(*f, dhf, "homing frame {} must encode to the DHF", i + 1);
+        }
+    }
+
+    /// §4.3 Step 2: after a homing frame the encoder state equals
+    /// the §4.5 Table 4.2 home state — subsequent frames encode
+    /// exactly as on a freshly-built encoder.
+    #[test]
+    fn homing_resets_encoder_to_home_state() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+        let mut sop = [0i16; FRAME_SAMPLES];
+        for (k, slot) in sop.iter_mut().enumerate() {
+            *slot = (((k as i32 * 37) % 401) - 200) as i16 * 8;
+        }
+
+        let mut fresh = EncoderState::new();
+        let want = fresh.encode_frame(&sop);
+
+        let mut homed = EncoderState::new();
+        let _ = homed.encode_frame_with_homing(&sop);
+        let _ = homed.encode_frame_with_homing(&sop);
+        let _ = homed.encode_frame_with_homing(&ehf);
+        assert_eq!(homed.encode_frame(&sop), want);
+    }
+
+    /// §4.1 loop-back: the second encoder-homing-frame's output is
+    /// the decoder-homing-frame; carried over the §1.7 bitstream
+    /// into a §4.4-homing decoder it produces the
+    /// encoder-homing-frame again, homing the decoder in turn. This
+    /// pins the "homing frame of one direction is by definition a
+    /// homing frame of the other direction" interplay end-to-end.
+    #[test]
+    fn homing_loops_back_through_packed_bitstream_and_decoder() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+
+        let mut enc = EncoderState::new();
+        let _ = enc.encode_frame_with_homing(&ehf);
+        let coded = enc.encode_frame_with_homing(&ehf);
+
+        let bytes = coded.to_bit_stream_msb_first();
+        let reparsed = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+        assert!(crate::decoder::is_decoder_homing_frame(&reparsed));
+
+        let mut dec = DecoderState::new();
+        let pcm = dec.decode_frame_with_homing(&reparsed);
+        assert_eq!(pcm, ehf);
     }
 }

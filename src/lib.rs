@@ -111,7 +111,7 @@ pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
 };
 pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
-pub use encoder::{analysis, EncoderState, PreProcessor};
+pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};
 pub use error::Error;
 
 use oxideav_core::RuntimeContext;

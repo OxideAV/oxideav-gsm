@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out). §4.3 encoder homing and §6 conformance sequences (not staged) are the remaining gaps. |
+| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. §6 conformance sequences (not staged) are the remaining gap. |
 
 ## Implementation
 
@@ -362,7 +362,7 @@ zero-pads a trailing partial frame. Roundtrip tests pin a ≥6 dB
 encode→decode error floor on a periodic signal and bit-level
 equivalence of the packed and unpacked decode paths.
 
-## Codec homing (§4.4)
+## Codec homing (§4.3 / §4.4)
 
 The decoder implements the §4.4 in-band homing protocol via
 [`DecoderState::decode_frame_with_homing`] (also wired into the
@@ -379,6 +379,26 @@ frames out" property the spec calls for, since the first homing
 frame triggers a state reset that the second arrives into.
 `decode_frame` is kept as the raw §5.3 entry point for callers
 who want pre-homing pipeline output.
+
+The encoder side is [`EncoderState::encode_frame_with_homing`]
+(wired into the `oxideav_core::Encoder` adapter on `make_encoder`):
+per §4.3, an input frame matching the §4.2 encoder-homing-frame
+(160 samples of `0x0008`, detected by [`is_encoder_homing_frame`])
+encodes normally — no output substitution on this side — and then
+resets every §4.5 Table 4.2 state variable to its home value.
+§4.3 Step 1's construction sentence is pinned as a test: from the
+home state, the encoder-homing-frame encodes **bit-exactly** to the
+§4.4 Table 4.1a/b decoder-homing-frame — a spec-supplied
+conformance vector exercising the entire §5.2 pipeline (all eight
+LARc codewords, and Nc/bc/Mc/xmaxc/xMc of all four sub-frames,
+including the lone `xMc[4] = 0x0003` deviation in sub-frame 4).
+Further tests pin the §4.3 NOTE "N in → N-1 out" property and the
+§4.1 loop-back interplay (second encoder-homing output → §1.7
+bitstream → homing decoder → encoder-homing-frame again). §4.3
+Step 2 also names VAD and DTX among the sub-modules to home; this
+crate implements neither (GSM 06.32 / GSM 06.31 are separate,
+unstaged specifications), so the reset covers the complete §4.5
+Table 4.2 set the encoder owns.
 
 ## Public API
 
@@ -424,7 +444,13 @@ in a follow-up round once trace docs are staged.
 ## Spec reference
 
 * `docs/audio/gsm/etsi-gsm-06.10-rpe-ltp.pdf` — ETSI EN 300 961 V8.1.1 (2000-11), GSM 06.10 RPE-LTP transcoding.
-* `docs/audio/gsm/etsi-gsm-06.12-comfort-noise.pdf` — ETSI EN 300 969 V8.0.1 (2000-11), GSM 06.12 comfort noise (not yet wired in).
+* `docs/audio/gsm/etsi-gsm-06.12-comfort-noise.pdf` — **staging
+  erratum:** despite the filename, this PDF is ETSI EN 300 969
+  V8.0.1 (2000-11), *Half rate speech; Half rate speech transcoding
+  (GSM 06.20)* — the half-rate VSELP codec spec, per its own title
+  page and clause structure. It contains no comfort-noise material.
+  The GSM 06.12 full-rate comfort-noise spec is **not** currently
+  staged; comfort-noise support remains docs-blocked.
 * `docs/audio/gsm/README.md` — staging notes.
 
 ## License
