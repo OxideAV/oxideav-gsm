@@ -108,7 +108,8 @@ pub mod tables;
 pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
 pub use codec::{make_decoder, make_encoder, CODEC_ID};
 pub use decoder::{
-    decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame, DecoderState,
+    decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
+    is_partial_decoder_homing_frame, DecoderState,
 };
 pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};

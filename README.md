@@ -7,7 +7,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
-| Decoder   | §5.3 pipeline + §4.4 homing protocol | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution. Conformance against §6 test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
+| Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). Conformance against the §6 binary test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
 | Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. §6 conformance sequences (not staged) are the remaining gap. |
 
 ## Implementation
@@ -379,6 +379,23 @@ frames out" property the spec calls for, since the first homing
 frame triggers a state reset that the second arrives into.
 `decode_frame` is kept as the raw §5.3 entry point for callers
 who want pre-homing pipeline output.
+
+§4.4 NOTE 2 / §6.3.3.2 — the **delay-optimised partial homing
+detection** — is also implemented. Once the decoder is already in
+its §4.6 home state (queryable via [`DecoderState::is_home_state`]),
+a subsequent frame only needs to carry the decoder-homing-frame's
+LARs and **first** sub-frame — sub-frames 2..=4 may hold arbitrary
+data — to trigger the same encoder-homing-frame substitution + state
+reset. This is the criterion the §6.3.3.2 `HOMING01` conformance
+sequence exercises (after two complete homing frames home the
+decoder it feeds a mixture of complete and *fractional* homing
+frames, each of which must still home the decoder) and the
+"delay-optimized implementation in the TRAU uplink direction" §4.4
+NOTE 2 names. [`is_partial_decoder_homing_frame`] is the predicate;
+`decode_frame_with_homing` applies it only when homed, falling back
+to the full-frame [`is_decoder_homing_frame`] check otherwise (a
+non-homed decoder must still receive a *complete* homing frame, since
+§4.4 NOTE 2's soundness argument only holds from the home state).
 
 The encoder side is [`EncoderState::encode_frame_with_homing`]
 (wired into the `oxideav_core::Encoder` adapter on `make_encoder`):

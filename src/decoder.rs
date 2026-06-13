@@ -66,6 +66,26 @@ impl DecoderState {
         *self = Self::default();
     }
 
+    /// Returns `true` if every persistent state variable currently
+    /// holds its §4.6 Table 4.3 home value (`nrp = 40`, the
+    /// `drp[-120..=-1]` delay line, `LARpp(j-1)[1..=8]`, the
+    /// short-term synthesis memory `v[0..=8]`, and the de-emphasis
+    /// memory `msr` all zero).
+    ///
+    /// This is the precondition the §4.4 NOTE 2 / §6.3.3.2
+    /// delay-optimised partial-homing detection
+    /// ([`is_partial_decoder_homing_frame`]) requires: the cheaper
+    /// LARs-plus-first-sub-frame check is only sound once the decoder
+    /// has already been driven into its home state by a preceding
+    /// complete homing frame.
+    pub fn is_home_state(&self) -> bool {
+        self.nrp == 40
+            && self.drp_hist == [0; 120]
+            && self.lar_pp_prev == [0; 9]
+            && self.v == [0; 9]
+            && self.msr == 0
+    }
+
     /// Decode one 260-bit speech frame into 160 linear 13-bit PCM
     /// samples, returned as `i16` per §1.3 ("uniform format shall
     /// be represented in two's complement"). The three LSBs of
@@ -485,13 +505,47 @@ pub fn encoder_homing_frame_pcm() -> [i16; FRAME_SAMPLES] {
 /// Returns `true` if `frame` exactly matches the §4.4 Table 4.1a/b
 /// decoder-homing-frame's 76 parameters.
 ///
-/// §4.4 NOTE 2 spells out the "delay-optimised" check: comparing
-/// only LARc[1..=8] and the first sub-frame is sufficient when the
-/// decoder is already in its home state. For the full bit-exact
-/// safety here we compare every parameter — the cheaper subset
-/// check is a §4.4 optimisation, not a normative requirement.
+/// This is the full-frame predicate: every LARc and every parameter
+/// of all four sub-frames must match. A decoder that is *not* yet in
+/// its home state must see a complete decoder-homing-frame before it
+/// resets, so this strict check is the one [`DecoderState::
+/// decode_frame_with_homing`] applies on a non-home decoder.
+///
+/// The §4.4 NOTE 2 / §6.3.3.2 *delay-optimised* check — which only
+/// inspects LARc[1..=8] and the first sub-frame, and is valid only
+/// once the decoder is already homed — is
+/// [`is_partial_decoder_homing_frame`].
 pub fn is_decoder_homing_frame(frame: &UnpackedFrame) -> bool {
     *frame == decoder_homing_frame()
+}
+
+/// Returns `true` if `frame` matches the decoder-homing-frame in
+/// *only* its LARc[1..=8] codewords and its first sub-frame
+/// (`sub[0]`), ignoring sub-frames 2..=4.
+///
+/// This is the §4.4 NOTE 2 "delay-optimised" detection criterion,
+/// also exercised by the §6.3.3.2 `HOMING01` conformance sequence:
+///
+/// > *"if the decoder is in its home state, it is sufficient to
+/// > check only these parameters [the LARs and first sub-frame] to
+/// > detect a subsequent decoder-homing-frame"* (§4.4 NOTE 2)
+///
+/// > *"it is sufficient that the following frame contains only the
+/// > LARs and the first subframe data of the decoder-homing-frame to
+/// > cause a decoder reset and the output of the encoder-homing-
+/// > frame"* (§6.3.3.2)
+///
+/// §4.4 NOTE 2 grounds the soundness: by construction, the first
+/// frame of any decoder test sequence differs from the decoder-
+/// homing-frame in at least one bit of the LARs or first sub-frame,
+/// so once the decoder is homed this subset is enough to tell a
+/// (possibly fractional) homing frame apart from real speech. The
+/// caller is responsible for only applying this predicate when the
+/// decoder is in its §4.6 home state (see
+/// [`DecoderState::is_home_state`]).
+pub fn is_partial_decoder_homing_frame(frame: &UnpackedFrame) -> bool {
+    let h = decoder_homing_frame();
+    frame.lar_c == h.lar_c && frame.sub[0] == h.sub[0]
 }
 
 // ─────────────────── §4.4 decoder-homing protocol ───────────────────
@@ -516,10 +570,32 @@ impl DecoderState {
     /// is already homed and the output is the spec-defined
     /// `0x0008`-fill regardless.
     ///
+    /// §4.4 NOTE 2 / §6.3.3.2 — *delay-optimised* detection. Once the
+    /// decoder is already in its §4.6 home state, a subsequent frame
+    /// only needs to carry the decoder-homing-frame's LARs and first
+    /// sub-frame (sub-frames 2..=4 may differ) to trigger the same
+    /// substitution + reset. The §6.3.3.2 `HOMING01` sequence
+    /// exercises exactly this: after two complete homing frames home
+    /// the decoder, it feeds a mixture of complete and *fractional*
+    /// homing frames, each of which must still home the decoder. A
+    /// non-home decoder, by contrast, must receive a *complete*
+    /// homing frame ([`is_decoder_homing_frame`]) before it resets,
+    /// because §4.4 NOTE 2's soundness argument only holds from the
+    /// home state.
+    ///
     /// For raw §5.3 decoding without the §4.4 substitution, use
     /// [`Self::decode_frame`] directly.
     pub fn decode_frame_with_homing(&mut self, frame: &UnpackedFrame) -> [i16; FRAME_SAMPLES] {
-        if is_decoder_homing_frame(frame) {
+        // A homed decoder accepts the cheaper LARs-plus-first-sub-frame
+        // criterion (§4.4 NOTE 2); a non-homed decoder demands the
+        // complete homing frame.
+        let is_homing = if self.is_home_state() {
+            is_partial_decoder_homing_frame(frame)
+        } else {
+            is_decoder_homing_frame(frame)
+        };
+
+        if is_homing {
             // §4.4 Step 1 — run the normal decode (so internal
             // state is consistent with having processed the input)
             // but discard the output and emit the encoder-homing-
@@ -710,6 +786,131 @@ mod tests {
         let expected = encoder_homing_frame_pcm();
         assert_eq!(out2, expected);
         assert_eq!(out3, expected);
+    }
+
+    /// §4.6 — a freshly-constructed decoder reports itself in the
+    /// home state; after a normal §5.3 decode it no longer does.
+    #[test]
+    fn is_home_state_tracks_reset_and_decode() {
+        let mut dec = DecoderState::new();
+        assert!(dec.is_home_state(), "fresh decoder must be homed");
+
+        // A non-trivial coded frame mutates the persistent state
+        // (de-emphasis memory `msr`, delay line, etc.).
+        let mut f = UnpackedFrame::default();
+        f.lar_c[1] = 5;
+        f.sub[0].xmax_c = 20;
+        let _ = dec.decode_frame(&f);
+        assert!(!dec.is_home_state(), "post-decode must leave home state");
+
+        dec.reset();
+        assert!(dec.is_home_state(), "reset must restore home state");
+    }
+
+    /// §4.4 NOTE 2 — the partial-homing predicate matches a frame
+    /// that carries the homing LARs and first sub-frame regardless of
+    /// what sub-frames 2..=4 hold, and rejects a frame that perturbs
+    /// the LARs or the first sub-frame.
+    #[test]
+    fn partial_homing_predicate_ignores_later_subframes() {
+        let h = decoder_homing_frame();
+
+        // Same LARs + sub[0], garbage in sub[1..=3] — still partial-homing.
+        let mut frac = h;
+        for sf in &mut frac.sub[1..=3] {
+            sf.n_c = 0x7F;
+            sf.b_c = 3;
+            sf.m_c = 3;
+            sf.xmax_c = 0x3F;
+            sf.x_mc = [7; PULSES];
+        }
+        assert!(is_partial_decoder_homing_frame(&frac));
+        // It is NOT a *complete* homing frame.
+        assert!(!is_decoder_homing_frame(&frac));
+
+        // Perturbing a LAR breaks the partial match.
+        let mut m = h;
+        m.lar_c[1] = 0;
+        assert!(!is_partial_decoder_homing_frame(&m));
+
+        // Perturbing the first sub-frame breaks the partial match.
+        let mut m = h;
+        m.sub[0].x_mc[0] = 7;
+        assert!(!is_partial_decoder_homing_frame(&m));
+
+        // Perturbing only a *later* sub-frame still matches partially.
+        let mut m = h;
+        m.sub[3].x_mc[4] = 4;
+        assert!(is_partial_decoder_homing_frame(&m));
+    }
+
+    /// §6.3.3.2 — once the decoder is homed, a *fractional* homing
+    /// frame (only the LARs and first sub-frame of the homing frame,
+    /// arbitrary remaining sub-frames) still homes it: the output is
+    /// the encoder-homing-frame and the state returns to §4.6 home.
+    #[test]
+    fn fractional_homing_frame_homes_a_homed_decoder() {
+        let mut dec = DecoderState::new();
+        let h = decoder_homing_frame();
+
+        // First, a complete homing frame brings the decoder home
+        // (it was already home, but this mirrors the HOMING01
+        // "two complete homing frames at the beginning" setup).
+        let _ = dec.decode_frame_with_homing(&h);
+        assert!(dec.is_home_state());
+
+        // Now a fractional homing frame: homing LARs + sub[0], with
+        // sub[1..=3] carrying unrelated data.
+        let mut frac = h;
+        for sf in &mut frac.sub[1..=3] {
+            sf.n_c = 0x55;
+            sf.xmax_c = 0x2A;
+            sf.x_mc = [6; PULSES];
+        }
+        let out = dec.decode_frame_with_homing(&frac);
+        assert_eq!(
+            out,
+            encoder_homing_frame_pcm(),
+            "fractional homing frame must emit the encoder-homing-frame"
+        );
+        assert!(dec.is_home_state(), "fractional homing must reset state");
+    }
+
+    /// §4.4 NOTE 2 soundness boundary — a decoder that is NOT in its
+    /// home state must see a *complete* homing frame before it
+    /// resets. A fractional homing frame fed to a non-home decoder
+    /// is decoded as ordinary speech (no substitution).
+    #[test]
+    fn fractional_homing_frame_does_not_home_a_dirty_decoder() {
+        let h = decoder_homing_frame();
+
+        // Drive the decoder out of its home state with a noisy frame.
+        let mut dec = DecoderState::new();
+        let mut noisy = UnpackedFrame::default();
+        noisy.lar_c[3] = 12;
+        noisy.sub[0].xmax_c = 30;
+        let _ = dec.decode_frame_with_homing(&noisy);
+        assert!(!dec.is_home_state());
+
+        // A fractional homing frame must NOT trigger substitution now.
+        let mut frac = h;
+        for sf in &mut frac.sub[1..=3] {
+            sf.x_mc = [1; PULSES];
+        }
+        // Reference: what the raw §5.3 pipeline would produce on a
+        // decoder in the identical (non-home) state.
+        let mut twin = dec.clone();
+        let raw = twin.decode_frame(&frac);
+        let out = dec.decode_frame_with_homing(&frac);
+        assert_eq!(
+            out, raw,
+            "dirty decoder must NOT home on a fractional frame"
+        );
+
+        // A *complete* homing frame, by contrast, does home it.
+        let out2 = dec.decode_frame_with_homing(&h);
+        assert_eq!(out2, encoder_homing_frame_pcm());
+        assert!(dec.is_home_state());
     }
 
     /// A non-homing input bypasses the §4.4 substitution — the

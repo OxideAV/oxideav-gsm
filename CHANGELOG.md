@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§4.4 NOTE 2 / §6.3.3.2 delay-optimised partial decoder-homing
+  detection (2026-06-14).** Once the decoder is already in its §4.6
+  home state, a subsequent frame only needs to carry the
+  decoder-homing-frame's LARs and first sub-frame — sub-frames 2..=4
+  may hold arbitrary data — to trigger the same encoder-homing-frame
+  substitution + state reset. This is the criterion the §6.3.3.2
+  `HOMING01` conformance sequence exercises (two complete homing
+  frames followed by a mixture of complete and *fractional* homing
+  frames, each of which must still home the decoder), and the
+  "delay-optimized implementation in the TRAU uplink direction" §4.4
+  NOTE 2 calls out.
+  - `is_partial_decoder_homing_frame(frame) -> bool` — the §4.4
+    NOTE 2 predicate: matches `LARc[1..=8]` + `sub[0]` against the
+    decoder-homing-frame, ignoring sub-frames 2..=4.
+  - `DecoderState::is_home_state() -> bool` — true when every §4.6
+    Table 4.3 state variable (`nrp`, `drp[-120..=-1]`,
+    `LARpp(j-1)[1..=8]`, `v[0..=8]`, `msr`) holds its home value.
+    This is the soundness precondition the partial check requires.
+  - `DecoderState::decode_frame_with_homing` now applies the cheaper
+    partial check when `is_home_state()`, and the full-frame
+    `is_decoder_homing_frame` check otherwise (a non-homed decoder
+    must still receive a *complete* homing frame before it resets, as
+    §4.4 NOTE 2's soundness argument only holds from the home state).
+  - `is_partial_decoder_homing_frame` is re-exported from the crate
+    root.
+  Four unit tests pin: `is_home_state` tracking reset/decode; the
+  partial predicate ignoring later sub-frames while rejecting LAR /
+  first-sub-frame perturbations; a fractional homing frame homing an
+  already-homed decoder; and the soundness boundary — a fractional
+  homing frame fed to a *dirty* (non-home) decoder is decoded as
+  ordinary speech and does NOT home it, while the subsequent complete
+  homing frame does.
+
 - **§4.3 encoder homing (2026-06-12).**
   - `is_encoder_homing_frame` — §4.2 predicate for the
     encoder-homing-frame (160 identical samples of `0x0008`, the
