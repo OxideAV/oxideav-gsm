@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.3.3 encoder-framing bit synchronization (2026-06-14).** When
+  the encoder is tested as a black box, the 20 ms framing and the
+  13-bit-word bit alignment of its input are unknown. The new `sync`
+  module implements the spec's bit-synchronization step: sweep the 13
+  candidate bit alignments, feeding three §4.2 encoder-homing-frames at
+  each, and take the first alignment that produces the §4.4
+  decoder-homing-frame at the encoder output as bit sync.
+  - `run_bit_sync_trial(shift, &[frame; 3]) -> BitSyncTrial` — one trial.
+  - `find_bit_sync(|shift| -> [frame; 3]) -> Option<usize>` — sweep the
+    `BIT_SYNC_TRIALS` (= `PCM_WORD_BITS` = 13) shifts.
+  - `SyncFormats` — §6.3.3.4 reference-sequence sizes (`BITSYNC.INP`,
+    `SEQSYNC.INP`, `SYNCxxx.COD`) as compile-time constants for a future
+    round that stages the (currently unstaged) ETSI conformance archive.
+  The §6.3.3.3 *frame*-synchronization sweep (the `SYNCxxx.COD` corpus)
+  remains deferred until that archive is staged.
+
 - **§4.4 NOTE 2 / §6.3.3.2 delay-optimised partial decoder-homing
   detection (2026-06-14).** Once the decoder is already in its §4.6
   home state, a subsequent frame only needs to carry the

@@ -103,6 +103,7 @@ pub mod codec;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
+pub mod sync;
 pub mod tables;
 
 pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
@@ -114,6 +115,10 @@ pub use decoder::{
 pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};
 pub use error::Error;
+pub use sync::{
+    find_bit_sync, run_bit_sync_trial, BitSyncTrial, SyncFormats, BIT_SYNC_TRIALS,
+    HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
+};
 
 use oxideav_core::RuntimeContext;
 

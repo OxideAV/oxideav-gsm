@@ -8,7 +8,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). Conformance against the §6 binary test sequences still pending — those sequences are distributed in the `en_300961v080101p0.ZIP` archive that ETSI ships alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. §6 conformance sequences (not staged) are the remaining gap. |
+| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing + §6.3.3.3 bit-sync | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. The §6.3.3.3 encoder-framing **bit-synchronization** detector is also in place (`find_bit_sync` / `run_bit_sync_trial`). §6 binary conformance sequences + the §6.3.3.3 *frame*-synchronization sweep (the unstaged `SYNCxxx.COD` corpus) are the remaining gap. |
 
 ## Implementation
 
@@ -416,6 +416,34 @@ Step 2 also names VAD and DTX among the sub-modules to home; this
 crate implements neither (GSM 06.32 / GSM 06.31 are separate,
 unstaged specifications), so the reset covers the complete §4.5
 Table 4.2 set the encoder owns.
+
+## Encoder framing synchronization (§6.3.3.3)
+
+When the encoder is tested as a black box "there is no information
+available about where the encoder starts its 20 ms segments of speech
+input" (§6.3.3.3). The spec recovers both bit and frame alignment using
+only the codec-homing feature. The crate's [`sync`] module implements the
+**bit-synchronization** half — the part that is fully specified textually
+and depends only on features this crate owns:
+
+* **Bit synchronization** — there are 13 possible bit alignments of the
+  13-bit linear PCM input word. Each trial feeds **three** consecutive
+  §4.2 encoder-homing-frames at one candidate alignment (three, not two,
+  because frame sync is unknown — so the encoder is guaranteed to read at
+  least two *complete* homing frames whatever its 20 ms segmentation),
+  and checks whether the §4.4 decoder-homing-frame appears at the encoder
+  output. The first alignment that produces it is bit sync.
+  - `run_bit_sync_trial(shift, &[frame; 3]) -> BitSyncTrial` — one trial.
+  - `find_bit_sync(|shift| -> [frame; 3]) -> Option<usize>` — sweep the
+    `BIT_SYNC_TRIALS` (= `PCM_WORD_BITS` = 13) candidate shifts and return
+    the first that homes the output.
+* **Reference-sequence formats** — [`SyncFormats`] records the §6.3.3.4
+  stated sizes (`BITSYNC.INP` = 12 480 B, `SEQSYNC.INP` = 1 280 B,
+  `SYNCxxx.COD` = 152 B, 160 frame-sync positions). The binary sequences
+  themselves are **not** staged under `docs/audio/gsm/` (they ship in the
+  ETSI conformance archive), so the *frame*-synchronization sweep that
+  recovers the 0..159 sample offset against `SYNC000.COD..SYNC159.COD` is
+  deferred to a follow-up round once that corpus is staged.
 
 ## Public API
 
