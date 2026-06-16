@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.12 §6.1 receive-side comfort-noise generation (2026-06-16).**
+  New `comfort_noise` module implementing the receive-side comfort-noise
+  synthesis of ETSI EN 300 963 (GSM 06.12), the DTX silence-descriptor
+  noise generator that masks the abrupt loss of background acoustic
+  noise when the radio link is cut. Per §6.1 the standard GSM 06.10
+  §5.3 speech decoder is driven with a frame whose parameters are
+  substituted: RPE pulses → random integers in [1, 6], grid positions
+  → random in [0, 3], LTP gains `bcr` → 0, LTP lags `Ncr` → 40/120/40/
+  120, and the LARs + four block amplitudes → the values received in the
+  SID frame.
+  - `SidParameters` — the SID-frame LAR + block-amplitude codewords in
+    `UnpackedFrame` codeword form.
+  - `NoiseRng` — deterministic LCG source for the §6.1 "locally
+    generated random integer sequence" (the generator is an
+    implementation choice; the spec only requires uniform draws).
+  - `comfort_noise_frame(sid, rng) -> UnpackedFrame` — builds the §6.1
+    substituted frame.
+  - `ComfortNoiseGenerator` — wraps a `DecoderState` + SID params + RNG;
+    `generate_frame()` synthesises one 20 ms comfort-noise frame,
+    `update_sid()` applies a freshly received SID frame, `reset_decoder()`
+    homes the wrapped decoder.
+  - `COMFORT_NOISE_NCR` = `[40, 120, 40, 120]`.
+  The §5 transmit side (background-noise evaluation + SID-frame
+  *encoding*) and receive-side "valid SID frame" detection depend on
+  GSM 06.32 (VAD), GSM 05.03 (channel-coding class-I bit positions of
+  the 95-bit SID code word), and GSM 06.31 (DTX scheduling /
+  interpolation), none of which are staged — those remain a docs gap.
+
 - **§6.3.3.3 encoder-framing bit synchronization (2026-06-14).** When
   the encoder is tested as a black box, the 20 ms framing and the
   13-bit-word bit alignment of its input are unknown. The new `sync`

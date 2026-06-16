@@ -100,6 +100,7 @@
 pub mod arith;
 pub mod bitstream;
 pub mod codec;
+pub mod comfort_noise;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
@@ -108,6 +109,9 @@ pub mod tables;
 
 pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
 pub use codec::{make_decoder, make_encoder, CODEC_ID};
+pub use comfort_noise::{
+    comfort_noise_frame, ComfortNoiseGenerator, NoiseRng, SidParameters, COMFORT_NOISE_NCR,
+};
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
     is_partial_decoder_homing_frame, DecoderState,

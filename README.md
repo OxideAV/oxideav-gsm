@@ -445,6 +445,58 @@ and depends only on features this crate owns:
   recovers the 0..159 sample offset against `SYNC000.COD..SYNC159.COD` is
   deferred to a follow-up round once that corpus is staged.
 
+## Comfort noise (GSM 06.12 §6.1)
+
+The receive-side **comfort-noise generation** of ETSI EN 300 963
+(GSM 06.12) is implemented as the [`comfort_noise`] module. During
+Discontinuous Transmission (DTX) the radio link is cut at the end of a
+speech burst; the background acoustic noise that travelled with the
+speech would vanish abruptly — "very annoying for the listener" (§4).
+The receiver masks this by synthesising comfort noise whose level and
+spectrum approximate the transmit-side background noise, using the
+noise parameters carried in a **SID (Silence Descriptor) frame**.
+
+Per §6.1, comfort noise is produced by driving the standard GSM 06.10
+§5.3 RPE-LTP speech decoder with a frame whose parameters are
+substituted:
+
+| Parameter            | §6.1 value                                |
+|----------------------|-------------------------------------------|
+| RPE pulses `Xmcr`    | random integers, uniform in **[1, 6]**    |
+| Grid positions `Mcr` | random integers, uniform in **[0, 3]**    |
+| LTP gains `bcr`      | **0**                                     |
+| LTP lags `Ncr`       | **40, 120, 40, 120** (sub-segments 1..4)  |
+| Block ampl. `Xmaxcr` | the four values **received in the SID frame** |
+| LAR coeffs `LARcr`   | the values **received in the SID frame**  |
+
+* **[`SidParameters`]** holds the SID-frame LAR codewords
+  (`LARcr[1..=8]`) and the four block amplitudes (`Xmaxcr[1..=4]`) in
+  the same `UnpackedFrame` codeword form the decoder consumes.
+* **[`NoiseRng`]** is a deterministic LCG source for the §6.1 "locally
+  generated random integer sequence". §6.1 leaves the generator an
+  implementation choice (no seed/table/recurrence is normative); a
+  reproducible LCG is used so the comfort noise is unit-testable.
+* **[`comfort_noise_frame`]`(sid, rng)`** builds the §6.1 substituted
+  [`UnpackedFrame`].
+* **[`ComfortNoiseGenerator`]** wraps a [`DecoderState`], the SID
+  parameters, and the RNG. `generate_frame()` builds one §6.1 frame and
+  runs the standard §5.3 decoder, yielding 160 PCM samples — the
+  inter-frame synthesis/LTP/de-emphasis memory carries across frames so
+  the noise is continuous. `update_sid()` applies a freshly received SID
+  frame (plain replacement; the §6.1 "interpolate over a few frames"
+  smoothing is a GSM 06.31 concern, deferred); `reset_decoder()` homes
+  the wrapped decoder on a codec-homing event.
+
+The §5 **transmit side** (background-acoustic-noise evaluation +
+SID-frame *encoding*) and the receive-side "valid SID frame" detection
+are **docs-blocked**: §5.1 averaging needs the VAD flag (GSM 06.32),
+§5.2 SID-frame layout is defined by "the 95 bits of the encoded
+RPE-pulses Xmc … in error protection class I (see GSM 05.03, table 2)"
+(GSM 05.03, channel coding), and DTX scheduling is GSM 06.31 — none of
+which are staged under `docs/audio/gsm/`. This module therefore takes
+the already-decoded SID parameters as input and implements only the
+spec-grounded §6.1 frame synthesis + decoder driving.
+
 ## Public API
 
 Two API tiers (the workspace's dual-API convention):
@@ -489,13 +541,17 @@ in a follow-up round once trace docs are staged.
 ## Spec reference
 
 * `docs/audio/gsm/etsi-gsm-06.10-rpe-ltp.pdf` — ETSI EN 300 961 V8.1.1 (2000-11), GSM 06.10 RPE-LTP transcoding.
-* `docs/audio/gsm/etsi-gsm-06.12-comfort-noise.pdf` — **staging
-  erratum:** despite the filename, this PDF is ETSI EN 300 969
-  V8.0.1 (2000-11), *Half rate speech; Half rate speech transcoding
-  (GSM 06.20)* — the half-rate VSELP codec spec, per its own title
-  page and clause structure. It contains no comfort-noise material.
-  The GSM 06.12 full-rate comfort-noise spec is **not** currently
-  staged; comfort-noise support remains docs-blocked.
+* `docs/audio/gsm/etsi-en-300963-gsm-06.12-comfort-noise.pdf` — ETSI
+  EN 300 963 V8.0.1 (2000-11), GSM 06.12 *Comfort noise aspect for
+  full rate speech traffic channels*. The genuine full-rate
+  comfort-noise (DTX/SID) spec; its §6.1 receive-side generation is
+  now implemented (see the comfort-noise section below). (An earlier
+  staging mislabelled the GSM 06.20 half-rate deliverable as "06.12";
+  that erratum has since been corrected in `docs/audio/gsm/`.)
+* `docs/audio/gsm/etsi-en-300969-gsm-06.20-half-rate.pdf` — ETSI
+  EN 300 969 V8.0.1 (2000-11), GSM 06.20 *Half rate speech
+  transcoding* (VSELP). Staged for reference only; not implemented by
+  this crate.
 * `docs/audio/gsm/README.md` — staging notes.
 
 ## License
