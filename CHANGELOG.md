@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.12 §6.1 comfort-noise update-smoothing interpolation
+  (2026-06-17).** Implements the §6.1 sentence *"when updating the
+  comfort noise, the parameters above should preferably be interpolated
+  over a few frames to obtain smooth transitions."* On `update_sid()`
+  the new `SidInterpolator` linearly ramps the SID-carried LAR codewords
+  (`LARcr[1..=8]`) and the four block amplitudes (`Xmaxcr[1..=4]`) from
+  their in-effect values to the newly-received ones over
+  `DEFAULT_INTERPOLATION_FRAMES` (= 4) frames, so the comfort-noise level
+  and spectrum transition gradually instead of stepping abruptly (the §4
+  "modulation of the background noise" the smoothing exists to avoid).
+  - Only the SID-carried parameters are ramped — the §6.1 random RPE
+    pulses / grid positions and the fixed `Ncr`/`bcr=0` carry no old→new
+    transition.
+  - The 4-frame default is the spec's open *"a few frames"* implementation
+    choice (matched to the §5.1 `N = 4` transmit-averaging window);
+    `ComfortNoiseGenerator::set_interpolation_frames` overrides it, and a
+    length of `0` reproduces the previous plain immediate replacement.
+  - A mid-ramp `update_sid()` re-bases the ramp from the in-flight
+    interpolated value, so chained SID updates stay smooth.
+  - `ComfortNoiseGenerator::sid()` now returns the interpolated
+    parameters in effect for the next frame (by value); `is_settled()`
+    reports whether the ramp has reached the latest SID frame.
+  This corrects an earlier note that mislabelled §6.1 update-smoothing as
+  a GSM 06.31 concern: 06.31 governs only the *scheduling* of when a
+  valid SID frame arrives; the smoothing instruction is in 06.12 §6.1
+  itself and is now implemented.
+
 - **GSM 06.12 §6.1 receive-side comfort-noise generation (2026-06-16).**
   New `comfort_noise` module implementing the receive-side comfort-noise
   synthesis of ETSI EN 300 963 (GSM 06.12), the DTX silence-descriptor

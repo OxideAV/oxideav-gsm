@@ -110,7 +110,8 @@ pub mod tables;
 pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
 pub use codec::{make_decoder, make_encoder, CODEC_ID};
 pub use comfort_noise::{
-    comfort_noise_frame, ComfortNoiseGenerator, NoiseRng, SidParameters, COMFORT_NOISE_NCR,
+    comfort_noise_frame, ComfortNoiseGenerator, NoiseRng, SidInterpolator, SidParameters,
+    COMFORT_NOISE_NCR, DEFAULT_INTERPOLATION_FRAMES,
 };
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,

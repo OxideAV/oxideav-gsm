@@ -82,6 +82,21 @@ pub const GRID_POSITION_MIN: u8 = 0;
 /// See [`GRID_POSITION_MIN`].
 pub const GRID_POSITION_MAX: u8 = 3;
 
+/// Default number of frames over which [`SidInterpolator`] ramps the
+/// SID noise parameters from their previous to their newly-received
+/// values, implementing the §6.1 recommendation that on update *"the
+/// parameters above should preferably be interpolated over a few frames
+/// to obtain smooth transitions"*.
+///
+/// §6.1 says only *"a few frames"* — it does not fix the count, so this
+/// is an implementation choice (like the [`NoiseRng`] generator itself).
+/// Four was chosen to match the `N = 4` averaging window the transmit
+/// side (§5.1) accumulates a SID frame over, so the receive-side ramp
+/// spans the same time scale as the parameter-estimation window. Any
+/// positive count satisfies the spec equally; callers can override via
+/// [`ComfortNoiseGenerator::set_interpolation_frames`].
+pub const DEFAULT_INTERPOLATION_FRAMES: u8 = 4;
+
 /// The noise parameters carried in a GSM 06.12 SID frame, in the
 /// already-decoded codeword form the §6.1 substitution consumes.
 ///
@@ -239,6 +254,147 @@ pub fn comfort_noise_frame(sid: &SidParameters, rng: &mut NoiseRng) -> UnpackedF
     f
 }
 
+/// Smooth-transition interpolator for the §6.1 comfort-noise update.
+///
+/// §6.1 closes with: *"When updating the comfort noise, the parameters
+/// above should preferably be interpolated over a few frames to obtain
+/// smooth transitions."* On receipt of a fresh SID frame the noise
+/// level (the four `Xmaxcr` block amplitudes) and spectrum (the eight
+/// `LARcr` log-area-ratio codewords) generally differ from the values
+/// currently driving the generator; switching them abruptly would
+/// re-introduce the very "modulation of the background noise" §4 warns
+/// is "very annoying for the listener". This interpolator linearly
+/// ramps each codeword from its previous value to the newly-received
+/// value over [`Self::frames`] frames so the transition is gradual.
+///
+/// Only the SID-carried parameters are ramped. The §6.1 RPE pulses,
+/// grid positions, fixed LTP lags (`40,120,40,120`), and zero LTP gains
+/// are re-drawn / fixed every frame and carry no old→new transition, so
+/// "the parameters above" that benefit from smoothing are exactly
+/// `LARcr` and `Xmaxcr`.
+///
+/// The ramp count is an implementation choice — §6.1 specifies only
+/// *"a few frames"* ([`DEFAULT_INTERPOLATION_FRAMES`]). With a count of
+/// `f`, the `n`-th frame after the update (`n = 1..=f`) uses
+/// `prev + (next - prev) * n / f` (rounded to nearest), so frame `f`
+/// lands exactly on the new value and frames past `f` hold it.
+#[derive(Debug, Clone)]
+pub struct SidInterpolator {
+    /// Parameters in effect before the most recent update (the ramp
+    /// origin). Equal to `target` once the ramp has completed.
+    prev: SidParameters,
+    /// Newly-received parameters (the ramp destination).
+    target: SidParameters,
+    /// Total ramp length in frames; `0` disables interpolation (each
+    /// update takes effect immediately).
+    frames: u8,
+    /// Frames already emitted since the update: `0` before the first
+    /// post-update frame, saturating at `frames` once the ramp is done.
+    elapsed: u8,
+}
+
+impl SidInterpolator {
+    /// Start with `sid` already fully in effect (no ramp in progress)
+    /// and a ramp length of `frames`.
+    pub fn new(sid: SidParameters, frames: u8) -> Self {
+        Self {
+            prev: sid,
+            target: sid,
+            frames,
+            elapsed: frames, // already settled on `target`
+        }
+    }
+
+    /// Begin ramping from the parameters currently in effect (the value
+    /// [`Self::current`] would return *now*) to `target` over
+    /// [`Self::frames`] frames. If a ramp is already in progress its
+    /// in-flight interpolated value becomes the new ramp origin, so
+    /// back-to-back SID updates chain smoothly instead of snapping.
+    pub fn update(&mut self, target: SidParameters) {
+        self.prev = self.current();
+        self.target = target;
+        self.elapsed = 0;
+        if self.frames == 0 {
+            // No ramp: settle immediately.
+            self.prev = target;
+            self.elapsed = 0;
+        }
+    }
+
+    /// Set the ramp length (`0` disables interpolation). Does not
+    /// disturb a ramp already in progress beyond re-clamping `elapsed`.
+    pub fn set_frames(&mut self, frames: u8) {
+        self.frames = frames;
+        if self.elapsed > frames {
+            self.elapsed = frames;
+        }
+    }
+
+    /// The current ramp length in frames.
+    pub fn frames(&self) -> u8 {
+        self.frames
+    }
+
+    /// The parameters in effect for the current frame, interpolated
+    /// `prev → target` by `elapsed / frames`. Returns `target` once the
+    /// ramp has completed (or immediately when `frames == 0`).
+    pub fn current(&self) -> SidParameters {
+        if self.frames == 0 || self.elapsed >= self.frames {
+            return self.target;
+        }
+        let n = self.elapsed as i32;
+        let f = self.frames as i32;
+        let mut out = SidParameters::default();
+        for i in 1..=8 {
+            out.lar_cr[i] = lerp_round(
+                self.prev.lar_cr[i] as i32,
+                self.target.lar_cr[i] as i32,
+                n,
+                f,
+            ) as i16;
+        }
+        for j in 0..SUBFRAMES {
+            out.xmax_cr[j] = lerp_round(
+                self.prev.xmax_cr[j] as i32,
+                self.target.xmax_cr[j] as i32,
+                n,
+                f,
+            ) as u8;
+        }
+        out
+    }
+
+    /// Advance the ramp by one frame (call once per generated frame,
+    /// after reading [`Self::current`]). Saturates at [`Self::frames`].
+    pub fn advance(&mut self) {
+        if self.elapsed < self.frames {
+            self.elapsed += 1;
+        }
+    }
+
+    /// `true` once the ramp has reached `target` (or interpolation is
+    /// disabled).
+    pub fn is_settled(&self) -> bool {
+        self.frames == 0 || self.elapsed >= self.frames
+    }
+}
+
+/// Linear interpolation `a + (b - a) * n / f`, rounded to nearest
+/// (round-half-away-from-zero), for `0 <= n <= f`, `f > 0`. The
+/// rounding is symmetric so a `prev → target` ramp and the reverse
+/// `target → prev` ramp visit the same intermediate magnitudes.
+#[inline]
+fn lerp_round(a: i32, b: i32, n: i32, f: i32) -> i32 {
+    let num = (b - a) * n;
+    let half = f / 2;
+    let delta = if num >= 0 {
+        (num + half) / f
+    } else {
+        (num - half) / f
+    };
+    a + delta
+}
+
 /// Receive-side §6.1 comfort-noise generator.
 ///
 /// Wraps a [`DecoderState`] (the GSM 06.10 §5.3 RPE-LTP speech
@@ -253,63 +409,100 @@ pub fn comfort_noise_frame(sid: &SidParameters, rng: &mut NoiseRng) -> UnpackedF
 /// the synthesised noise continuous rather than restarting each frame.
 ///
 /// Parameter *updating* on receipt of a fresh SID frame is
-/// [`Self::update_sid`]. Per §6.1 the spec notes the parameters
-/// *"should preferably be interpolated over a few frames to obtain
-/// smooth transitions"*; that interpolation policy is governed by
-/// GSM 06.31 (not staged), so [`Self::update_sid`] performs the plain
-/// replacement the spec mandates and leaves any smoothing to a
-/// follow-up round once GSM 06.31 is available.
+/// [`Self::update_sid`]. Per §6.1 *"when updating the comfort noise, the
+/// parameters above should preferably be interpolated over a few frames
+/// to obtain smooth transitions"*: the generator ramps the SID-carried
+/// LARs and block amplitudes from their previous to their new values
+/// over [`DEFAULT_INTERPOLATION_FRAMES`] frames (a [`SidInterpolator`]).
+/// The ramp length is an implementation choice the spec leaves open
+/// (*"a few frames"*); [`Self::set_interpolation_frames`] overrides it,
+/// and a length of `0` reproduces the plain immediate replacement.
+///
+/// (The §6 *scheduling* of when a valid SID frame arrives is a GSM 06.31
+/// concern, not staged; this generator implements the §6.1 generation
+/// and the §6.1 update-smoothing, and leaves the schedule to the
+/// caller's `update_sid` cadence.)
 #[derive(Debug)]
 pub struct ComfortNoiseGenerator {
     decoder: DecoderState,
-    sid: SidParameters,
+    interp: SidInterpolator,
     rng: NoiseRng,
 }
 
 impl ComfortNoiseGenerator {
     /// Build a comfort-noise generator seeded with the given SID
-    /// parameters and PRNG seed. The wrapped decoder starts in its
-    /// §4.6 home state.
+    /// parameters and PRNG seed, using the default §6.1 update-smoothing
+    /// ramp length ([`DEFAULT_INTERPOLATION_FRAMES`]). The wrapped
+    /// decoder starts in its §4.6 home state, and the initial SID
+    /// parameters are already fully in effect (no ramp in progress).
     pub fn new(sid: SidParameters, seed: u32) -> Self {
         Self {
             decoder: DecoderState::new(),
-            sid,
+            interp: SidInterpolator::new(sid, DEFAULT_INTERPOLATION_FRAMES),
             rng: NoiseRng::new(seed),
         }
     }
 
-    /// Replace the active SID noise parameters (§6.1: *"the 4 block
-    /// amplitude values … and the log area ratio parameters … used are
-    /// those received in the SID frame"*; updating happens *"each time
-    /// a valid SID frame is received"*).
-    ///
-    /// Plain replacement — the §6.1 "interpolate over a few frames"
-    /// smoothing is a GSM 06.31 concern and is deferred (see the type
-    /// docs).
+    /// Apply a freshly received SID frame, beginning the §6.1
+    /// smooth-transition ramp from the parameters currently in effect to
+    /// `sid` over the configured number of frames (*"the parameters
+    /// above should preferably be interpolated over a few frames to
+    /// obtain smooth transitions"*). Updating happens *"each time a
+    /// valid SID frame is received"*; with the ramp length set to `0`
+    /// this is the plain immediate replacement.
     pub fn update_sid(&mut self, sid: SidParameters) {
-        self.sid = sid;
+        self.interp.update(sid);
     }
 
-    /// The SID parameters currently driving comfort-noise generation.
-    pub fn sid(&self) -> &SidParameters {
-        &self.sid
+    /// Set the §6.1 update-smoothing ramp length in frames (`0` disables
+    /// interpolation — each [`Self::update_sid`] then takes effect
+    /// immediately). §6.1 specifies only *"a few frames"*, so the count
+    /// is an implementation choice.
+    pub fn set_interpolation_frames(&mut self, frames: u8) {
+        self.interp.set_frames(frames);
+    }
+
+    /// The §6.1 update-smoothing ramp length currently in effect.
+    pub fn interpolation_frames(&self) -> u8 {
+        self.interp.frames()
+    }
+
+    /// The SID parameters in effect for the *next* frame — the ramp's
+    /// current interpolated value, which equals the most recently
+    /// received SID frame once the ramp has settled.
+    pub fn sid(&self) -> SidParameters {
+        self.interp.current()
+    }
+
+    /// `true` once the §6.1 update ramp has reached the most recently
+    /// received SID parameters (or interpolation is disabled).
+    pub fn is_settled(&self) -> bool {
+        self.interp.is_settled()
     }
 
     /// Generate one 20 ms comfort-noise frame: build the §6.1
-    /// substituted [`UnpackedFrame`] and synthesise it through the
+    /// substituted [`UnpackedFrame`] (from the interpolated SID
+    /// parameters in effect this frame) and synthesise it through the
     /// standard §5.3 decoder. Returns 160 linear 13-bit PCM samples
     /// (the three LSBs cleared per §5.3.7, as for any decoded frame).
+    /// Advances the §6.1 update ramp by one frame.
     pub fn generate_frame(&mut self) -> [i16; FRAME_SAMPLES] {
-        let frame = comfort_noise_frame(&self.sid, &mut self.rng);
-        self.decoder.decode_frame(&frame)
+        let sid = self.interp.current();
+        let frame = comfort_noise_frame(&sid, &mut self.rng);
+        let pcm = self.decoder.decode_frame(&frame);
+        self.interp.advance();
+        pcm
     }
 
-    /// The most recently built §6.1 comfort-noise frame's parameters,
-    /// without decoding — useful for callers that want to inspect or
-    /// re-pack the substituted codewords. Advances the PRNG exactly as
-    /// [`Self::generate_frame`] would.
+    /// The next §6.1 comfort-noise frame's parameters, without decoding
+    /// — useful for callers that want to inspect or re-pack the
+    /// substituted codewords. Advances the PRNG and the §6.1 update ramp
+    /// exactly as [`Self::generate_frame`] would.
     pub fn next_frame_parameters(&mut self) -> UnpackedFrame {
-        comfort_noise_frame(&self.sid, &mut self.rng)
+        let sid = self.interp.current();
+        let frame = comfort_noise_frame(&sid, &mut self.rng);
+        self.interp.advance();
+        frame
     }
 
     /// Reset the wrapped decoder to its §4.6 home state (e.g. on a
@@ -473,15 +666,16 @@ mod tests {
         }
     }
 
-    /// Updating the SID parameters takes effect on the next generated
-    /// frame's codewords.
+    /// Updating the SID parameters with interpolation disabled takes
+    /// effect immediately on the next generated frame's codewords.
     #[test]
-    fn update_sid_takes_effect() {
+    fn update_sid_takes_effect_immediately_without_interp() {
         let mut g = ComfortNoiseGenerator::new(SidParameters::default(), 5);
+        g.set_interpolation_frames(0);
         let _ = g.next_frame_parameters();
         let new_sid = SidParameters::new([0, 1, 2, 3, 4, 5, 6, 7, 8], [10, 20, 30, 40]);
         g.update_sid(new_sid);
-        assert_eq!(g.sid(), &new_sid);
+        assert_eq!(g.sid(), new_sid);
         let f = g.next_frame_parameters();
         assert_eq!(f.lar_c, new_sid.lar_cr);
         assert_eq!(f.sub[0].xmax_c, 10);
@@ -517,6 +711,109 @@ mod tests {
         }
         g.reset_decoder();
         assert!(g.decoder.is_home_state());
-        assert_eq!(g.sid(), &sid);
+        assert_eq!(g.sid(), sid);
+    }
+
+    /// §6.1 smooth transition: with the default 4-frame ramp, after an
+    /// update the SID parameters in effect step monotonically from the
+    /// previous value (the first post-update frame still holds prev,
+    /// n=0) up to the new value, landing exactly on the new value at the
+    /// frame `f` read and holding it afterwards.
+    #[test]
+    fn update_sid_ramps_smoothly() {
+        // prev all-zero, target xmax = 80 across the board: the reads
+        // visit 0, 20, 40, 60, 80 (80*n/4) over the ramp, settling at 80.
+        let prev = SidParameters::default();
+        let target = SidParameters::new([0; 9], [80, 80, 80, 80]);
+        let mut g = ComfortNoiseGenerator::new(prev, 9);
+        assert_eq!(g.interpolation_frames(), DEFAULT_INTERPOLATION_FRAMES);
+        g.update_sid(target);
+
+        let expected = [0u8, 20, 40, 60, 80];
+        for (i, &e) in expected.iter().enumerate() {
+            let s = g.sid();
+            assert_eq!(s.xmax_cr, [e, e, e, e], "frame {} ramp value", i + 1);
+            let _ = g.next_frame_parameters(); // advance the ramp
+        }
+        // Past the ramp the new value holds.
+        assert!(g.is_settled());
+        assert_eq!(g.sid().xmax_cr, [80, 80, 80, 80]);
+    }
+
+    /// §6.1 ramp on the LARs too: a clean halfway point is hit at the
+    /// midpoint of an even-length ramp.
+    #[test]
+    fn lar_ramp_midpoint() {
+        let prev = SidParameters::new([0, 0, 0, 0, 0, 0, 0, 0, 0], [0; 4]);
+        let target = SidParameters::new([0, 40, 20, -40, 0, 0, 0, 0, 0], [0; 4]);
+        let mut interp = SidInterpolator::new(prev, 4);
+        interp.update(target);
+        // frame 1: n=0 -> prev
+        assert_eq!(interp.current().lar_cr[1..=3], [0, 0, 0]);
+        interp.advance();
+        // frame 2: n=1 -> a quarter
+        assert_eq!(interp.current().lar_cr[1..=3], [10, 5, -10]);
+        interp.advance();
+        // frame 3: n=2 -> halfway
+        assert_eq!(interp.current().lar_cr[1..=3], [20, 10, -20]);
+        interp.advance();
+        // frame 4: n=3 -> three quarters
+        assert_eq!(interp.current().lar_cr[1..=3], [30, 15, -30]);
+        interp.advance();
+        // frame 5: settled on target
+        assert_eq!(interp.current().lar_cr[1..=3], [40, 20, -40]);
+        assert!(interp.is_settled());
+    }
+
+    /// Disabling interpolation (`frames == 0`) makes every update snap.
+    #[test]
+    fn zero_frames_snaps() {
+        let mut interp = SidInterpolator::new(SidParameters::default(), 0);
+        let target = SidParameters::new([0; 9], [50, 50, 50, 50]);
+        interp.update(target);
+        assert!(interp.is_settled());
+        assert_eq!(interp.current().xmax_cr, [50, 50, 50, 50]);
+    }
+
+    /// A second update mid-ramp re-bases the ramp from the in-flight
+    /// interpolated value rather than snapping back to the old origin.
+    #[test]
+    fn chained_update_rebases_from_current() {
+        let mut interp = SidInterpolator::new(SidParameters::default(), 4);
+        interp.update(SidParameters::new([0; 9], [80, 80, 80, 80]));
+        interp.advance(); // n=1 -> 20
+        interp.advance(); // n=2 -> 40
+        let mid = interp.current().xmax_cr[0];
+        assert_eq!(mid, 40);
+        // New update from the in-flight value (40) toward 0.
+        interp.update(SidParameters::new([0; 9], [0, 0, 0, 0]));
+        // First post-update frame still sits at the old in-flight value.
+        assert_eq!(interp.current().xmax_cr[0], 40);
+        interp.advance();
+        // Ramps 40 -> 0 over 4 frames: n=1 -> 30.
+        assert_eq!(interp.current().xmax_cr[0], 30);
+    }
+
+    /// The §6.1 ramp produces no out-of-range codewords: every
+    /// interpolated frame still packs legally through §1.7.
+    #[test]
+    fn ramped_frames_pack_legally() {
+        let mut g = ComfortNoiseGenerator::new(
+            SidParameters::new([0, 9, 23, 15, 8, 7, 3, 3, 2], [3, 3, 3, 3]),
+            2024,
+        );
+        g.update_sid(SidParameters::new(
+            [0, 50, 40, 30, 20, 10, 5, 4, 3],
+            [60, 60, 60, 60],
+        ));
+        for _ in 0..12 {
+            let f = g.next_frame_parameters();
+            let bytes = f.to_bit_stream_msb_first();
+            let back = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+            assert_eq!(
+                f, back,
+                "ramped comfort-noise frame did not survive §1.7 packing"
+            );
+        }
     }
 }

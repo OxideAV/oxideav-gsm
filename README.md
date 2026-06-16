@@ -478,14 +478,31 @@ substituted:
   reproducible LCG is used so the comfort noise is unit-testable.
 * **[`comfort_noise_frame`]`(sid, rng)`** builds the §6.1 substituted
   [`UnpackedFrame`].
-* **[`ComfortNoiseGenerator`]** wraps a [`DecoderState`], the SID
-  parameters, and the RNG. `generate_frame()` builds one §6.1 frame and
-  runs the standard §5.3 decoder, yielding 160 PCM samples — the
-  inter-frame synthesis/LTP/de-emphasis memory carries across frames so
-  the noise is continuous. `update_sid()` applies a freshly received SID
-  frame (plain replacement; the §6.1 "interpolate over a few frames"
-  smoothing is a GSM 06.31 concern, deferred); `reset_decoder()` homes
-  the wrapped decoder on a codec-homing event.
+* **[`ComfortNoiseGenerator`]** wraps a [`DecoderState`], a
+  [`SidInterpolator`], and the RNG. `generate_frame()` builds one §6.1
+  frame and runs the standard §5.3 decoder, yielding 160 PCM samples —
+  the inter-frame synthesis/LTP/de-emphasis memory carries across frames
+  so the noise is continuous. `update_sid()` applies a freshly received
+  SID frame; `reset_decoder()` homes the wrapped decoder on a
+  codec-homing event.
+* **§6.1 smooth-transition update** — *"when updating the comfort noise,
+  the parameters above should preferably be interpolated over a few
+  frames to obtain smooth transitions"* (§6.1). On `update_sid()` the
+  generator linearly ramps the SID-carried LARs (`LARcr[1..=8]`) and the
+  four block amplitudes (`Xmaxcr[1..=4]`) from their in-effect values to
+  the newly-received ones over [`DEFAULT_INTERPOLATION_FRAMES`] (= 4)
+  frames, avoiding the abrupt noise-level/spectrum step that would
+  re-introduce the §4 "modulation of the background noise". Only the
+  SID-carried parameters are ramped — the random RPE pulses / grid
+  positions and the fixed `Ncr`/`bcr=0` carry no old→new transition. The
+  ramp length is the spec's open *"a few frames"* implementation choice
+  (4 matches the §5.1 `N = 4` transmit averaging window);
+  `set_interpolation_frames()` overrides it, and `0` reproduces the
+  plain immediate replacement. A mid-ramp `update_sid()` re-bases from
+  the in-flight interpolated value so chained SID updates stay smooth.
+  This smoothing is the §6.1 sentence itself — distinct from the §6
+  *scheduling* of when a valid SID arrives, which is the (unstaged)
+  GSM 06.31 concern.
 
 The §5 **transmit side** (background-acoustic-noise evaluation +
 SID-frame *encoding*) and the receive-side "valid SID frame" detection
@@ -494,8 +511,9 @@ are **docs-blocked**: §5.1 averaging needs the VAD flag (GSM 06.32),
 RPE-pulses Xmc … in error protection class I (see GSM 05.03, table 2)"
 (GSM 05.03, channel coding), and DTX scheduling is GSM 06.31 — none of
 which are staged under `docs/audio/gsm/`. This module therefore takes
-the already-decoded SID parameters as input and implements only the
-spec-grounded §6.1 frame synthesis + decoder driving.
+the already-decoded SID parameters as input and implements the
+spec-grounded §6.1 receive side in full: frame synthesis, decoder
+driving, and the §6.1 update-smoothing interpolation.
 
 ## Public API
 
