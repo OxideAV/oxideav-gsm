@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.2 Table 6.5 spec-boundary conformance pins (2026-06-19).**
+  Table 6.5 ("Errors specially detected by sequence 4/Config 1") states,
+  for each critical breakpoint, the *incorrect* statement next to the
+  *correct* one the SEQ04 conformance vector flushes out. Five new tests
+  pin the correct boundary as an executable assertion so any regression
+  at a spec-named pitfall fails loudly even without the (unstaged)
+  SEQ04 corpus:
+  - §5.2.9.2 / §5.3.3 `larp_to_rp` segment breakpoints — `11059` (not
+    `11058`) and `20070` (not `20069`), on both the positive and
+    negative sides. These are the decoder-side reflection-coefficient
+    reconstruction boundaries.
+  - §5.2.5 reflection-coefficient abort test — the **strict** `P[0] <
+    abs(P[1])` (not `<=`): the boundary case `P[0] == abs(P[1])` must
+    *not* abort, yielding `r[1] = -32767` (Q15 unity) rather than `0`.
+  - §5.2.4 autocorrelation loop range — `k = 0..=159` (not `0..=158`):
+    `s[159]` must contribute to `L_ACF[0]`.
+  Pre-existing tests already covered the encoder-side §5.2.6 segment
+  boundaries; these extend the coverage to the decoder-side §5.2.9.2
+  inverse and the §5.2.4/§5.2.5 ranges/comparisons Table 6.5 enumerates.
+
 - **End-to-end §6.2/§6.3.3.1 codec-homing conformance harness
   (`tests/conformance_homing.rs`) (2026-06-19).** Reconstructs the two
   digital test vectors the staged EN 300 961 PDF fully defines —

@@ -2201,6 +2201,29 @@ pub mod analysis {
             assert_eq!(l_acf[0], 320);
         }
 
+        /// §5.2.4 inner-product upper bound — Table 6.5 ("Autocorrelation
+        /// function (5.2.4): k=0 to 158 / k=0 to 159") names the
+        /// *correct* loop range as `k = 0 to 159`, i.e. **all 160**
+        /// samples contribute to `L_ACF[0]`; the SEQ04 vector flushes
+        /// out a one-short `k = 0 to 158` mistake. We pin the
+        /// last-sample contribution unmistakably: feed an all-zero
+        /// frame except `s[159] = 1`. With the correct full range
+        /// `L_ACF[0] = L_mult(1, 1) = 2`; a `k = 0..158` bug would
+        /// drop s[159] entirely and give `L_ACF[0] = 0`.
+        #[test]
+        fn autocorrelation_includes_the_last_sample_159() {
+            let mut s = [0i16; FRAME_SAMPLES];
+            s[FRAME_SAMPLES - 1] = 1; // s[159] = 1, everything else 0
+            let l_acf = autocorrelation(&s);
+            assert_eq!(
+                l_acf[0], 2,
+                "s[159] must contribute to L_ACF[0] (k = 0..=159, not 0..=158)"
+            );
+            // L_ACF[1] pairs s[k]*s[k-1]; s[159]*s[158] = 1*0 = 0, so
+            // the single non-zero sample contributes only to lag 0.
+            assert_eq!(l_acf[1], 0, "lag-1 has no contributing pair");
+        }
+
         // ─── §5.2.5 Schur recursion ───
 
         /// `L_ACF[0] == 0` short-circuit ⇒ r[1..=8] = 0.
@@ -2266,6 +2289,34 @@ pub mod analysis {
             for i in 1..=8 {
                 assert_eq!(r[i], 0);
             }
+        }
+
+        /// §5.2.5 strict-comparison boundary — Table 6.5 ("Computation
+        /// of the reflect. coefficients (5.2.5): if( P[0] <= /
+        /// if( P[0] < abs(P[1]) )") names the *correct* abort test as
+        /// the **strict** `P[0] < abs(P[1])`; the SEQ04 vector flushes
+        /// out a `<=` mistake. We pin the boundary case `P[0] ==
+        /// abs(P[1])`: a strict `<` does **not** abort, so the
+        /// recursion proceeds and `r[1] = div(abs(P[1]), P[0]) =
+        /// div(x, x) = 32767` (Q15 unity). A buggy `<=` would instead
+        /// have aborted at n=1 and left `r[1] = 0`. The distinct value
+        /// (32767 vs 0) is exactly what the conformance vector detects.
+        #[test]
+        fn schur_equal_p0_abs_p1_does_not_abort() {
+            // L_ACF[0] == L_ACF[1] (positive), already normalised.
+            // norm() scaling preserves equality, so after the §5.2.5
+            // setup P[0] == abs(P[1]) at n=1.
+            let mut l_acf = [0i32; 9];
+            l_acf[0] = 1 << 30;
+            l_acf[1] = 1 << 30; // equal ⇒ must NOT abort (strict <)
+            let r = reflection_coefficients(&l_acf);
+            // r[1] = div(abs(P[1]), P[0]) with abs(P[1]) == P[0] ⇒
+            // the §5.1 div contract returns 32767 (Q15 ~1.0).
+            // P[1] > 0 ⇒ the §5.2.5 conditional negates it.
+            assert_eq!(
+                r[1], -32767,
+                "P[0] == abs(P[1]) must proceed (strict <), giving r[1] = -32767, not abort to 0"
+            );
         }
 
         // ─── §5.2.6 reflection → LAR ───

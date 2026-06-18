@@ -722,6 +722,65 @@ mod tests {
         assert!(rp[2] < 0);
     }
 
+    /// §5.2.9.2 / §5.3.3 segment-1/2 breakpoint — Table 6.5
+    /// ("Comput. of the rp from the interp. LARp (5.2.9): 11058 /
+    /// 11059") names `11059` as the *correct* boundary value (the
+    /// `11058` column being the deliberately-wrong statement the
+    /// SEQ04 vector flushes out). The decoder's `larp_to_rp`
+    /// branches `temp < 11059 ⇒ temp << 1` for the first segment and
+    /// `temp = add(temp, 11059)` for the second. We pin the boundary
+    /// exactly: `LARp = 11058` is the last value handled by segment 1
+    /// (`<< 1 = 22116`), and `LARp = 11059` is the first handled by
+    /// segment 2 (`+ 11059 = 22118`).
+    #[test]
+    fn larp_to_rp_segment_1_2_boundary_is_11059() {
+        let mut lar = [0i16; 9];
+        // Last segment-1 input: 11058 → 22116 (doubling).
+        lar[1] = 11058;
+        // First segment-2 input: 11059 → 11059 + 11059 = 22118.
+        lar[2] = 11059;
+        let rp = larp_to_rp(&lar);
+        assert_eq!(rp[1], 22116, "11058 is the last segment-1 value (<<1)");
+        assert_eq!(rp[2], 22118, "11059 is the first segment-2 value (+11059)");
+        // The boundary is the §5.2.6 inverse: r = 22118 is exactly
+        // the encoder's segment-1/2 transition (22118 = 2 * 11059).
+    }
+
+    /// §5.2.9.2 / §5.3.3 segment-2/3 breakpoint — Table 6.5
+    /// ("Comput. of the rp from the interp. LARp (5.2.9): 20069 /
+    /// 20070") names `20070` as the *correct* boundary. The decoder
+    /// branches `temp < 20070 ⇒ add(temp, 11059)` (segment 2) and
+    /// `else ⇒ add(temp >> 2, 26112)` (segment 3). We pin the
+    /// boundary exactly: `LARp = 20069` is the last segment-2 value
+    /// (`+ 11059 = 31128`), and `LARp = 20070` is the first segment-3
+    /// value (`(20070 >> 2) + 26112 = 5017 + 26112 = 31129`).
+    #[test]
+    fn larp_to_rp_segment_2_3_boundary_is_20070() {
+        let mut lar = [0i16; 9];
+        lar[1] = 20069; // last segment-2 input
+        lar[2] = 20070; // first segment-3 input
+        let rp = larp_to_rp(&lar);
+        assert_eq!(rp[1], 31128, "20069 is the last segment-2 value (+11059)");
+        assert_eq!(
+            rp[2], 31129,
+            "20070 is the first segment-3 value ((>>2)+26112)"
+        );
+    }
+
+    /// §5.2.9.2 negative-side breakpoints — Table 6.5's boundary
+    /// statements apply to `|LARp|`, so the sign is restored after
+    /// the segment lookup. A negative LARp at each breakpoint yields
+    /// the negated segment output.
+    #[test]
+    fn larp_to_rp_boundaries_negate_correctly() {
+        let mut lar = [0i16; 9];
+        lar[1] = -11059; // first segment-2 magnitude, negative
+        lar[2] = -20070; // first segment-3 magnitude, negative
+        let rp = larp_to_rp(&lar);
+        assert_eq!(rp[1], -22118, "negative segment-2 boundary");
+        assert_eq!(rp[2], -31129, "negative segment-3 boundary");
+    }
+
     /// §4.2 encoder-homing-frame PCM is exactly 160 samples of
     /// 0x0008.
     #[test]
