@@ -86,6 +86,19 @@ impl DecoderState {
             && self.msr == 0
     }
 
+    /// Snapshot of the §5.3.2 long-term synthesis delay line
+    /// `drp[-120..=-1]`, with index 0 = `drp[-1]` (most recent) and
+    /// index 119 = `drp[-120]` (oldest) — the exact layout the
+    /// encoder's local-decoder `dp[-120..=-1]` uses.
+    ///
+    /// Exposed `pub(crate)` so the analysis-by-synthesis cross-check
+    /// can assert the encoder's reconstructed short-term residual
+    /// history is bit-identical to the receiving decoder's.
+    #[cfg(test)]
+    pub(crate) fn drp_hist(&self) -> &[i16; 120] {
+        &self.drp_hist
+    }
+
     /// Decode one 260-bit speech frame into 160 linear 13-bit PCM
     /// samples, returned as `i16` per §1.3 ("uniform format shall
     /// be represented in two's complement"). The three LSBs of

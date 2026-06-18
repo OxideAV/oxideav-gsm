@@ -4074,6 +4074,18 @@ impl EncoderState {
         self.ltp.reset();
     }
 
+    /// Snapshot of the local-decoder LTP delay line `dp[-120..=-1]`
+    /// (§4.5 Table 4.2), index 0 = `dp[-1]` (most recent), index 119
+    /// = `dp[-120]` (oldest). This is the reconstructed short-term
+    /// residual the §5.2.16..§5.2.18 feedback loop folds back each
+    /// sub-segment; by the analysis-by-synthesis principle it must be
+    /// bit-identical to the receiving decoder's §5.3.2 `drp[-120..=-1]`
+    /// once the decoder has consumed the same bitstream.
+    #[cfg(test)]
+    pub(crate) fn ltp_dp_hist(&self) -> &[i16; analysis::LTP_DELAY] {
+        self.ltp.dp_hist()
+    }
+
     /// Encode one 160-sample input frame `sop[0..=159]` into the 76
     /// codewords of the §1.7 frame.
     ///
@@ -4481,5 +4493,170 @@ mod encoder_state_tests {
         let mut dec = DecoderState::new();
         let pcm = dec.decode_frame_with_homing(&reparsed);
         assert_eq!(pcm, ehf);
+    }
+
+    /// Analysis-by-synthesis invariant (§5.2.16..§5.2.18 vs §5.3.2):
+    /// the encoder's **local-decoder** LTP delay line `dp[-120..=-1]`
+    /// must be **bit-identical** to the receiving decoder's §5.3.2
+    /// `drp[-120..=-1]` after every frame, for any input.
+    ///
+    /// This is the load-bearing correctness property of the whole
+    /// RPE-LTP encoder. §5.2's local-decoder feedback loop folds the
+    /// reconstructed long-term residual `add(ep[k], dpp[k])` back into
+    /// `dp[]`; the standalone §5.3 decoder folds `add(erp[k], drpp[k])`
+    /// into `drp[]`. The §5.2.11 cross-correlation lag search of the
+    /// *next* sub-segment runs against that history, so if the two
+    /// diverge by even one LSB the encoder optimises against a history
+    /// the decoder never reconstructs and the coded stream drifts. The
+    /// two folds are arithmetically identical only when `ep == erp`
+    /// (the §5.2.16 inverse APCM reuses the in-memory `(exp, mant)`
+    /// while the §5.3.1 decoder re-derives them from `xmaxc` — these
+    /// must agree) and `dpp == drpp` (same Table 5.3b gain `bp`, same
+    /// lag `Nc` ≥ 40 > 39, both reaching only into history). The
+    /// invariant therefore holds inductively iff it holds each frame.
+    ///
+    /// Earlier tests pinned only the `bc = 0`, first-sub-segment,
+    /// home-state case. This exercises non-zero `bc`, all four
+    /// sub-segments, and many frames of state carry-over on a battery
+    /// of signals (silence, ramps, multi-tone, alternating loud
+    /// square, pseudo-random), each of which drives different
+    /// `(Nc, bc, Mc, xmaxc)` codeword combinations through the loop.
+    #[test]
+    fn local_decoder_dp_history_matches_decoder_drp_history_every_frame() {
+        // Five signal generators, each as a closure over the global
+        // sample index `n`, producing 13-bit-clean samples (low 3 bits
+        // zero per §5.2.1) within the §5.2.0 input convention.
+        let generators: [fn(usize) -> i16; 5] = [
+            // Silence — minimal xmaxc, exercises the quantiser floor.
+            |_n| 0,
+            // Triangle ~250 Hz — periodic, mid amplitude.
+            |n| {
+                let phase = (n % 32) as i32;
+                let tri = if phase < 16 { phase - 8 } else { 23 - phase };
+                (tri * 1024) as i16
+            },
+            // Two-tone-ish ramp mix — broadband residual, varied lags.
+            |n| {
+                let a = (((n as i32 * 31) % 97) - 48) * 256;
+                let b = (((n as i32 * 7) % 53) - 26) * 128;
+                ((a + b) & !7) as i16
+            },
+            // Alternating loud square — saturates the APCM exponent path.
+            |n| if (n / 17) % 2 == 0 { 20000 } else { -20000 },
+            // Pseudo-random LCG — decorrelated, hits many codeword combos.
+            |n| {
+                let mut x = (n as u32)
+                    .wrapping_mul(1_664_525)
+                    .wrapping_add(1_013_904_223);
+                x ^= x >> 16;
+                (((x as i32) % 24001) - 12000) as i16 & !7
+            },
+        ];
+
+        const FRAMES: usize = 12;
+        for (g, gen) in generators.iter().enumerate() {
+            let mut enc = EncoderState::new();
+            let mut dec = DecoderState::new();
+            for f in 0..FRAMES {
+                let mut sop = [0i16; FRAME_SAMPLES];
+                for (k, slot) in sop.iter_mut().enumerate() {
+                    *slot = gen(f * FRAME_SAMPLES + k);
+                }
+
+                let coded = enc.encode_frame(&sop);
+                // Carry over the real §1.7 bitstream so the decoder sees
+                // exactly the codewords the wire delivers, not the
+                // encoder's in-memory struct.
+                let bytes = coded.to_bit_stream_msb_first();
+                let reparsed = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+                let _ = dec.decode_frame(&reparsed);
+
+                assert_eq!(
+                    enc.ltp_dp_hist(),
+                    dec.drp_hist(),
+                    "gen {g}, frame {f}: encoder local-decoder dp[-120..=-1] \
+                     diverged from decoder drp[-120..=-1]"
+                );
+            }
+        }
+    }
+
+    /// The invariant must survive a complete §4.3/§4.4 homing event,
+    /// observing the spec's asymmetric reset timing.
+    ///
+    /// The encoder (§4.3 Step 2) resets to home *after* encoding an
+    /// encoder-homing-frame, regardless of its prior state. The
+    /// decoder (§4.4) only resets when it *detects* a complete
+    /// decoder-homing-frame at its input and substitutes the
+    /// encoder-homing-frame output. Per the §4.3 NOTE, an encoder
+    /// driven from an arbitrary state emits the decoder-homing-frame
+    /// only on the *second* consecutive homing frame ("N in ⇒ N-1
+    /// out"). So a single homing frame homes the encoder but **not**
+    /// the decoder — their delay lines legitimately differ at that
+    /// instant (this is not a bug; the encoder is home/all-zero while
+    /// the decoder still holds the residual of the non-homing frame it
+    /// just decoded). Only after the *second* homing frame, when the
+    /// decoder receives a genuine decoder-homing-frame and resets, are
+    /// both back in their all-zero home state and bit-locked again.
+    #[test]
+    fn local_decoder_history_stays_locked_across_homing() {
+        let ehf = crate::decoder::encoder_homing_frame_pcm();
+
+        let mut enc = EncoderState::new();
+        let mut dec = DecoderState::new();
+
+        let drive = |enc: &mut EncoderState, dec: &mut DecoderState, sop: &[i16; FRAME_SAMPLES]| {
+            let coded = enc.encode_frame_with_homing(sop);
+            let bytes = coded.to_bit_stream_msb_first();
+            let reparsed = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+            let _ = dec.decode_frame_with_homing(&reparsed);
+        };
+
+        // A few frames of real signal — both sides track in lockstep
+        // (non-homing frames pass straight through both protocols).
+        for f in 0..3 {
+            let mut sop = [0i16; FRAME_SAMPLES];
+            for (k, slot) in sop.iter_mut().enumerate() {
+                *slot = (((((f * FRAME_SAMPLES + k) as i32) * 41) % 211) - 105) as i16 * 64;
+            }
+            drive(&mut enc, &mut dec, &sop);
+            assert_eq!(enc.ltp_dp_hist(), dec.drp_hist(), "pre-homing frame {f}");
+        }
+
+        // First homing frame: §4.3 NOTE — from a non-home state the
+        // encoder output is *not* the DHF, so the decoder does not yet
+        // home. Encoder is now all-zero home; decoder still holds the
+        // decoded residual ⇒ histories legitimately differ here.
+        drive(&mut enc, &mut dec, &ehf);
+        assert_eq!(
+            enc.ltp_dp_hist(),
+            &[0i16; analysis::LTP_DELAY],
+            "encoder homed"
+        );
+
+        // Second homing frame: the now-homed encoder emits the
+        // decoder-homing-frame, the decoder detects it and resets ⇒
+        // both back to the all-zero home state, bit-locked.
+        drive(&mut enc, &mut dec, &ehf);
+        assert_eq!(
+            enc.ltp_dp_hist(),
+            dec.drp_hist(),
+            "after second homing frame"
+        );
+        assert_eq!(
+            dec.drp_hist(),
+            &[0i16; analysis::LTP_DELAY],
+            "decoder homed"
+        );
+
+        // Continued coding from the shared home state stays locked.
+        for f in 0..3 {
+            let mut sop = [0i16; FRAME_SAMPLES];
+            for (k, slot) in sop.iter_mut().enumerate() {
+                *slot = (((((f * FRAME_SAMPLES + k) as i32) * 23) % 151) - 75) as i16 * 96;
+            }
+            drive(&mut enc, &mut dec, &sop);
+            assert_eq!(enc.ltp_dp_hist(), dec.drp_hist(), "post-homing frame {f}");
+        }
     }
 }

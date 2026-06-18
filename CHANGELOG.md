@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Analysis-by-synthesis bit-exactness cross-check (§5.2.16..§5.2.18
+  vs §5.3.2) (2026-06-18).** Pins the encoder's load-bearing
+  correctness invariant: the local-decoder LTP delay line
+  `dp[-120..=-1]` the §5.2.16..§5.2.18 feedback loop reconstructs must
+  be **bit-identical** to the receiving decoder's §5.3.2 `drp[-120..=-1]`
+  after every frame. If they diverged by even one LSB the §5.2.11
+  cross-correlation lag search of the next sub-segment would optimise
+  against a history the decoder never reconstructs and the coded stream
+  would drift. The new
+  `local_decoder_dp_history_matches_decoder_drp_history_every_frame`
+  test encodes 12 frames each of five signal classes (silence, periodic
+  triangle, broadband two-tone-ish ramp mix, alternating loud square,
+  pseudo-random), carries each output over the real §1.7 bitstream into
+  a decoder, and asserts the two 120-sample histories are equal at every
+  frame — exercising non-zero `bc`, all four sub-segments, and many
+  frames of state carry-over. (Earlier coverage pinned only the
+  `bc = 0`, first-sub-segment, home-state case.)
+  - `local_decoder_history_stays_locked_across_homing` extends the
+    invariant through a complete §4.3/§4.4 homing event, documenting the
+    spec's asymmetric reset timing: a single homing frame homes the
+    encoder (§4.3 Step 2) but not the decoder — per the §4.3 NOTE the
+    decoder only sees a genuine decoder-homing-frame on the *second*
+    consecutive homing frame — so the histories legitimately differ for
+    one frame, then re-lock once both reach the all-zero home state.
+  - New `pub(crate)` test-only accessors `EncoderState::ltp_dp_hist`
+    and `DecoderState::drp_hist` expose the two delay lines (both in the
+    `dp_hist[0] = dp[-1]` newest-first layout) for the cross-check; no
+    public-API surface added.
+
 - **GSM 06.12 §6.1 comfort-noise update-smoothing interpolation
   (2026-06-17).** Implements the §6.1 sentence *"when updating the
   comfort noise, the parameters above should preferably be interpolated

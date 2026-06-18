@@ -333,9 +333,25 @@ folds `add(ep[k], dpp[k])` (with the §5.2.12 prediction estimate
 existing `update_dp_after_subframe`. The history it builds is the
 encoder's local-decoder copy of the reconstructed short-term
 residual — bit-exact with the `drp[..]` the receiving decoder builds
-in §5.3.2 (verified for the `bc = 0` first-sub-segment case), so the
-next sub-segment's §5.2.11 cross-correlation search runs on the same
-history the decoder sees.
+in §5.3.2, so the next sub-segment's §5.2.11 cross-correlation search
+runs on the same history the decoder sees.
+
+This **analysis-by-synthesis bit-exactness** is the encoder's
+load-bearing correctness invariant and is now pinned for the general
+case: `local_decoder_dp_history_matches_decoder_drp_history_every_frame`
+encodes 12 frames each of five signal classes (silence, periodic
+triangle, broadband ramp mix, alternating loud square, pseudo-random),
+carries every output over the real §1.7 bitstream into a decoder, and
+asserts the two 120-sample LTP delay lines are **equal at every frame**
+— exercising non-zero `bc`, all four sub-segments, and many frames of
+state carry-over. (Earlier coverage pinned only the `bc = 0`,
+first-sub-segment, home-state case.) A companion test carries the
+invariant through a complete §4.3/§4.4 homing event, documenting the
+spec's asymmetric reset timing (a single homing frame homes the encoder
+but not the decoder — per the §4.3 NOTE the decoder only sees a genuine
+decoder-homing-frame on the *second* consecutive homing frame — so the
+histories legitimately differ for one frame, then re-lock at the
+all-zero home state).
 
 With §5.2.16/§5.2.17 in place the per-sub-segment §5.2.11..§5.2.18
 LTP feedback loop closes end-to-end.
