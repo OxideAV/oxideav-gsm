@@ -461,6 +461,42 @@ and depends only on features this crate owns:
   recovers the 0..159 sample offset against `SYNC000.COD..SYNC159.COD` is
   deferred to a follow-up round once that corpus is staged.
 
+## End-to-end conformance harness (§6.2 / §6.3.3.1)
+
+`tests/conformance_homing.rs` runs the spec's own §6.2 verification
+configurations against the only §6 digital test vectors that are fully
+specified **inside the staged PDF**: §6.3.3.1's `SEQ06H.INP` ("one
+encoder-homing-frame", §4.2 — 160 PCM words of `0x0008`) and
+`SEQ06H.COD` ("one decoder-homing-frame", §4.4 Table 4.1a/b, packed
+into the §1.7 33-byte `b1..b260` stream). Both are reconstructed from
+the spec and driven through the **public registry adapters**
+(`make_encoder` / `make_decoder` with real `Packet` / `Frame` values),
+so the whole §5.2 encode → §1.7 pack → §1.7 unpack → §5.3 decode chain
+runs end-to-end at the byte level — the in-crate unit tests pin the
+same relationships only at the internal `UnpackedFrame` boundary.
+
+* **§6.2.1 Configuration 1 (encoder under test)** — from the §4.5 home
+  state, the encoder maps `SEQ06H.INP` bit-exactly to `SEQ06H.COD`; the
+  §6.2.1 "first output frame undefined, all subsequent identical"
+  property is exercised over a repeated-homing stream.
+* **§6.2.2 Configuration 2 (decoder under test)** — `SEQ06H.COD`
+  decodes to the encoder-homing-frame (160 × `0x0008`); the "two leading
+  homing frames define the subsequent output" property is shown
+  **history-independent** (a clean decoder and one pre-soiled with a
+  noisy frame yield identical post-homing samples); the §6.3.3.2
+  fractional-homing reset works through the `Packet` adapter; and a
+  multi-frame coded stream decodes to §5.3.7-shaped output with correct
+  `NeedMore` discipline.
+* **§4.1 loop-back** — `SEQ06H.INP` → encode → `SEQ06H.COD` → decode →
+  `SEQ06H.INP` closes the circle through both adapters with byte-exact
+  endpoints.
+
+The bulk SEQ01..SEQ05 `*.INP`/`*.COD`/`*.OUT` corpus (the LPC / LTP /
+overflow / critical-path sequences of §6.3.1 / §6.3.2) ships in the
+unstaged ETSI conformance archive (`en_300961v080101p0.ZIP`); running
+those is a docs-staging followup. The SEQ06H homing vectors are the
+spec-complete subset that needs no external corpus.
+
 ## Comfort noise (GSM 06.12 §6.1)
 
 The receive-side **comfort-noise generation** of ETSI EN 300 963

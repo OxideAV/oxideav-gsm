@@ -6,6 +6,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **End-to-end §6.2/§6.3.3.1 codec-homing conformance harness
+  (`tests/conformance_homing.rs`) (2026-06-19).** Reconstructs the two
+  digital test vectors the staged EN 300 961 PDF fully defines —
+  `SEQ06H.INP` (§6.3.3.1: "one encoder-homing-frame", §4.2 160 × `0x0008`)
+  and `SEQ06H.COD` (§6.3.3.1: "one decoder-homing-frame", §4.4 Table
+  4.1a/b) — and drives them through the **public registry adapters**
+  (`make_encoder` / `make_decoder` + `Packet`/`Frame`), exercising the
+  whole §5.2 encode → §1.7 pack → §1.7 unpack → §5.3 decode chain at the
+  byte level rather than only at the internal struct boundary the
+  in-crate unit tests cover. Nine integration tests pin:
+  - **§6.2.1 Configuration 1 (encoder under test)** — from the §4.5 home
+    state the encoder maps `SEQ06H.INP` bit-exactly to `SEQ06H.COD`; and
+    the "first frame undefined, subsequent frames defined" property holds
+    over a five-frame repeated-homing stream.
+  - **§6.2.2 Configuration 2 (decoder under test)** — `SEQ06H.COD`
+    decodes to the encoder-homing-frame (160 × `0x0008`); the "two
+    leading homing frames define subsequent output" property is shown
+    history-independent (a clean decoder and a decoder pre-soiled with a
+    noisy frame produce identical post-homing speech samples); the
+    §6.3.3.2 fractional-homing-frame reset works through the `Packet`
+    adapter; and a multi-frame coded stream decodes to §5.3.7-shaped
+    output with correct `NeedMore` discipline.
+  - **§4.1 loop-back** — `SEQ06H.INP` → encode → `SEQ06H.COD` → decode →
+    `SEQ06H.INP` closes the circle through both registry adapters with
+    byte-exact endpoints. These are the only §6 conformance vectors that
+    are fully specified inside the staged PDF; the bulk SEQ01..SEQ05
+    `*.INP`/`*.COD`/`*.OUT` corpus ships in the unstaged ETSI conformance
+    archive and remains a docs-staging followup.
+
 - **Analysis-by-synthesis bit-exactness cross-check (§5.2.16..§5.2.18
   vs §5.3.2) (2026-06-18).** Pins the encoder's load-bearing
   correctness invariant: the local-decoder LTP delay line
