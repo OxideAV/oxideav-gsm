@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.2 Table 6.7 decoder-overflow saturation pin (2026-06-19).**
+  Table 6.7 ("List of tested overflows points for sequence 1 (decoder
+  part)") records that the §5.3.6 output-scaling `add(sro[k], sro[k])`
+  overflows **16691 times** in conformance sequence 1 — so the doubling
+  must use the §5.1 *saturating* `add`, not a wrapping double. A new
+  `upscaling_saturates_per_table_6_7` test drives `post_process` past
+  the i16 ceiling in both directions: `sro = 20000` clamps to 32767
+  (→ §5.3.7-shaped 32760), `sro = -20000` clamps to -32768, and a
+  no-overflow control confirms ordinary samples are unaffected. A
+  wrapping double would sign-flip (`40000 as i16 = -25536`) — the exact
+  corruption Table 6.7's overflow handling exists to prevent.
+
 - **§6.3.2 Table 6.5 spec-boundary conformance pins (2026-06-19).**
   Table 6.5 ("Errors specially detected by sequence 4/Config 1") states,
   for each critical breakpoint, the *incorrect* statement next to the

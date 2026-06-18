@@ -674,6 +674,42 @@ mod tests {
         }
     }
 
+    /// §5.3.6 upscaling must **saturate** — Table 6.7 ("List of tested
+    /// overflows points for sequence 1 (decoder part): Scaling of the
+    /// output signal (5.3.6): add — 16691 occurrences") confirms the
+    /// `srop[k] = add(sro[k], sro[k])` doubling overflows tens of
+    /// thousands of times in conformance sequence 1, so it must use the
+    /// §5.1 saturating `add`, not a wrapping double. We drive
+    /// `post_process` past the i16 ceiling directly: `sro[k] = 20000`
+    /// doubles to 40000 > 32767, so the saturating add clamps to 32767,
+    /// and the §5.3.7 low-3-bit clear then lands `(32767 >> 3) << 3 =
+    /// 32760`. A wrapping double would instead give `40000 as i16 =
+    /// -25536` — the catastrophic sign flip Table 6.7's overflow
+    /// handling exists to prevent.
+    #[test]
+    fn upscaling_saturates_per_table_6_7() {
+        let mut sro = [0i16; FRAME_SAMPLES];
+        sro[0] = 20_000; // 2× overflows i16
+        sro[1] = -20_000; // 2× underflows i16
+        sro[2] = 16_383; // 2× = 32766, no overflow (control)
+        let out = post_process(&sro);
+        assert_eq!(
+            out[0], 32_760,
+            "positive overflow clamps to 32767 then >>3<<3"
+        );
+        // Negative overflow clamps to -32768; (-32768 >> 3) << 3 =
+        // -4096 << 3 = -32768 (already low-3-bit clear — no rounding).
+        assert_eq!(
+            out[1], -32_768,
+            "negative overflow clamps to -32768 (shape no-op)"
+        );
+        assert_eq!(out[2], 32_760, "32766 >> 3 << 3 = 32760 (no overflow)");
+        // Every output is still §5.3.7-shaped.
+        for s in out {
+            assert_eq!(s & 0b111, 0, "§5.3.7 shaping holds through saturation");
+        }
+    }
+
     /// `reset` returns the decoder to its §4.6 home values — every
     /// internal field matches a freshly-constructed decoder.
     #[test]
