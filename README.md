@@ -9,7 +9,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) + §6.2/§6.3.3.1 conformance harness | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). The §6.2 verification configurations now run end-to-end against the §6.3.3.1 SEQ06H homing vectors (the only §6 vectors fully defined in the staged PDF) through the public registry adapters, and the §6.3.2 Table 6.5/6.7 spec-named boundary statements (§5.2.4/§5.2.5/§5.2.9.2 ranges + comparisons, §5.3.6 saturation) are pinned. The bulk SEQ01..SEQ05 binary test sequences remain pending — they ship in the `en_300961v080101p0.ZIP` archive ETSI distributes alongside the PDF; staging it is a docs followup. |
 | Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing + §6.3.3.3 bit-sync | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. The §6.3.3.3 encoder-framing **bit-synchronization** detector is also in place (`find_bit_sync` / `run_bit_sync_trial`). §6 binary conformance sequences + the §6.3.3.3 *frame*-synchronization sweep (the unstaged `SYNCxxx.COD` corpus) are the remaining gap. |
-| Comfort noise (GSM 06.12) | §5.1 transmit evaluation + §6.1 receive generation | **Transmit side** (`NoiseEvaluator`): the §5.1 `N = 4`-frame averaging — per-coefficient `mean(LAR(i))` and the single `mean(xmax)` over all 16 sub-segment block amplitudes — producing the `SidParameters` a SID carries. **Receive side** (`ComfortNoiseGenerator`): the §6.1 substitution (random RPE [1,6] / grid [0,3], `bcr = 0`, `Ncr = 40/120/40/120`, SID-carried LARs + block amplitudes) driving the §5.3 decoder, plus the §6.1 update-smoothing interpolation. Closes the §5.1 → §6.1 parameter loop. Still docs-blocked: the VAD flag (GSM 06.32), the §5.2 SID-frame *bit* layout incl. the class-I 95-bit code word (GSM 05.03 table 2), and DTX scheduling (GSM 06.31) — none staged. |
+| Comfort noise (GSM 06.12) | §5.1 transmit evaluation + §5.2 parameter encoding + §6.1 receive generation | **Transmit side** (`NoiseEvaluator`): the §5.1 `N = 4`-frame averaging of the **unquantised** parameters — per-coefficient `mean(LAR(i))` and the single `mean(xmax)` over all 16 sub-segment block maxima — then the §5.2 re-encoding *"as described in GSM 06.10"* (§5.2.7 `quantise_lar` + §5.2.15 `code_xmax`, replicated × 4) producing the `SidParameters` a SID carries. **Receive side** (`ComfortNoiseGenerator`): the §6.1 substitution (random RPE [1,6] / grid [0,3], `bcr = 0`, `Ncr = 40/120/40/120`, SID-carried LARs + block amplitudes) driving the §5.3 decoder, plus the §6.1 update-smoothing interpolation. Closes the §5.1 → §5.2 → §6.1 parameter loop. Still docs-blocked: the VAD flag (GSM 06.32), the §5.2 SID-frame *bit* layout incl. the class-I 95-bit code word (GSM 05.03 table 2), and DTX scheduling (GSM 06.31) — none staged. |
 
 ## Implementation
 
@@ -560,28 +560,39 @@ substituted:
 
 ### §5.1 transmit-side background-acoustic-noise evaluation
 
-The transmit side builds a SID's noise parameters by averaging the
-coded-speech parameters of the silent frames. [`NoiseEvaluator`]
-implements the two §5.1 means over the `N = 4` most recent VAD = 0
-frames (window length [`NOISE_EVAL_FRAMES`]):
+§5.1 builds a SID's noise parameters from the **unquantised** coded-
+speech parameters of the silent frames — *"the unquantized block
+amplitude and Log Area Ratio (LAR) parameters … defined in 4.2.15 and
+4.2.6"*. [`NoiseEvaluator`] takes the two §5.1 means over the `N = 4`
+most recent VAD = 0 frames (window length [`NOISE_EVAL_FRAMES`]):
 
 * **Log-Area Ratios** —
   `mean(LAR(i)) = (1/N) · Σ LAR[j−n](i)`, `i = 1..8`: each of the
-  eight LAR codewords is averaged independently across the four frames.
+  eight unquantised §5.2.6 LARs averaged independently across the four
+  frames.
 * **Block amplitude** —
   `mean(xmax) = (1/(4N)) · Σ_n Σ_i xmax[j−n](i)`: a *single* mean over
-  **all** `4·N = 16` sub-segment block amplitudes. §5.2 then stores it
-  *"repeated four times inside the frame"*, so the resulting
-  [`SidParameters::xmax_cr`] carries it in all four slots.
+  **all** `4·N = 16` unquantised sub-segment block maxima (the §5.2.15
+  `xmax` search result of each sub-segment).
 
-`push_unpacked(&UnpackedFrame)` (or `push_frame` with a
-[`NoiseFrameParameters`], trivially `From<&UnpackedFrame>`) feeds VAD = 0
-frames in; `evaluate()` returns the [`SidParameters`] the §6.1 receive
-side consumes — closing the §5.1 → §6.1 loop end-to-end. The §5.1
-equations are exact arithmetic means of integer codewords; the staged
-PDF leaves the final-division rounding direction unstated, so
-round-to-nearest (ties away from zero) is used — the only quantity left
-to implementation choice here, on the same footing as the receive-side
+§5.2 then **encodes those means** *"as described in GSM 06.10"*: the
+mean LARs through the §5.2.7 `quantise_lar` quantiser and the single
+mean block amplitude through the §5.2.15 `code_xmax` coder, the latter
+*"repeated four times inside the frame"* — so [`SidParameters`] already
+carries `LARcr` / `Xmaxcr` codewords (the same `Xmaxcr` in all four
+slots). Averaging the *coded* codewords instead would be a different,
+incorrect quantity, which is why the evaluator consumes unquantised
+input.
+
+Frames feed in via `push_frame(NoiseFrameParameters::new(lar, xmax))`,
+where `lar` is the encoder's §5.2.6 `analyse_frame` output and `xmax`
+the four sub-segments' §5.2.15 `ApcmQuantised::xmax` block maxima;
+`evaluate()` returns the [`SidParameters`] the §6.1 receive side
+consumes — closing the §5.1 → §6.1 loop end-to-end. The §5.1 means are
+exact integer averages; the staged PDF leaves the final-division
+rounding direction unstated, so round-to-nearest (ties away from zero,
+symmetric for the signed LARs) is used — the only quantity left to
+implementation choice here, on the same footing as the receive-side
 [`NoiseRng`].
 
 ### Still docs-blocked

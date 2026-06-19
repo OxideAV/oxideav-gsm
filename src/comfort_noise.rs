@@ -19,8 +19,10 @@
 //! EN 300 963 PDF fully defines:
 //!
 //! * the **§5.1 transmit-side background-acoustic-noise evaluation**
-//!   ([`NoiseEvaluator`]) — the `N = 4`-frame averaging of the LAR
-//!   codewords and block amplitude that builds the [`SidParameters`];
+//!   plus the **§5.2 parameter encoding** ([`NoiseEvaluator`]) — the
+//!   `N = 4`-frame averaging of the unquantised LARs and block maxima,
+//!   re-encoded *"as described in GSM 06.10"* into the
+//!   [`SidParameters`] codewords;
 //! * the **§6.1 receive-side comfort-noise generation**
 //!   ([`ComfortNoiseGenerator`]) — driving the §5.3 RPE-LTP speech
 //!   decoder with the SID-supplied noise parameters and the §6.1
@@ -53,26 +55,29 @@
 //!   that mark is **GSM 06.32** (not staged). [`NoiseEvaluator`]
 //!   therefore averages the VAD = 0 frames the caller supplies rather
 //!   than detecting voice activity itself.
-//! * **The §5.2 SID-frame *bit* layout.** The 95-bit all-zero "SID
-//!   code word" is inserted at *"those 95 bits of the encoded
-//!   RPE-pulses Xmc which are in the error protection class I (see
-//!   GSM 05.03, table 2)"*. **GSM 05.03 table 2** (not staged) holds
-//!   those positions, so the transmit side stops at the §5.1 parameter
-//!   mean ([`SidParameters`]) — the part the staged PDF defines — and
-//!   does not pack a SID bitstream, nor implement the matching
-//!   receive-side "valid SID frame" detector.
+//! * **The §5.2 SID-frame *bit* layout.** The §5.2 *parameter*
+//!   encoding (mean LARs / block amplitude → codewords) is implemented;
+//!   what remains is the SID *bit* layout — the 95-bit all-zero "SID
+//!   code word" inserted at *"those 95 bits of the encoded RPE-pulses
+//!   Xmc which are in the error protection class I (see GSM 05.03,
+//!   table 2)"*. **GSM 05.03 table 2** (not staged) holds those
+//!   positions, so the transmit side stops at the §5.2 [`SidParameters`]
+//!   codewords and does not pack a SID bitstream, nor implement the
+//!   matching receive-side "valid SID frame" detector.
 //! * **DTX scheduling.** When a SID frame is emitted or comfort noise
 //!   updated (§6 opening, §6.1 closing) is defined in **GSM 06.31**
 //!   (not staged).
 //!
-//! Accordingly the transmit side ([`NoiseEvaluator`]) emits decoded
-//! [`SidParameters`] and the receive side ([`ComfortNoiseGenerator`])
-//! consumes them — the full §5.1 → §6.1 parameter loop — leaving the
-//! §5.2 bit-packing, the VAD mark, and the DTX scheduling for a
-//! follow-up round once GSM 05.03 / 06.31 / 06.32 are staged.
+//! Accordingly the transmit side ([`NoiseEvaluator`]) emits the §5.2
+//! [`SidParameters`] codewords and the receive side
+//! ([`ComfortNoiseGenerator`]) consumes them — the full §5.1 → §5.2 →
+//! §6.1 parameter loop — leaving the §5.2 SID *bit*-packing, the VAD
+//! mark, and the DTX scheduling for a follow-up round once GSM 05.03 /
+//! 06.31 / 06.32 are staged.
 
 use crate::bitstream::{SubFrame, UnpackedFrame, SUBFRAMES};
 use crate::decoder::DecoderState;
+use crate::encoder::analysis::{code_xmax, quantise_lar};
 use crate::FRAME_SAMPLES;
 
 /// The four §6.1 LTP lag values `Ncr` for sub-segments 1..4:
@@ -527,34 +532,48 @@ impl ComfortNoiseGenerator {
 /// evaluated over *"N = 4 consecutive frames marked with VAD = 0"*.
 pub const NOISE_EVAL_FRAMES: usize = 4;
 
-/// One full-rate speech frame's noise-relevant codewords, as §5.1
-/// consumes them for the background-acoustic-noise evaluation.
+/// One full-rate speech frame's *unquantised* noise parameters, as
+/// §5.1 consumes them for the background-acoustic-noise evaluation.
 ///
-/// §5.1 averages two quantities over the `N = 4` most recent VAD = 0
-/// frames: the eight Log-Area-Ratio codewords `LARc(i)` (i = 1..8) and
-/// the four sub-segment block amplitudes `xmaxc(i)` (i = 1..4). This
-/// struct is exactly the slice of an [`UnpackedFrame`] those two
-/// equations read, so a caller can build it directly from an encoder's
-/// output via [`From<&UnpackedFrame>`](#impl-From<%26UnpackedFrame>).
+/// §5.1 is explicit that it *"uses the **unquantized** block amplitude
+/// and Log Area Ratio (LAR) parameters of the full rate speech encoder,
+/// defined in 4.2.15 and 4.2.6 of GSM 06.10"* — i.e. the §5.2.6 LAR
+/// values *before* the §5.2.7 quantiser, and the §5.2.15 block maximum
+/// `xmax = max|xM[i]|` *before* the `xmaxc` coding step. The means are
+/// taken on these unquantised values and only then *"encoded as
+/// described in GSM 06.10"* (§5.2). Averaging the *coded* `LARc` /
+/// `xmaxc` instead would be a different (and incorrect) quantity.
+///
+/// * `lar[1..=8]` is the §5.2.6 [`analysis::reflection_to_lar`] /
+///   [`analysis::analyse_frame`] output (entry 0 is the 1-based
+///   sentinel).
+/// * `xmax[1..=4]` is the §5.2.15 block maximum of each of the four
+///   sub-segments — the [`analysis::ApcmQuantised::xmax`] field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoiseFrameParameters {
-    /// `LARc[1..=8]` — the frame's eight log-area-ratio codewords
-    /// (entry 0 is a sentinel zero for 1-based indexing, mirroring
-    /// [`UnpackedFrame::lar_c`]).
-    pub lar_c: [i16; 9],
-    /// `xmaxc[1..=4]` — the four sub-segment block-amplitude codewords
-    /// of this frame.
-    pub xmax_c: [u8; SUBFRAMES],
+    /// `LAR[1..=8]` — the frame's eight *unquantised* log-area ratios
+    /// (the §5.2.6 output; entry 0 is a sentinel zero for 1-based
+    /// indexing).
+    pub lar: [i16; 9],
+    /// `xmax[1..=4]` — the four sub-segments' *unquantised* block
+    /// maxima (the §5.2.15 `xmax` search result of each sub-segment).
+    pub xmax: [i16; SUBFRAMES],
 }
 
-impl From<&UnpackedFrame> for NoiseFrameParameters {
-    /// Extract the §5.1 noise-relevant codewords from a coded speech
-    /// frame: the eight `LARc(i)` and the four sub-segment `xmaxc(i)`.
-    fn from(frame: &UnpackedFrame) -> Self {
-        Self {
-            lar_c: frame.lar_c,
-            xmax_c: core::array::from_fn(|j| frame.sub[j].xmax_c),
-        }
+impl NoiseFrameParameters {
+    /// Build the §5.1 input from one frame's *unquantised* encoder
+    /// intermediates: the eight §5.2.6 LARs (`lar[1..=8]`; index 0 is
+    /// forced to the sentinel zero) and the four sub-segments' §5.2.15
+    /// block maxima `xmax[0..=3]`.
+    ///
+    /// During normal encoding these are exactly the
+    /// [`analysis::analyse_frame`] output (the per-frame LARs) and the
+    /// [`analysis::ApcmQuantised::xmax`] field of each sub-segment's
+    /// [`analysis::apcm_quantise_rpe`] result.
+    pub fn new(lar: [i16; 9], xmax: [i16; SUBFRAMES]) -> Self {
+        let mut lar = lar;
+        lar[0] = 0;
+        Self { lar, xmax }
     }
 }
 
@@ -567,27 +586,34 @@ impl From<&UnpackedFrame> for NoiseFrameParameters {
 /// transmit side must describe the residual background noise so the
 /// receive side ([`ComfortNoiseGenerator`]) can resynthesise it. §5.1
 /// specifies the noise description as the arithmetic mean of the
-/// coded-speech noise parameters over the `N = 4` consecutive frames
-/// marked `VAD = 0`:
+/// *unquantised* coded-speech noise parameters over the `N = 4`
+/// consecutive frames marked `VAD = 0`:
 ///
 /// * **Log-Area Ratios** —
 ///   `mean(LAR(i)) = (1/N) · Σ_{n=1}^{N} LAR[j−n](i)`,  i = 1..8.
-///   Each of the eight LAR codewords is averaged independently across
-///   the four frames.
+///   Each of the eight §5.2.6 LAR values is averaged independently
+///   across the four frames.
 /// * **Block amplitude** —
 ///   `mean(xmax) = (1/(4N)) · Σ_{n=1}^{N} Σ_{i=1}^{4} xmax[j−n](i)`.
 ///   A *single* mean is taken over **all** `4·N = 16` sub-segment block
-///   amplitudes (four sub-segments × four frames). §5.2 then stores
-///   this one value *"repeated four times inside the frame"*, so the
-///   resulting [`SidParameters::xmax_cr`] carries it in all four slots.
+///   maxima (four sub-segments × four frames).
 ///
-/// This evaluator implements that part of §5 which the staged
-/// EN 300 963 PDF fully defines: the averaging itself. It takes the
-/// per-frame noise parameters of the VAD = 0 frames as input
-/// ([`NoiseFrameParameters`], trivially built from an encoder's
-/// [`UnpackedFrame`] output) and emits the [`SidParameters`] the
-/// existing §6.1 receive side consumes — closing the §5.1 → §6.1
-/// transmit-to-receive comfort-noise loop end-to-end.
+/// §5.2 then *encodes those means "as described in GSM 06.10"*: the
+/// mean LARs through the §5.2.7 [`analysis::quantise_lar`] quantiser
+/// and the single mean block amplitude through the §5.2.15
+/// [`analysis::code_xmax`] coder, the latter *"repeated four times
+/// inside the frame"* — so the [`SidParameters`] this evaluator emits
+/// already carries `LARcr` / `Xmaxcr` codewords ready for the §6.1
+/// receive side, with the same `Xmaxcr` value in all four slots.
+///
+/// This evaluator implements the part of §5 the staged EN 300 963 PDF
+/// fully defines: the §5.1 averaging plus the §5.2 *parameter*
+/// re-encoding (everything except the §5.2 SID *bit* layout, which
+/// needs the unstaged GSM 05.03 — see below). It takes the per-frame
+/// *unquantised* noise parameters of the VAD = 0 frames as input
+/// ([`NoiseFrameParameters`], built from the encoder's §5.2.6 /
+/// §5.2.15 intermediates) and emits the [`SidParameters`] the existing
+/// §6.1 receive side consumes — closing the §5.1 → §6.1 loop.
 ///
 /// ## What this evaluator does *not* do (documented spec gap)
 ///
@@ -605,13 +631,14 @@ impl From<&UnpackedFrame> for NoiseFrameParameters {
 /// bitstream. The DTX scheduling that decides *when* a SID frame is
 /// emitted is **GSM 06.31** (not staged).
 ///
-/// The §5.1 equations are exact arithmetic means of integer codewords;
-/// the staged PDF does not state the rounding direction of the final
-/// integer division. Round-to-nearest (ties away from zero) is used —
-/// the natural reading of *"mean"* — and is the only quantity left to
-/// implementation choice here, on the same footing as the receive-side
-/// [`NoiseRng`] generator. No staged conformance vector exercises the
-/// SID parameter values, so the choice is not bit-pinned by the spec.
+/// The §5.1 equations are exact arithmetic means of integer-valued
+/// parameters; the staged PDF does not state the rounding direction of
+/// the final integer division. Round-to-nearest (ties away from zero,
+/// symmetric for the signed LARs) is used — the natural reading of
+/// *"mean"* — and is the only quantity left to implementation choice
+/// here, on the same footing as the receive-side [`NoiseRng`]
+/// generator. No staged conformance vector exercises the SID parameter
+/// values, so the choice is not bit-pinned by the spec.
 #[derive(Debug, Clone)]
 pub struct NoiseEvaluator {
     /// Fixed `N`-slot ring of the most recent VAD = 0 frame parameters.
@@ -634,8 +661,8 @@ impl NoiseEvaluator {
     pub fn new() -> Self {
         Self {
             window: [NoiseFrameParameters {
-                lar_c: [0; 9],
-                xmax_c: [0; SUBFRAMES],
+                lar: [0; 9],
+                xmax: [0; SUBFRAMES],
             }; NOISE_EVAL_FRAMES],
             count: 0,
             next: 0,
@@ -683,22 +710,25 @@ impl NoiseEvaluator {
         }
     }
 
-    /// Convenience wrapper around [`Self::push_frame`] that extracts the
-    /// §5.1 noise parameters straight from a coded speech frame.
-    pub fn push_unpacked(&mut self, frame: &UnpackedFrame) {
-        self.push_frame(NoiseFrameParameters::from(frame));
-    }
-
-    /// Evaluate the §5.1 mean LARs and mean block amplitude over the
-    /// frames accumulated so far, returning the [`SidParameters`] the
-    /// §6.1 receive side consumes.
+    /// Evaluate §5.1 + §5.2 over the frames accumulated so far,
+    /// returning the [`SidParameters`] the §6.1 receive side consumes.
+    ///
+    /// Steps:
+    ///
+    /// 1. **§5.1 means.** Average each of the eight *unquantised* LARs
+    ///    independently across the `n` frames, and take a single mean
+    ///    over all `4·n` *unquantised* sub-segment block maxima.
+    /// 2. **§5.2 encoding.** Encode the eight mean LARs through the
+    ///    §5.2.7 [`analysis::quantise_lar`] quantiser, and the single
+    ///    mean block amplitude through the §5.2.15
+    ///    [`analysis::code_xmax`] coder, writing that one `Xmaxcr`
+    ///    codeword into all four slots per §5.2 *"repeated four times
+    ///    inside the frame"*.
     ///
     /// Returns `None` only when no frame has been pushed (an empty mean
     /// is undefined). With a partial window (1..3 frames) it averages
     /// what is present; with the full `N = 4` window it is the canonical
-    /// §5.1 evaluation. The single §5.1 `mean(xmax)` is written into all
-    /// four [`SidParameters::xmax_cr`] slots per the §5.2 *"repeated
-    /// four times"* rule.
+    /// §5.1 evaluation.
     pub fn evaluate(&self) -> Option<SidParameters> {
         let n = self.count;
         if n == 0 {
@@ -706,27 +736,33 @@ impl NoiseEvaluator {
         }
         let frames = &self.window[..n];
 
-        // §5.1 mean(LAR(i)) — average each of the eight LAR codewords
+        // §5.1 mean(LAR(i)) — average each of the eight unquantised LARs
         // independently across the n frames. Slot 0 stays the 1-based
         // sentinel.
-        let mut lar_cr = [0i16; 9];
-        for (i, slot) in lar_cr.iter_mut().enumerate().take(9).skip(1) {
-            let sum: i32 = frames.iter().map(|f| f.lar_c[i] as i32).sum();
+        let mut lar_mean = [0i16; 9];
+        for (i, slot) in lar_mean.iter_mut().enumerate().take(9).skip(1) {
+            let sum: i32 = frames.iter().map(|f| f.lar[i] as i32).sum();
             *slot = mean_round(sum, n as i32) as i16;
         }
+        // §5.2 — encode the mean LARs "as described in GSM 06.10"
+        // (§5.2.7 quantiser → LARcr codewords).
+        let lar_cr = quantise_lar(&lar_mean);
 
-        // §5.1 mean(xmax) — one mean over all 4·n sub-segment block
-        // amplitudes, then §5.2 repeats it across the four slots.
+        // §5.1 mean(xmax) — one mean over all 4·n unquantised sub-segment
+        // block maxima.
         let xmax_sum: i32 = frames
             .iter()
-            .flat_map(|f| f.xmax_c.iter())
+            .flat_map(|f| f.xmax.iter())
             .map(|&x| x as i32)
             .sum();
-        let xmax_mean = mean_round(xmax_sum, (SUBFRAMES * n) as i32) as u8;
+        let xmax_mean = mean_round(xmax_sum, (SUBFRAMES * n) as i32) as i16;
+        // §5.2 — encode the mean block amplitude (§5.2.15 coder), then
+        // repeat the single Xmaxcr codeword across the four slots.
+        let xmax_cr = code_xmax(xmax_mean) as u8;
 
         Some(SidParameters {
             lar_cr,
-            xmax_cr: [xmax_mean; SUBFRAMES],
+            xmax_cr: [xmax_cr; SUBFRAMES],
         })
     }
 }
@@ -1050,15 +1086,10 @@ mod tests {
 
     // ----- §5.1 transmit-side background-acoustic-noise evaluation -----
 
-    fn noise_frame(lar: [i16; 9], xmax: [u8; SUBFRAMES]) -> NoiseFrameParameters {
-        NoiseFrameParameters {
-            lar_c: lar,
-            xmax_c: xmax,
-        }
-    }
+    use crate::encoder::analysis::{code_xmax, quantise_lar};
 
     /// §5.1: `mean_round` is round-to-nearest, ties away from zero, and
-    /// symmetric for negative LAR codewords.
+    /// symmetric for negative LARs.
     #[test]
     fn mean_round_is_nearest_ties_away() {
         assert_eq!(mean_round(0, 4), 0);
@@ -1080,55 +1111,66 @@ mod tests {
         assert!(e.evaluate().is_none());
     }
 
-    /// §5.1: averaging four identical frames yields those same codewords;
-    /// the single mean(xmax) is replicated across all four §5.2 slots.
+    /// `NoiseFrameParameters::new` forces the 1-based sentinel slot 0.
     #[test]
-    fn evaluate_identical_frames_is_identity() {
+    fn noise_frame_params_force_sentinel() {
+        let np = NoiseFrameParameters::new([99, 1, 2, 3, 4, 5, 6, 7, 8], [10, 20, 30, 40]);
+        assert_eq!(np.lar[0], 0);
+        assert_eq!(&np.lar[1..=8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(np.xmax, [10, 20, 30, 40]);
+    }
+
+    /// §5.1 + §5.2: averaging four identical frames yields that frame's
+    /// mean, which §5.2 re-encodes through `quantise_lar` / `code_xmax`.
+    /// The single mean(xmax) codeword is replicated across all four slots.
+    #[test]
+    fn evaluate_identical_frames_is_quantised_identity() {
         let mut e = NoiseEvaluator::new();
-        let lar = [0, 10, 20, 30, 40, 50, 6, 7, 8];
-        let xmax = [12, 12, 12, 12];
+        let lar = [0, 2000, -1500, 800, -400, 300, -200, 100, -50];
+        let xmax = [4096, 4096, 4096, 4096];
         for _ in 0..NOISE_EVAL_FRAMES {
-            e.push_frame(noise_frame(lar, xmax));
+            e.push_frame(NoiseFrameParameters::new(lar, xmax));
         }
         assert!(e.is_ready());
         assert_eq!(e.len(), NOISE_EVAL_FRAMES);
         let sid = e.evaluate().unwrap();
-        assert_eq!(sid.lar_cr, lar);
-        assert_eq!(sid.xmax_cr, [12, 12, 12, 12]);
+        // §5.2: the mean (= the common value) is encoded, not stored raw.
+        assert_eq!(sid.lar_cr, quantise_lar(&lar));
+        let expect_xmax = code_xmax(4096) as u8;
+        assert_eq!(sid.xmax_cr, [expect_xmax; SUBFRAMES]);
     }
 
-    /// §5.1: each LAR(i) is averaged independently across the N=4 frames.
-    /// Frames carry LARc(i) = i, 2i, 3i, 4i → mean = 2.5·i, rounded.
+    /// §5.1: each LAR(i) is averaged independently across the N=4 frames,
+    /// on the *unquantised* values, before the §5.2 quantiser.
     #[test]
     fn evaluate_lar_averaged_per_coefficient() {
         let mut e = NoiseEvaluator::new();
         for k in 1..=NOISE_EVAL_FRAMES as i16 {
-            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { k * i as i16 });
-            e.push_frame(noise_frame(lar, [0; SUBFRAMES]));
+            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { k * (i as i16) * 100 });
+            e.push_frame(NoiseFrameParameters::new(lar, [0; SUBFRAMES]));
+        }
+        // mean over {100i, 200i, 300i, 400i} = 1000i/4 = 250i.
+        let mut mean_lar = [0i16; 9];
+        for (i, slot) in mean_lar.iter_mut().enumerate().skip(1) {
+            *slot = mean_round(1000 * i as i32, 4) as i16;
         }
         let sid = e.evaluate().unwrap();
-        // mean over {i,2i,3i,4i} = 10i/4 = 2.5·i → nearest, tie away.
-        for i in 1..=8i16 {
-            let expect = mean_round(10 * i as i32, 4) as i16;
-            assert_eq!(sid.lar_cr[i as usize], expect, "LAR coeff {i}");
-        }
-        assert_eq!(sid.lar_cr[0], 0, "sentinel slot must stay zero");
+        assert_eq!(sid.lar_cr, quantise_lar(&mean_lar));
     }
 
     /// §5.1: mean(xmax) is a *single* mean over all 4·N = 16 sub-segment
-    /// block amplitudes, not a per-sub-segment average. §5.2 then repeats
-    /// it across the four slots.
+    /// block maxima, not a per-sub-segment average. §5.2 then repeats the
+    /// one encoded codeword across the four slots.
     #[test]
     fn evaluate_xmax_single_mean_over_all_subsegments() {
         let mut e = NoiseEvaluator::new();
-        // Frame block amplitudes: frame0 all 4, frame1 all 8, frame2 all
-        // 12, frame3 all 16 → 16 values summing to 4*(4+8+12+16)=160,
-        // /16 = 10.
-        for v in [4u8, 8, 12, 16] {
-            e.push_frame(noise_frame([0; 9], [v; SUBFRAMES]));
+        // frame maxima 1024/2048/3072/4096 (all four sub-segments each)
+        // → 16 values, mean = (1024+2048+3072+4096)/4 = 2560.
+        for v in [1024i16, 2048, 3072, 4096] {
+            e.push_frame(NoiseFrameParameters::new([0; 9], [v; SUBFRAMES]));
         }
         let sid = e.evaluate().unwrap();
-        assert_eq!(sid.xmax_cr, [10, 10, 10, 10]);
+        assert_eq!(sid.xmax_cr, [code_xmax(2560) as u8; SUBFRAMES]);
     }
 
     /// §5.1: the window keeps only the four most recent VAD=0 frames;
@@ -1136,14 +1178,14 @@ mod tests {
     #[test]
     fn window_evicts_oldest_beyond_n() {
         let mut e = NoiseEvaluator::new();
-        // Push 5 frames; first (xmax=0) must be evicted, leaving xmax
-        // 4,8,12,16 → mean 10.
-        for v in [0u8, 4, 8, 12, 16] {
-            e.push_frame(noise_frame([0; 9], [v; SUBFRAMES]));
+        // Push 5 frames; first (xmax=0) is evicted, leaving 1024/2048/
+        // 3072/4096 → mean 2560.
+        for v in [0i16, 1024, 2048, 3072, 4096] {
+            e.push_frame(NoiseFrameParameters::new([0; 9], [v; SUBFRAMES]));
         }
         assert_eq!(e.len(), NOISE_EVAL_FRAMES);
         let sid = e.evaluate().unwrap();
-        assert_eq!(sid.xmax_cr, [10, 10, 10, 10]);
+        assert_eq!(sid.xmax_cr, [code_xmax(2560) as u8; SUBFRAMES]);
     }
 
     /// A partial window (fewer than N frames) averages only what is
@@ -1151,54 +1193,62 @@ mod tests {
     #[test]
     fn evaluate_partial_window() {
         let mut e = NoiseEvaluator::new();
-        e.push_frame(noise_frame([0, 4, 4, 4, 4, 4, 4, 4, 4], [8; SUBFRAMES]));
-        e.push_frame(noise_frame([0, 8, 8, 8, 8, 8, 8, 8, 8], [16; SUBFRAMES]));
+        e.push_frame(NoiseFrameParameters::new(
+            [0, 400, 400, 400, 400, 400, 400, 400, 400],
+            [1024; SUBFRAMES],
+        ));
+        e.push_frame(NoiseFrameParameters::new(
+            [0, 800, 800, 800, 800, 800, 800, 800, 800],
+            [3072; SUBFRAMES],
+        ));
         assert!(!e.is_ready());
         let sid = e.evaluate().unwrap();
-        assert_eq!(&sid.lar_cr[1..=8], &[6i16; 8]); // mean(4,8)=6
-        assert_eq!(sid.xmax_cr, [12, 12, 12, 12]); // mean(8,16)=12
+        // mean LAR = 600 for each; mean xmax = (1024+3072)/2 = 2048.
+        assert_eq!(
+            sid.lar_cr,
+            quantise_lar(&[0, 600, 600, 600, 600, 600, 600, 600, 600])
+        );
+        assert_eq!(sid.xmax_cr, [code_xmax(2048) as u8; SUBFRAMES]);
     }
 
     /// `reset` clears the window so a new silence period restarts §5.1.
     #[test]
     fn reset_clears_window() {
         let mut e = NoiseEvaluator::new();
-        e.push_frame(noise_frame([0; 9], [9; SUBFRAMES]));
+        e.push_frame(NoiseFrameParameters::new([0; 9], [2048; SUBFRAMES]));
         e.reset();
         assert!(e.is_empty());
         assert!(e.evaluate().is_none());
     }
 
-    /// `NoiseFrameParameters::from(&UnpackedFrame)` lifts exactly the
-    /// §5.1 noise codewords out of a coded speech frame.
+    /// The §5.1 evaluator's `xmax` input comes from the §5.2.15 block
+    /// maximum the encoder exposes on `ApcmQuantised::xmax`, and
+    /// re-coding it reproduces the encoder's own `xmaxc`.
     #[test]
-    fn extract_noise_params_from_unpacked_frame() {
-        let mut f = UnpackedFrame {
-            lar_c: [0, 1, 2, 3, 4, 5, 6, 7, 8],
-            sub: [SubFrame::default(); SUBFRAMES],
-        };
-        for (j, sf) in f.sub.iter_mut().enumerate() {
-            sf.xmax_c = (j as u8 + 1) * 10;
-        }
-        let np = NoiseFrameParameters::from(&f);
-        assert_eq!(np.lar_c, f.lar_c);
-        assert_eq!(np.xmax_c, [10, 20, 30, 40]);
+    fn xmax_field_matches_encoder_block_maximum() {
+        use crate::encoder::analysis::apcm_quantise_rpe;
+        let x_m = [
+            120i16, -300, 50, 0, 700, -40, 12, -9, 333, -1000, 5, 88, -250,
+        ];
+        let apcm = apcm_quantise_rpe(&x_m);
+        // The block maximum is max|xM[i]| = 1000.
+        assert_eq!(apcm.xmax, 1000);
+        // Coding that block maximum reproduces the encoder's xmaxc.
+        assert_eq!(code_xmax(apcm.xmax), apcm.xmaxc);
     }
 
-    /// End-to-end §5.1 → §6.1: a SID evaluated on the transmit side
-    /// drives the receive-side comfort-noise generator, and every frame
-    /// it emits packs legally through §1.7.
+    /// End-to-end §5.1 → §5.2 → §6.1: a SID evaluated on the transmit
+    /// side drives the receive-side comfort-noise generator, and every
+    /// frame it emits packs legally through §1.7.
     #[test]
     fn transmit_eval_feeds_receive_generator() {
         let mut e = NoiseEvaluator::new();
-        // Legal §1.7 LAR codewords (6/6/5/5/4/4/3/3 bit fields) plus a
-        // small per-frame perturbation so the mean is non-trivial.
-        let base = [0i16, 9, 23, 15, 8, 7, 3, 3, 2];
         for k in 0..NOISE_EVAL_FRAMES as i16 {
-            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { base[i] + (k % 2) });
-            e.push_frame(noise_frame(lar, [(k as u8 + 1) * 4; SUBFRAMES]));
+            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { (i as i16) * 200 + k * 30 });
+            e.push_frame(NoiseFrameParameters::new(lar, [(k + 1) * 1024; SUBFRAMES]));
         }
         let sid = e.evaluate().unwrap();
+        // The §5.2-encoded codewords must already be legal §1.7 fields.
         let mut g = ComfortNoiseGenerator::new(sid, 7);
         for _ in 0..8 {
             let f = g.next_frame_parameters();

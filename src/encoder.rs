@@ -1767,6 +1767,13 @@ pub mod analysis {
     /// rather than re-deriving them from `xmaxc`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ApcmQuantised {
+        /// §5.2.15 *unquantised* block maximum `xmax = max|xM[i]|` of
+        /// this sub-segment, before the `xmaxc` coding step. This is
+        /// the "unquantized block amplitude parameter" GSM 06.12 §5.1
+        /// averages for transmit-side comfort-noise evaluation (it is
+        /// the `xmax` the §5.2.15 search produces, not the coded
+        /// `xmaxc`).
+        pub xmax: i16,
         /// §5.2.15 quantised block maximum, 6-bit unsigned code
         /// (range 0..=63 per §1.7 Table 1.1 column `Xmaxc`).
         pub xmaxc: i16,
@@ -1907,33 +1914,7 @@ pub mod analysis {
         }
 
         // §5.2.15 — quantise + code xmax to get the 6-bit xmaxc.
-        //   exp = 0;
-        //   temp = xmax >> 9;
-        //   itest = 0;
-        //   FOR i = 0 to 5:
-        //     IF (temp <= 0) itest = 1;
-        //     temp >>= 1;
-        //     IF (itest == 0) exp += 1;
-        //   NEXT i:
-        let mut exp: i16 = 0;
-        let mut temp: i16 = xmax >> 9;
-        let mut itest: i16 = 0;
-        for _ in 0..6 {
-            if temp <= 0 {
-                itest = 1;
-            }
-            temp >>= 1;
-            if itest == 0 {
-                exp = add(exp, 1);
-            }
-        }
-
-        // §5.2.15 — pack: xmaxc = (xmax >> (exp+5)) + (exp << 3).
-        //   `temp = add(exp, 5)` may exceed 15; use the spec's
-        //   §5.1 signed-shift fall-through via `shl_signed` on
-        //   xmax (a positive i16) to right-shift safely.
-        let pack_shift = add(exp, 5);
-        let xmaxc = add(shl_signed(xmax, sub(0, pack_shift)), shl_signed(exp, 3));
+        let xmaxc = code_xmax(xmax);
 
         // §5.2.15 — compute exponent and mantissa of the decoded
         // version of xmaxc, then normalise so that on entry to
@@ -1996,11 +1977,55 @@ pub mod analysis {
         }
 
         ApcmQuantised {
+            xmax,
             xmaxc,
             x_mc,
             exp: norm_exp,
             mant: mant_idx,
         }
+    }
+
+    /// §5.2.15 — code an *unquantised* block maximum `xmax` (a
+    /// non-negative i16, e.g. the §5.2.15 search result or the GSM
+    /// 06.12 §5.1 `mean(xmax)`) into the 6-bit `xmaxc` codeword §1.7
+    /// packs as `Xmaxc`.
+    ///
+    /// §5.2.15 pseudocode:
+    /// ```text
+    ///     exp = 0;
+    ///     temp = xmax >> 9;
+    ///     itest = 0;
+    ///     FOR i = 0 to 5:
+    ///         IF ( temp <= 0 ) THEN itest = 1;
+    ///         temp = temp >> 1;
+    ///         IF ( itest == 0 ) THEN exp = add( exp, 1 ) ;
+    ///     NEXT i:
+    ///     temp = add( exp, 5 ) ;
+    ///     xmaxc = add( ( xmax >> temp ), ( exp << 3 ) ) ;
+    /// ```
+    ///
+    /// Factored out of [`apcm_quantise_rpe`] so GSM 06.12 §5.2 can
+    /// re-use it to encode the §5.1 mean block amplitude *"as described
+    /// in GSM 06.10"* without re-deriving the exponent search.
+    pub fn code_xmax(xmax: i16) -> i16 {
+        let mut exp: i16 = 0;
+        let mut temp: i16 = xmax >> 9;
+        let mut itest: i16 = 0;
+        for _ in 0..6 {
+            if temp <= 0 {
+                itest = 1;
+            }
+            temp >>= 1;
+            if itest == 0 {
+                exp = add(exp, 1);
+            }
+        }
+        // §5.2.15 — pack: xmaxc = (xmax >> (exp+5)) + (exp << 3).
+        //   `temp = add(exp, 5)` may exceed 15; use the spec's §5.1
+        //   signed-shift fall-through via `shl_signed` on xmax (a
+        //   non-negative i16) to right-shift safely.
+        let pack_shift = add(exp, 5);
+        add(shl_signed(xmax, sub(0, pack_shift)), shl_signed(exp, 3))
     }
 
     /// §5.2.16 + §5.2.17 — encoder-side APCM inverse quantisation and

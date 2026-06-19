@@ -6,32 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **GSM 06.12 §5.1 transmit-side background-acoustic-noise evaluation
-  (2026-06-20).** New `NoiseEvaluator` implements the §5.1 averaging
-  that builds a SID frame's noise parameters over the `N = 4` most
-  recent VAD = 0 frames: `mean(LAR(i)) = (1/N)·Σ LAR[j−n](i)` for the
-  eight LAR codewords (each averaged independently) and the single
+- **GSM 06.12 §5.1 + §5.2 transmit-side comfort-noise evaluation
+  (2026-06-20).** New `NoiseEvaluator` implements the §5.1 background-
+  acoustic-noise averaging *plus* the §5.2 parameter encoding that
+  builds a SID frame's noise parameters over the `N = 4` most recent
+  VAD = 0 frames. Per §5.1 the means are taken on the **unquantised**
+  parameters — *"the unquantized block amplitude and Log Area Ratio
+  (LAR) parameters … defined in 4.2.15 and 4.2.6"*:
+  `mean(LAR(i)) = (1/N)·Σ LAR[j−n](i)` for the eight §5.2.6 LARs (each
+  averaged independently) and the single
   `mean(xmax) = (1/(4N))·Σ_n Σ_i xmax[j−n](i)` over all `4·N = 16`
-  sub-segment block amplitudes, replicated across the four
-  `SidParameters::xmax_cr` slots per §5.2's *"repeated four times"*.
-  Frames feed in via `push_unpacked(&UnpackedFrame)` /
-  `push_frame(NoiseFrameParameters)` (the latter `From<&UnpackedFrame>`)
-  into a fixed 4-slot ring that evicts the oldest beyond `N`; `evaluate`
-  emits the `SidParameters` the existing §6.1 `ComfortNoiseGenerator`
-  consumes — closing the §5.1 → §6.1 transmit-to-receive comfort-noise
-  parameter loop end-to-end. The §5.1 means are exact integer-codeword
-  averages; the staged PDF leaves the final-division rounding direction
-  unstated, so round-to-nearest (ties away from zero, symmetric for the
-  signed LAR codewords) is used — the only quantity left to
-  implementation choice, on the same footing as the receive-side
+  §5.2.15 sub-segment block maxima. §5.2 then encodes those means *"as
+  described in GSM 06.10"*: the mean LARs through the §5.2.7
+  `quantise_lar` quantiser and the single mean block amplitude through
+  the new §5.2.15 `code_xmax` coder (factored out of `apcm_quantise_rpe`
+  and now exposed), replicated across the four `SidParameters::xmax_cr`
+  slots per §5.2's *"repeated four times"*. Frames feed in via
+  `push_frame(NoiseFrameParameters::new(lar, xmax))` — `lar` the
+  encoder's §5.2.6 `analyse_frame` output, `xmax` the four sub-segments'
+  §5.2.15 `ApcmQuantised::xmax` block maxima (a new field on that
+  struct) — into a fixed 4-slot ring that evicts the oldest beyond `N`;
+  `evaluate` emits the `SidParameters` the existing §6.1
+  `ComfortNoiseGenerator` consumes, closing the §5.1 → §5.2 → §6.1
+  transmit-to-receive comfort-noise parameter loop end-to-end. The
+  means are exact integer averages; the staged PDF leaves the final-
+  division rounding direction unstated, so round-to-nearest (ties away
+  from zero, symmetric for the signed LARs) is used — the only quantity
+  left to implementation choice, on the same footing as the receive-side
   `NoiseRng`. New public surface: `NoiseEvaluator`,
-  `NoiseFrameParameters`, `NOISE_EVAL_FRAMES`. 11 new tests cover the
-  rounding helper, identity/partial/full windows, per-coefficient LAR
-  averaging, the single-mean xmax semantics, oldest-frame eviction,
-  `UnpackedFrame` extraction, and an end-to-end §5.1→§6.1 round-trip.
-  Still docs-blocked (unstaged): the VAD flag (GSM 06.32), the §5.2
-  SID-frame *bit* layout incl. the class-I 95-bit code word (GSM 05.03
-  table 2), and DTX scheduling (GSM 06.31).
+  `NoiseFrameParameters`, `NOISE_EVAL_FRAMES`, `analysis::code_xmax`,
+  `ApcmQuantised::xmax`. 11 new comfort-noise tests cover the rounding
+  helper, identity/partial/full windows, per-coefficient unquantised LAR
+  averaging, the single-mean xmax semantics, oldest-frame eviction, the
+  `ApcmQuantised::xmax` ↔ `code_xmax` consistency, and an end-to-end
+  §5.1→§5.2→§6.1 round-trip. Still docs-blocked (unstaged): the VAD flag
+  (GSM 06.32), the §5.2 SID-frame *bit* layout incl. the class-I 95-bit
+  code word (GSM 05.03 table 2), and DTX scheduling (GSM 06.31).
 
 - **§6.3.2 Table 6.7 decoder-overflow saturation pin (2026-06-19).**
   Table 6.7 ("List of tested overflows points for sequence 1 (decoder

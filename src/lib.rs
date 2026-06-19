@@ -118,7 +118,7 @@ pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
     is_partial_decoder_homing_frame, DecoderState,
 };
-pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
+pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};
 pub use error::Error;
 pub use sync::{
