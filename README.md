@@ -9,6 +9,7 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 |-----------|----------|-------|
 | Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) + §6.2/§6.3.3.1 conformance harness | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). The §6.2 verification configurations now run end-to-end against the §6.3.3.1 SEQ06H homing vectors (the only §6 vectors fully defined in the staged PDF) through the public registry adapters, and the §6.3.2 Table 6.5/6.7 spec-named boundary statements (§5.2.4/§5.2.5/§5.2.9.2 ranges + comparisons, §5.3.6 saturation) are pinned. The bulk SEQ01..SEQ05 binary test sequences remain pending — they ship in the `en_300961v080101p0.ZIP` archive ETSI distributes alongside the PDF; staging it is a docs followup. |
 | Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing + §6.3.3.3 bit-sync | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. The §6.3.3.3 encoder-framing **bit-synchronization** detector is also in place (`find_bit_sync` / `run_bit_sync_trial`). §6 binary conformance sequences + the §6.3.3.3 *frame*-synchronization sweep (the unstaged `SYNCxxx.COD` corpus) are the remaining gap. |
+| Comfort noise (GSM 06.12) | §5.1 transmit evaluation + §6.1 receive generation | **Transmit side** (`NoiseEvaluator`): the §5.1 `N = 4`-frame averaging — per-coefficient `mean(LAR(i))` and the single `mean(xmax)` over all 16 sub-segment block amplitudes — producing the `SidParameters` a SID carries. **Receive side** (`ComfortNoiseGenerator`): the §6.1 substitution (random RPE [1,6] / grid [0,3], `bcr = 0`, `Ncr = 40/120/40/120`, SID-carried LARs + block amplitudes) driving the §5.3 decoder, plus the §6.1 update-smoothing interpolation. Closes the §5.1 → §6.1 parameter loop. Still docs-blocked: the VAD flag (GSM 06.32), the §5.2 SID-frame *bit* layout incl. the class-I 95-bit code word (GSM 05.03 table 2), and DTX scheduling (GSM 06.31) — none staged. |
 
 ## Implementation
 
@@ -497,10 +498,11 @@ unstaged ETSI conformance archive (`en_300961v080101p0.ZIP`); running
 those is a docs-staging followup. The SEQ06H homing vectors are the
 spec-complete subset that needs no external corpus.
 
-## Comfort noise (GSM 06.12 §6.1)
+## Comfort noise (GSM 06.12 §5.1 + §6.1)
 
-The receive-side **comfort-noise generation** of ETSI EN 300 963
-(GSM 06.12) is implemented as the [`comfort_noise`] module. During
+The transmit-side **background-acoustic-noise evaluation** (§5.1) and
+the receive-side **comfort-noise generation** (§6.1) of ETSI EN 300 963
+(GSM 06.12) are implemented as the [`comfort_noise`] module. During
 Discontinuous Transmission (DTX) the radio link is cut at the end of a
 speech burst; the background acoustic noise that travelled with the
 speech would vanish abruptly — "very annoying for the listener" (§4).
@@ -556,16 +558,43 @@ substituted:
   *scheduling* of when a valid SID arrives, which is the (unstaged)
   GSM 06.31 concern.
 
-The §5 **transmit side** (background-acoustic-noise evaluation +
-SID-frame *encoding*) and the receive-side "valid SID frame" detection
-are **docs-blocked**: §5.1 averaging needs the VAD flag (GSM 06.32),
-§5.2 SID-frame layout is defined by "the 95 bits of the encoded
-RPE-pulses Xmc … in error protection class I (see GSM 05.03, table 2)"
-(GSM 05.03, channel coding), and DTX scheduling is GSM 06.31 — none of
-which are staged under `docs/audio/gsm/`. This module therefore takes
-the already-decoded SID parameters as input and implements the
-spec-grounded §6.1 receive side in full: frame synthesis, decoder
-driving, and the §6.1 update-smoothing interpolation.
+### §5.1 transmit-side background-acoustic-noise evaluation
+
+The transmit side builds a SID's noise parameters by averaging the
+coded-speech parameters of the silent frames. [`NoiseEvaluator`]
+implements the two §5.1 means over the `N = 4` most recent VAD = 0
+frames (window length [`NOISE_EVAL_FRAMES`]):
+
+* **Log-Area Ratios** —
+  `mean(LAR(i)) = (1/N) · Σ LAR[j−n](i)`, `i = 1..8`: each of the
+  eight LAR codewords is averaged independently across the four frames.
+* **Block amplitude** —
+  `mean(xmax) = (1/(4N)) · Σ_n Σ_i xmax[j−n](i)`: a *single* mean over
+  **all** `4·N = 16` sub-segment block amplitudes. §5.2 then stores it
+  *"repeated four times inside the frame"*, so the resulting
+  [`SidParameters::xmax_cr`] carries it in all four slots.
+
+`push_unpacked(&UnpackedFrame)` (or `push_frame` with a
+[`NoiseFrameParameters`], trivially `From<&UnpackedFrame>`) feeds VAD = 0
+frames in; `evaluate()` returns the [`SidParameters`] the §6.1 receive
+side consumes — closing the §5.1 → §6.1 loop end-to-end. The §5.1
+equations are exact arithmetic means of integer codewords; the staged
+PDF leaves the final-division rounding direction unstated, so
+round-to-nearest (ties away from zero) is used — the only quantity left
+to implementation choice here, on the same footing as the receive-side
+[`NoiseRng`].
+
+### Still docs-blocked
+
+Three pieces remain unstaged under `docs/audio/gsm/`: the **VAD flag**
+that marks which frames are silent (GSM 06.32); the §5.2 SID-frame
+*bit* layout — the 95-bit all-zero "SID code word" inserted at "the 95
+bits of the encoded RPE-pulses Xmc … in error protection class I (see
+GSM 05.03, table 2)" (GSM 05.03, channel coding) — and the matching
+receive-side "valid SID frame" detector; and the DTX scheduling that
+decides *when* a SID is emitted (GSM 06.31). The transmit side
+therefore stops at the §5.1 parameter mean ([`SidParameters`]) rather
+than packing a SID bitstream.
 
 ## Public API
 

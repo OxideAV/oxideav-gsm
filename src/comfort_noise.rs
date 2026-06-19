@@ -1,4 +1,4 @@
-//! GSM 06.12 comfort-noise generation — receive-side §6.1.
+//! GSM 06.12 comfort-noise — transmit-side §5.1 + receive-side §6.1.
 //!
 //! Source: ETSI EN 300 963 V8.0.1 (2000-11), *Full rate speech;
 //! Comfort noise aspect for full rate speech traffic channels
@@ -15,12 +15,19 @@
 //! in a special **SID (Silence Descriptor) frame** before the link is
 //! cut, and refreshed at a low rate afterwards.
 //!
-//! This module implements the **§6.1 receive-side generation**, which
-//! is the half of GSM 06.12 that depends only on features this crate
-//! already owns (the §5.3 RPE-LTP speech decoder of GSM 06.10) plus
-//! the SID-frame-supplied noise parameters. Per §6.1, comfort noise
-//! is produced by driving the standard speech decoder with a frame
-//! whose parameters are substituted as follows:
+//! This module implements both halves of GSM 06.12 that the staged
+//! EN 300 963 PDF fully defines:
+//!
+//! * the **§5.1 transmit-side background-acoustic-noise evaluation**
+//!   ([`NoiseEvaluator`]) — the `N = 4`-frame averaging of the LAR
+//!   codewords and block amplitude that builds the [`SidParameters`];
+//! * the **§6.1 receive-side comfort-noise generation**
+//!   ([`ComfortNoiseGenerator`]) — driving the §5.3 RPE-LTP speech
+//!   decoder with the SID-supplied noise parameters and the §6.1
+//!   substituted excitation.
+//!
+//! Per §6.1, comfort noise is produced by driving the standard speech
+//! decoder with a frame whose parameters are substituted as follows:
 //!
 //! | Parameter            | §6.1 value                                   |
 //! |----------------------|----------------------------------------------|
@@ -37,29 +44,32 @@
 //!
 //! ## What is *not* here (docs gap)
 //!
-//! GSM 06.12 §5 (transmit side — background-acoustic-noise evaluation
-//! and SID-frame *encoding*) and the detection of a "valid SID frame"
-//! on receive both depend on companion specifications that are **not**
-//! staged under `docs/audio/gsm/`:
+//! Three parts of the DTX comfort-noise path depend on companion
+//! specifications that are **not** staged under `docs/audio/gsm/`, so
+//! they are deliberately left out:
 //!
-//! * The §5.1 averaging of `LAR(i)` / `xmax` over `N = 4` VAD=0 frames
-//!   needs the **VAD flag**, defined in GSM 06.32 (not staged).
-//! * The §5.2 SID-frame layout — the 95-bit all-zero "SID code word"
-//!   and the positions at which it is inserted — is defined by *"those
-//!   95 bits of the encoded RPE-pulses Xmc which are in the error
-//!   protection class I (see GSM 05.03, table 2)"*. GSM 05.03 (channel
-//!   coding) is **not** staged, so neither SID-frame construction nor
-//!   the "valid SID frame" receive-side detector can be implemented
-//!   clean-room here.
-//! * The DTX scheduling that decides when comfort noise is generated
-//!   or updated (§6 opening, §6.1 closing) is defined in GSM 06.31
+//! * **Which frames are VAD = 0.** §5.1 averages only frames *"marked
+//!   with VAD = 0"*; the Voice Activity Detection algorithm producing
+//!   that mark is **GSM 06.32** (not staged). [`NoiseEvaluator`]
+//!   therefore averages the VAD = 0 frames the caller supplies rather
+//!   than detecting voice activity itself.
+//! * **The §5.2 SID-frame *bit* layout.** The 95-bit all-zero "SID
+//!   code word" is inserted at *"those 95 bits of the encoded
+//!   RPE-pulses Xmc which are in the error protection class I (see
+//!   GSM 05.03, table 2)"*. **GSM 05.03 table 2** (not staged) holds
+//!   those positions, so the transmit side stops at the §5.1 parameter
+//!   mean ([`SidParameters`]) — the part the staged PDF defines — and
+//!   does not pack a SID bitstream, nor implement the matching
+//!   receive-side "valid SID frame" detector.
+//! * **DTX scheduling.** When a SID frame is emitted or comfort noise
+//!   updated (§6 opening, §6.1 closing) is defined in **GSM 06.31**
 //!   (not staged).
 //!
-//! Accordingly this module takes the already-decoded SID parameters
-//! ([`SidParameters`]) as its input and implements the §6.1 frame
-//! synthesis and decoder driving — the spec-grounded part — leaving
-//! SID-frame parsing/scheduling for a follow-up round once GSM 05.03
-//! / 06.31 / 06.32 are staged.
+//! Accordingly the transmit side ([`NoiseEvaluator`]) emits decoded
+//! [`SidParameters`] and the receive side ([`ComfortNoiseGenerator`])
+//! consumes them — the full §5.1 → §6.1 parameter loop — leaving the
+//! §5.2 bit-packing, the VAD mark, and the DTX scheduling for a
+//! follow-up round once GSM 05.03 / 06.31 / 06.32 are staged.
 
 use crate::bitstream::{SubFrame, UnpackedFrame, SUBFRAMES};
 use crate::decoder::DecoderState;
@@ -513,6 +523,227 @@ impl ComfortNoiseGenerator {
     }
 }
 
+/// The §5.1 averaging-window length: comfort-noise parameters are
+/// evaluated over *"N = 4 consecutive frames marked with VAD = 0"*.
+pub const NOISE_EVAL_FRAMES: usize = 4;
+
+/// One full-rate speech frame's noise-relevant codewords, as §5.1
+/// consumes them for the background-acoustic-noise evaluation.
+///
+/// §5.1 averages two quantities over the `N = 4` most recent VAD = 0
+/// frames: the eight Log-Area-Ratio codewords `LARc(i)` (i = 1..8) and
+/// the four sub-segment block amplitudes `xmaxc(i)` (i = 1..4). This
+/// struct is exactly the slice of an [`UnpackedFrame`] those two
+/// equations read, so a caller can build it directly from an encoder's
+/// output via [`From<&UnpackedFrame>`](#impl-From<%26UnpackedFrame>).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoiseFrameParameters {
+    /// `LARc[1..=8]` — the frame's eight log-area-ratio codewords
+    /// (entry 0 is a sentinel zero for 1-based indexing, mirroring
+    /// [`UnpackedFrame::lar_c`]).
+    pub lar_c: [i16; 9],
+    /// `xmaxc[1..=4]` — the four sub-segment block-amplitude codewords
+    /// of this frame.
+    pub xmax_c: [u8; SUBFRAMES],
+}
+
+impl From<&UnpackedFrame> for NoiseFrameParameters {
+    /// Extract the §5.1 noise-relevant codewords from a coded speech
+    /// frame: the eight `LARc(i)` and the four sub-segment `xmaxc(i)`.
+    fn from(frame: &UnpackedFrame) -> Self {
+        Self {
+            lar_c: frame.lar_c,
+            xmax_c: core::array::from_fn(|j| frame.sub[j].xmax_c),
+        }
+    }
+}
+
+/// GSM 06.12 §5.1 transmit-side background-acoustic-noise evaluator.
+///
+/// Source: ETSI EN 300 963 V8.0.1 §5 *"Functions on the transmit
+/// side"*, §5.1 *"Background acoustic noise evaluation"*.
+///
+/// When Discontinuous Transmission detects a speech pause, the
+/// transmit side must describe the residual background noise so the
+/// receive side ([`ComfortNoiseGenerator`]) can resynthesise it. §5.1
+/// specifies the noise description as the arithmetic mean of the
+/// coded-speech noise parameters over the `N = 4` consecutive frames
+/// marked `VAD = 0`:
+///
+/// * **Log-Area Ratios** —
+///   `mean(LAR(i)) = (1/N) · Σ_{n=1}^{N} LAR[j−n](i)`,  i = 1..8.
+///   Each of the eight LAR codewords is averaged independently across
+///   the four frames.
+/// * **Block amplitude** —
+///   `mean(xmax) = (1/(4N)) · Σ_{n=1}^{N} Σ_{i=1}^{4} xmax[j−n](i)`.
+///   A *single* mean is taken over **all** `4·N = 16` sub-segment block
+///   amplitudes (four sub-segments × four frames). §5.2 then stores
+///   this one value *"repeated four times inside the frame"*, so the
+///   resulting [`SidParameters::xmax_cr`] carries it in all four slots.
+///
+/// This evaluator implements that part of §5 which the staged
+/// EN 300 963 PDF fully defines: the averaging itself. It takes the
+/// per-frame noise parameters of the VAD = 0 frames as input
+/// ([`NoiseFrameParameters`], trivially built from an encoder's
+/// [`UnpackedFrame`] output) and emits the [`SidParameters`] the
+/// existing §6.1 receive side consumes — closing the §5.1 → §6.1
+/// transmit-to-receive comfort-noise loop end-to-end.
+///
+/// ## What this evaluator does *not* do (documented spec gap)
+///
+/// §5.1 says the averaged frames are *"marked with VAD = 0"*; the VAD
+/// (Voice Activity Detection) algorithm that produces that mark is
+/// **GSM 06.32**, which is not staged under `docs/audio/gsm/`. This
+/// evaluator therefore accepts the VAD = 0 frames as given by the
+/// caller rather than detecting voice activity itself. Likewise the
+/// §5.2 *bit-level* SID-frame layout — inserting the 95-bit all-zero
+/// "SID code word" at *"those 95 bits of the encoded RPE-pulses Xmc
+/// which are in the error protection class I (see GSM 05.03, table
+/// 2)"* — depends on **GSM 05.03 table 2**, also not staged, so the
+/// transmit side stops at the §5.1 parameter mean (the part the staged
+/// PDF defines) and emits [`SidParameters`] rather than a packed SID
+/// bitstream. The DTX scheduling that decides *when* a SID frame is
+/// emitted is **GSM 06.31** (not staged).
+///
+/// The §5.1 equations are exact arithmetic means of integer codewords;
+/// the staged PDF does not state the rounding direction of the final
+/// integer division. Round-to-nearest (ties away from zero) is used —
+/// the natural reading of *"mean"* — and is the only quantity left to
+/// implementation choice here, on the same footing as the receive-side
+/// [`NoiseRng`] generator. No staged conformance vector exercises the
+/// SID parameter values, so the choice is not bit-pinned by the spec.
+#[derive(Debug, Clone)]
+pub struct NoiseEvaluator {
+    /// Fixed `N`-slot ring of the most recent VAD = 0 frame parameters.
+    /// `count` says how many slots are populated (0..=[`NOISE_EVAL_FRAMES`]);
+    /// `next` is the write cursor. The averaging is order-independent, so
+    /// the ring needs no explicit oldest-first ordering.
+    window: [NoiseFrameParameters; NOISE_EVAL_FRAMES],
+    count: usize,
+    next: usize,
+}
+
+impl Default for NoiseEvaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NoiseEvaluator {
+    /// Build a fresh evaluator with an empty averaging window.
+    pub fn new() -> Self {
+        Self {
+            window: [NoiseFrameParameters {
+                lar_c: [0; 9],
+                xmax_c: [0; SUBFRAMES],
+            }; NOISE_EVAL_FRAMES],
+            count: 0,
+            next: 0,
+        }
+    }
+
+    /// Discard all accumulated VAD = 0 frames (e.g. on a speech burst,
+    /// which restarts the §5.1 window).
+    pub fn reset(&mut self) {
+        self.count = 0;
+        self.next = 0;
+    }
+
+    /// Number of VAD = 0 frames currently held in the averaging window
+    /// (0..=[`NOISE_EVAL_FRAMES`]).
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the averaging window holds no frames yet.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// `true` once [`NOISE_EVAL_FRAMES`] (= 4) VAD = 0 frames have been
+    /// pushed — i.e. a §5.1 SID frame can be evaluated over a full
+    /// window. [`Self::evaluate`] also yields a value for a partial
+    /// window (averaging only the frames seen so far); this predicate
+    /// just reports whether the canonical `N = 4` window is complete.
+    pub fn is_ready(&self) -> bool {
+        self.count >= NOISE_EVAL_FRAMES
+    }
+
+    /// Push one VAD = 0 frame's noise parameters into the §5.1 window.
+    ///
+    /// The window keeps only the [`NOISE_EVAL_FRAMES`] most recent
+    /// frames (`j−1 … j−N`); pushing a fifth frame evicts the oldest,
+    /// so the evaluator always averages over the latest four VAD = 0
+    /// frames as §5.1 specifies (*"the previous frames"*).
+    pub fn push_frame(&mut self, params: NoiseFrameParameters) {
+        self.window[self.next] = params;
+        self.next = (self.next + 1) % NOISE_EVAL_FRAMES;
+        if self.count < NOISE_EVAL_FRAMES {
+            self.count += 1;
+        }
+    }
+
+    /// Convenience wrapper around [`Self::push_frame`] that extracts the
+    /// §5.1 noise parameters straight from a coded speech frame.
+    pub fn push_unpacked(&mut self, frame: &UnpackedFrame) {
+        self.push_frame(NoiseFrameParameters::from(frame));
+    }
+
+    /// Evaluate the §5.1 mean LARs and mean block amplitude over the
+    /// frames accumulated so far, returning the [`SidParameters`] the
+    /// §6.1 receive side consumes.
+    ///
+    /// Returns `None` only when no frame has been pushed (an empty mean
+    /// is undefined). With a partial window (1..3 frames) it averages
+    /// what is present; with the full `N = 4` window it is the canonical
+    /// §5.1 evaluation. The single §5.1 `mean(xmax)` is written into all
+    /// four [`SidParameters::xmax_cr`] slots per the §5.2 *"repeated
+    /// four times"* rule.
+    pub fn evaluate(&self) -> Option<SidParameters> {
+        let n = self.count;
+        if n == 0 {
+            return None;
+        }
+        let frames = &self.window[..n];
+
+        // §5.1 mean(LAR(i)) — average each of the eight LAR codewords
+        // independently across the n frames. Slot 0 stays the 1-based
+        // sentinel.
+        let mut lar_cr = [0i16; 9];
+        for (i, slot) in lar_cr.iter_mut().enumerate().take(9).skip(1) {
+            let sum: i32 = frames.iter().map(|f| f.lar_c[i] as i32).sum();
+            *slot = mean_round(sum, n as i32) as i16;
+        }
+
+        // §5.1 mean(xmax) — one mean over all 4·n sub-segment block
+        // amplitudes, then §5.2 repeats it across the four slots.
+        let xmax_sum: i32 = frames
+            .iter()
+            .flat_map(|f| f.xmax_c.iter())
+            .map(|&x| x as i32)
+            .sum();
+        let xmax_mean = mean_round(xmax_sum, (SUBFRAMES * n) as i32) as u8;
+
+        Some(SidParameters {
+            lar_cr,
+            xmax_cr: [xmax_mean; SUBFRAMES],
+        })
+    }
+}
+
+/// Round-to-nearest integer division (ties away from zero) for the
+/// §5.1 arithmetic means. `denom > 0`; `numer` may be negative (LAR
+/// codewords are signed). See [`NoiseEvaluator`] for why the rounding
+/// direction is an implementation choice the spec leaves open.
+fn mean_round(numer: i32, denom: i32) -> i32 {
+    debug_assert!(denom > 0);
+    if numer >= 0 {
+        (numer + denom / 2) / denom
+    } else {
+        -((-numer + denom / 2) / denom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +1044,169 @@ mod tests {
             assert_eq!(
                 f, back,
                 "ramped comfort-noise frame did not survive §1.7 packing"
+            );
+        }
+    }
+
+    // ----- §5.1 transmit-side background-acoustic-noise evaluation -----
+
+    fn noise_frame(lar: [i16; 9], xmax: [u8; SUBFRAMES]) -> NoiseFrameParameters {
+        NoiseFrameParameters {
+            lar_c: lar,
+            xmax_c: xmax,
+        }
+    }
+
+    /// §5.1: `mean_round` is round-to-nearest, ties away from zero, and
+    /// symmetric for negative LAR codewords.
+    #[test]
+    fn mean_round_is_nearest_ties_away() {
+        assert_eq!(mean_round(0, 4), 0);
+        assert_eq!(mean_round(6, 4), 2); // 1.5 → 2 (tie up)
+        assert_eq!(mean_round(5, 4), 1); // 1.25 → 1
+        assert_eq!(mean_round(7, 4), 2); // 1.75 → 2
+        assert_eq!(mean_round(-6, 4), -2); // tie away from zero
+        assert_eq!(mean_round(-5, 4), -1);
+        assert_eq!(mean_round(10, 4), 3); // 2.5 → 3
+    }
+
+    /// §5.1: an empty window has no defined mean.
+    #[test]
+    fn evaluate_empty_window_is_none() {
+        let e = NoiseEvaluator::new();
+        assert!(e.is_empty());
+        assert!(!e.is_ready());
+        assert_eq!(e.len(), 0);
+        assert!(e.evaluate().is_none());
+    }
+
+    /// §5.1: averaging four identical frames yields those same codewords;
+    /// the single mean(xmax) is replicated across all four §5.2 slots.
+    #[test]
+    fn evaluate_identical_frames_is_identity() {
+        let mut e = NoiseEvaluator::new();
+        let lar = [0, 10, 20, 30, 40, 50, 6, 7, 8];
+        let xmax = [12, 12, 12, 12];
+        for _ in 0..NOISE_EVAL_FRAMES {
+            e.push_frame(noise_frame(lar, xmax));
+        }
+        assert!(e.is_ready());
+        assert_eq!(e.len(), NOISE_EVAL_FRAMES);
+        let sid = e.evaluate().unwrap();
+        assert_eq!(sid.lar_cr, lar);
+        assert_eq!(sid.xmax_cr, [12, 12, 12, 12]);
+    }
+
+    /// §5.1: each LAR(i) is averaged independently across the N=4 frames.
+    /// Frames carry LARc(i) = i, 2i, 3i, 4i → mean = 2.5·i, rounded.
+    #[test]
+    fn evaluate_lar_averaged_per_coefficient() {
+        let mut e = NoiseEvaluator::new();
+        for k in 1..=NOISE_EVAL_FRAMES as i16 {
+            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { k * i as i16 });
+            e.push_frame(noise_frame(lar, [0; SUBFRAMES]));
+        }
+        let sid = e.evaluate().unwrap();
+        // mean over {i,2i,3i,4i} = 10i/4 = 2.5·i → nearest, tie away.
+        for i in 1..=8i16 {
+            let expect = mean_round(10 * i as i32, 4) as i16;
+            assert_eq!(sid.lar_cr[i as usize], expect, "LAR coeff {i}");
+        }
+        assert_eq!(sid.lar_cr[0], 0, "sentinel slot must stay zero");
+    }
+
+    /// §5.1: mean(xmax) is a *single* mean over all 4·N = 16 sub-segment
+    /// block amplitudes, not a per-sub-segment average. §5.2 then repeats
+    /// it across the four slots.
+    #[test]
+    fn evaluate_xmax_single_mean_over_all_subsegments() {
+        let mut e = NoiseEvaluator::new();
+        // Frame block amplitudes: frame0 all 4, frame1 all 8, frame2 all
+        // 12, frame3 all 16 → 16 values summing to 4*(4+8+12+16)=160,
+        // /16 = 10.
+        for v in [4u8, 8, 12, 16] {
+            e.push_frame(noise_frame([0; 9], [v; SUBFRAMES]));
+        }
+        let sid = e.evaluate().unwrap();
+        assert_eq!(sid.xmax_cr, [10, 10, 10, 10]);
+    }
+
+    /// §5.1: the window keeps only the four most recent VAD=0 frames;
+    /// a fifth push evicts the oldest.
+    #[test]
+    fn window_evicts_oldest_beyond_n() {
+        let mut e = NoiseEvaluator::new();
+        // Push 5 frames; first (xmax=0) must be evicted, leaving xmax
+        // 4,8,12,16 → mean 10.
+        for v in [0u8, 4, 8, 12, 16] {
+            e.push_frame(noise_frame([0; 9], [v; SUBFRAMES]));
+        }
+        assert_eq!(e.len(), NOISE_EVAL_FRAMES);
+        let sid = e.evaluate().unwrap();
+        assert_eq!(sid.xmax_cr, [10, 10, 10, 10]);
+    }
+
+    /// A partial window (fewer than N frames) averages only what is
+    /// present — useful at the start of a silence period.
+    #[test]
+    fn evaluate_partial_window() {
+        let mut e = NoiseEvaluator::new();
+        e.push_frame(noise_frame([0, 4, 4, 4, 4, 4, 4, 4, 4], [8; SUBFRAMES]));
+        e.push_frame(noise_frame([0, 8, 8, 8, 8, 8, 8, 8, 8], [16; SUBFRAMES]));
+        assert!(!e.is_ready());
+        let sid = e.evaluate().unwrap();
+        assert_eq!(&sid.lar_cr[1..=8], &[6i16; 8]); // mean(4,8)=6
+        assert_eq!(sid.xmax_cr, [12, 12, 12, 12]); // mean(8,16)=12
+    }
+
+    /// `reset` clears the window so a new silence period restarts §5.1.
+    #[test]
+    fn reset_clears_window() {
+        let mut e = NoiseEvaluator::new();
+        e.push_frame(noise_frame([0; 9], [9; SUBFRAMES]));
+        e.reset();
+        assert!(e.is_empty());
+        assert!(e.evaluate().is_none());
+    }
+
+    /// `NoiseFrameParameters::from(&UnpackedFrame)` lifts exactly the
+    /// §5.1 noise codewords out of a coded speech frame.
+    #[test]
+    fn extract_noise_params_from_unpacked_frame() {
+        let mut f = UnpackedFrame {
+            lar_c: [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            sub: [SubFrame::default(); SUBFRAMES],
+        };
+        for (j, sf) in f.sub.iter_mut().enumerate() {
+            sf.xmax_c = (j as u8 + 1) * 10;
+        }
+        let np = NoiseFrameParameters::from(&f);
+        assert_eq!(np.lar_c, f.lar_c);
+        assert_eq!(np.xmax_c, [10, 20, 30, 40]);
+    }
+
+    /// End-to-end §5.1 → §6.1: a SID evaluated on the transmit side
+    /// drives the receive-side comfort-noise generator, and every frame
+    /// it emits packs legally through §1.7.
+    #[test]
+    fn transmit_eval_feeds_receive_generator() {
+        let mut e = NoiseEvaluator::new();
+        // Legal §1.7 LAR codewords (6/6/5/5/4/4/3/3 bit fields) plus a
+        // small per-frame perturbation so the mean is non-trivial.
+        let base = [0i16, 9, 23, 15, 8, 7, 3, 3, 2];
+        for k in 0..NOISE_EVAL_FRAMES as i16 {
+            let lar = core::array::from_fn(|i| if i == 0 { 0 } else { base[i] + (k % 2) });
+            e.push_frame(noise_frame(lar, [(k as u8 + 1) * 4; SUBFRAMES]));
+        }
+        let sid = e.evaluate().unwrap();
+        let mut g = ComfortNoiseGenerator::new(sid, 7);
+        for _ in 0..8 {
+            let f = g.next_frame_parameters();
+            let bytes = f.to_bit_stream_msb_first();
+            let back = UnpackedFrame::from_bit_stream_msb_first(&bytes).unwrap();
+            assert_eq!(
+                f, back,
+                "transmit-derived comfort-noise frame did not round-trip"
             );
         }
     }
