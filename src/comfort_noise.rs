@@ -571,6 +571,27 @@ pub enum RxFrame {
     NoData,
 }
 
+impl RxFrame {
+    /// Build a [`RxFrame::Speech`] by parsing a 33-byte §1.7 speech frame
+    /// (the `b1..b260` MSB-first stream) with
+    /// [`UnpackedFrame::from_bit_stream_msb_first`].
+    ///
+    /// This is the natural bridge from the on-wire byte layout into the
+    /// §6 receive dispatcher for *speech* frames. SID frames are **not**
+    /// constructed from bytes here: the §5.2 SID *bit* layout (the 95
+    /// all-zero "SID code word" at the GSM 05.03 table-2 class-I
+    /// positions) is not staged, so a valid SID frame cannot be parsed
+    /// from its bytes yet. Callers that have already decoded SID
+    /// parameters out-of-band construct [`RxFrame::Sid`] directly.
+    ///
+    /// Returns [`crate::Error::ShortFrame`] if `bytes` is shorter than 33.
+    pub fn speech_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
+        Ok(RxFrame::Speech(Box::new(
+            UnpackedFrame::from_bit_stream_msb_first(bytes)?,
+        )))
+    }
+}
+
 /// The §6 receive-side DTX state: whether the receiver is currently
 /// decoding speech or synthesising comfort noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,6 +806,23 @@ impl DtxReceiver {
                 }
             }
         }
+    }
+
+    /// Dispatch a whole sequence of classified [`RxFrame`]s, returning
+    /// the concatenated PCM (160 samples per frame). A convenience over
+    /// repeated [`Self::receive`]; the receiver's DTX state carries
+    /// across the sequence exactly as it would frame-by-frame, so a
+    /// speech-burst / SID / no-data / speech-resume cycle synthesises one
+    /// continuous stream.
+    pub fn receive_stream<I>(&mut self, frames: I) -> Vec<i16>
+    where
+        I: IntoIterator<Item = RxFrame>,
+    {
+        let mut out = Vec::new();
+        for f in frames {
+            out.extend_from_slice(&self.receive(f));
+        }
+        out
     }
 
     /// Build one §6.1 comfort-noise frame from the parameters currently
@@ -1548,6 +1586,62 @@ mod tests {
             warm, cold_pcm,
             "comfort noise ignored the carried-over speech decoder memory"
         );
+    }
+
+    /// `RxFrame::speech_from_bytes` parses a 33-byte speech frame and the
+    /// receiver decodes it identically to feeding the parsed frame
+    /// directly.
+    #[test]
+    fn speech_from_bytes_matches_parsed_frame() {
+        let f = speech_frame();
+        let bytes = f.to_bit_stream_msb_first();
+
+        let mut a = DtxReceiver::new(3);
+        let from_bytes = a.receive(RxFrame::speech_from_bytes(&bytes).unwrap());
+
+        let mut b = DtxReceiver::new(3);
+        let from_frame = b.receive(RxFrame::Speech(f));
+
+        assert_eq!(from_bytes, from_frame);
+    }
+
+    /// A short buffer is rejected with `ShortFrame`.
+    #[test]
+    fn speech_from_bytes_rejects_short_buffer() {
+        assert!(matches!(
+            RxFrame::speech_from_bytes(&[0u8; 10]),
+            Err(crate::Error::ShortFrame)
+        ));
+    }
+
+    /// `receive_stream` over a full DTX cycle equals frame-by-frame
+    /// `receive`, and produces 160 samples per frame.
+    #[test]
+    fn receive_stream_equals_frame_by_frame() {
+        let frames = || {
+            vec![
+                RxFrame::Speech(speech_frame()),
+                RxFrame::Speech(speech_frame()),
+                RxFrame::Sid(SidParameters::new(
+                    [0, 9, 23, 15, 8, 7, 3, 3, 2],
+                    [6, 6, 6, 6],
+                )),
+                RxFrame::NoData,
+                RxFrame::NoData,
+                RxFrame::Speech(speech_frame()),
+            ]
+        };
+
+        let mut a = DtxReceiver::new(55);
+        let streamed = a.receive_stream(frames());
+        assert_eq!(streamed.len(), 6 * FRAME_SAMPLES);
+
+        let mut b = DtxReceiver::new(55);
+        let mut manual = Vec::new();
+        for f in frames() {
+            manual.extend_from_slice(&b.receive(f));
+        }
+        assert_eq!(streamed, manual);
     }
 
     // ----- §5.1 transmit-side background-acoustic-noise evaluation -----
