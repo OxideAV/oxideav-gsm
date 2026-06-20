@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.12 §6 receive-side DTX dispatcher `DtxReceiver`
+  (2026-06-20).** Implements the receive-side Discontinuous-Transmission
+  dispatch the staged EN 300 963 §6 fully defines: comfort-noise
+  generation *"is started or updated whenever a valid SID frame is
+  received"*, continued across the radio cut *"at a regular low rate
+  afterwards"* (§4), and ended when speech resumes. New public types:
+  `RxFrame` (a classified receive frame — `Speech` / `Sid` / `NoData`),
+  `DtxState` (`Speech` | `ComfortNoise`), and `DtxReceiver`. The
+  dispatcher holds **one** shared `DecoderState` across speech decode
+  and §6.1 comfort-noise synthesis, so the §5.3 synthesis lattice,
+  §5.3.2 long-term delay line, and §5.3.5 de-emphasis memory carry
+  continuously across the speech ⇄ noise boundary — the cross-transition
+  continuity §4 needs to avoid the *"very annoying"* background-noise
+  modulation. `receive(RxFrame)` dispatches one frame; `receive_stream`
+  drives a whole sequence; `RxFrame::speech_from_bytes` bridges a 33-byte
+  §1.7 frame into the dispatcher. Frame *classification* (valid-SID
+  detection, SID/speech/no-data scheduling) is left to the caller, as
+  `NoiseEvaluator` leaves the VAD mark to the caller — the underlying
+  detectors are the documented spec gaps (GSM 05.03 table 2 + GSM 06.31,
+  neither staged). 18 new tests (14 unit + 4 integration in
+  `tests/dtx_comfort_noise.rs`) cover the state machine, speech ==
+  bare-decoder PCM, SID open/update-with-ramp, no-data continuation,
+  shared-decoder filter continuity, byte bridge, stream driver, and the
+  full §5.1 → §5.2 → §6.1 → §6 transmit-to-receive loop.
+
 - **GSM 06.12 §5.1 + §5.2 transmit-side comfort-noise evaluation
   (2026-06-20).** New `NoiseEvaluator` implements the §5.1 background-
   acoustic-noise averaging *plus* the §5.2 parameter encoding that
