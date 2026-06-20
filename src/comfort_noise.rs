@@ -528,6 +528,277 @@ impl ComfortNoiseGenerator {
     }
 }
 
+/// One classified frame arriving at the §6 receive side during
+/// Discontinuous Transmission.
+///
+/// GSM 06.12 §6 says comfort-noise generation *"is started or updated
+/// whenever a **valid SID frame** is received"*, and §4 describes the
+/// background-noise parameters being sent *"before the radio
+/// transmission is cut and at a regular low rate afterwards"* — so
+/// between SID frames (and across the radio cut) the receiver gets no
+/// usable speech payload and must keep generating comfort noise from the
+/// last received parameters.
+///
+/// To dispatch correctly the receiver needs the arriving frame already
+/// *classified* into one of three kinds. The classification itself is a
+/// **documented spec gap**: telling a valid SID frame apart from a
+/// speech frame requires detecting the §5.2 "SID code word" — the 95
+/// all-zero bits at the GSM 05.03 table-2 class-I positions — and the
+/// *scheduling* of which radio frames carry SID / speech / nothing is
+/// **GSM 06.31**. Neither GSM 05.03 nor GSM 06.31 is staged under
+/// `docs/audio/gsm/`, so — exactly as [`NoiseEvaluator`] accepts the
+/// VAD = 0 mark from the caller rather than running the (unstaged) GSM
+/// 06.32 VAD itself — [`DtxReceiver`] accepts the *classified* frame
+/// from the caller and implements only the §6 dispatch the staged
+/// EN 300 963 PDF fully defines.
+#[derive(Debug, Clone)]
+pub enum RxFrame {
+    /// A normal §1.7 speech frame: decode it through the standard §5.3
+    /// RPE-LTP speech decoder. Receiving speech ends any comfort-noise
+    /// period.
+    Speech(Box<UnpackedFrame>),
+    /// A *valid SID frame* carrying fresh §5.2 comfort-noise parameters.
+    /// Per §6 this *"start[s] or update[s]"* comfort-noise generation:
+    /// the first one opens a comfort-noise period, each subsequent one
+    /// updates the parameters (§6.1 smoothly interpolated).
+    Sid(SidParameters),
+    /// No usable payload this frame — the radio link is cut, or a frame
+    /// between SID updates carries nothing. Inside a comfort-noise period
+    /// the receiver keeps synthesising noise from the last SID
+    /// parameters (§4 *"at a regular low rate afterwards"*); see
+    /// [`DtxReceiver::receive`] for the (out-of-06.12-scope) behaviour
+    /// before any SID has been seen.
+    NoData,
+}
+
+/// The §6 receive-side DTX state: whether the receiver is currently
+/// decoding speech or synthesising comfort noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtxState {
+    /// Decoding ordinary speech frames (no comfort-noise period active,
+    /// or one just ended on a speech frame). This is the initial state.
+    Speech,
+    /// A comfort-noise period is active: a valid SID frame has been
+    /// received and the receiver is synthesising §6.1 comfort noise,
+    /// updated on each further SID and continued across [`RxFrame::
+    /// NoData`] frames until speech resumes.
+    ComfortNoise,
+}
+
+/// GSM 06.12 §6 receive-side Discontinuous-Transmission dispatcher.
+///
+/// Source: ETSI EN 300 963 V8.0.1 §6 *"Functions on the receive side"*,
+/// §6.1 *"Comfort noise generation and updating"*.
+///
+/// §6 defines the receive-side behaviour during DTX as a two-state
+/// process driven by the kind of frame that arrives:
+///
+/// * a **speech** frame is decoded normally (§5.3) and ends any
+///   comfort-noise period;
+/// * a **valid SID** frame *"start[s] or update[s]"* comfort-noise
+///   generation (§6 opening) — the first opens the period, each later
+///   one updates the §6.1 parameters (smoothly interpolated, §6.1
+///   closing);
+/// * **no data** (the radio cut, or a gap between SID updates) keeps the
+///   comfort-noise generator running from the last SID parameters (§4
+///   *"at a regular low rate afterwards"*).
+///
+/// The crucial correctness property is **filter continuity**: §6.1 says
+/// comfort noise *"performs the standard operations described in GSM
+/// 06.10"* — it drives *the* speech decoder, the same one the speech
+/// frames use. So [`DtxReceiver`] holds a **single** [`DecoderState`]
+/// shared between speech decode and comfort-noise synthesis. When a
+/// speech burst gives way to a comfort-noise period (or vice versa), the
+/// §5.3 short-term synthesis lattice, the §5.3.2 long-term delay line,
+/// and the §5.3.5 de-emphasis memory carry straight across the
+/// transition — which is exactly what stops the boundary from clicking
+/// (the *"modulation of the background noise"* §4 warns is *"very
+/// annoying for the listener"*). Wrapping the existing
+/// [`ComfortNoiseGenerator`] would *not* give this, because that type
+/// owns a private decoder; the receiver therefore drives the §6.1
+/// [`comfort_noise_frame`] substitution and the shared decoder directly.
+///
+/// Every [`Self::receive`] call consumes one classified [`RxFrame`] and
+/// returns 160 linear PCM samples — speech, or comfort noise, depending
+/// on the frame and the current [`DtxState`].
+///
+/// ## What this dispatcher does *not* decide (documented spec gap)
+///
+/// [`DtxReceiver`] implements the §6 *dispatch*; it does **not** classify
+/// the incoming frames, because classification depends on companion
+/// specs not staged under `docs/audio/gsm/`:
+///
+/// * Telling a **valid SID frame** from a speech frame means detecting
+///   the §5.2 "SID code word" (95 all-zero bits at the class-I positions
+///   of **GSM 05.03 table 2**) — not staged.
+/// * The **SID / speech / no-data scheduling** on the radio path is
+///   **GSM 06.31** — not staged (§5 and §6 both defer to it explicitly).
+///
+/// So the caller hands [`Self::receive`] an already-classified
+/// [`RxFrame`], the same way [`NoiseEvaluator`] is handed VAD = 0 frames
+/// rather than running the (unstaged GSM 06.32) VAD. Once GSM 05.03 /
+/// 06.31 are staged, a thin classifier can sit in front of this
+/// dispatcher without changing its §6 logic.
+#[derive(Debug)]
+pub struct DtxReceiver {
+    /// The single §5.3 speech decoder shared by speech decode and §6.1
+    /// comfort-noise synthesis — the source of the cross-transition
+    /// filter continuity §4 needs.
+    decoder: DecoderState,
+    /// The §6.1 parameter interpolator: holds the comfort-noise SID
+    /// parameters currently in effect and ramps them on update.
+    interp: SidInterpolator,
+    /// The §6.1 random source for the substituted RPE pulses / grid
+    /// positions.
+    rng: NoiseRng,
+    /// Whether a comfort-noise period is currently active.
+    state: DtxState,
+    /// `true` once at least one valid SID frame has opened a
+    /// comfort-noise period since construction / [`Self::reset`]. Until
+    /// then there are no comfort-noise parameters to fall back on, so a
+    /// [`RxFrame::NoData`] cannot synthesise §6.1 noise.
+    sid_seen: bool,
+}
+
+impl DtxReceiver {
+    /// Build a receive-side DTX dispatcher in the [`DtxState::Speech`]
+    /// state with a fresh §4.6 home-state decoder and the default §6.1
+    /// update-smoothing ramp ([`DEFAULT_INTERPOLATION_FRAMES`]).
+    ///
+    /// `seed` seeds the §6.1 comfort-noise PRNG; any value is acceptable
+    /// (the spec leaves the generator an implementation choice — see
+    /// [`NoiseRng`]). No comfort-noise parameters exist yet; the first
+    /// [`RxFrame::Sid`] supplies them.
+    pub fn new(seed: u32) -> Self {
+        Self {
+            decoder: DecoderState::new(),
+            interp: SidInterpolator::new(SidParameters::default(), DEFAULT_INTERPOLATION_FRAMES),
+            rng: NoiseRng::new(seed),
+            state: DtxState::Speech,
+            sid_seen: false,
+        }
+    }
+
+    /// The current §6 receive-side DTX state.
+    pub fn state(&self) -> DtxState {
+        self.state
+    }
+
+    /// `true` while a comfort-noise period is active (the last decisive
+    /// frame was a valid SID or a no-data continuation of one).
+    pub fn is_generating_comfort_noise(&self) -> bool {
+        self.state == DtxState::ComfortNoise
+    }
+
+    /// `true` once at least one valid SID frame has been received since
+    /// construction / [`Self::reset`] (so [`RxFrame::NoData`] has §6.1
+    /// parameters to synthesise from).
+    pub fn has_sid(&self) -> bool {
+        self.sid_seen
+    }
+
+    /// The §6.1 comfort-noise SID parameters currently in effect (the
+    /// interpolator's current value). Before any SID has been received
+    /// this is [`SidParameters::default`] (all-zero).
+    pub fn sid(&self) -> SidParameters {
+        self.interp.current()
+    }
+
+    /// Set the §6.1 update-smoothing ramp length in frames (`0` disables
+    /// interpolation — each SID update then takes effect immediately).
+    /// §6.1 specifies only *"a few frames"*, so the count is an
+    /// implementation choice ([`DEFAULT_INTERPOLATION_FRAMES`]).
+    pub fn set_interpolation_frames(&mut self, frames: u8) {
+        self.interp.set_frames(frames);
+    }
+
+    /// The §6.1 update-smoothing ramp length currently in effect.
+    pub fn interpolation_frames(&self) -> u8 {
+        self.interp.frames()
+    }
+
+    /// Reset the receiver: home the shared §5.3 decoder, drop the
+    /// comfort-noise parameters, and return to [`DtxState::Speech`]. The
+    /// PRNG and ramp length are preserved. Use this on a §4.4 codec
+    /// homing event or to restart a stream.
+    pub fn reset(&mut self) {
+        self.decoder.reset();
+        self.interp = SidInterpolator::new(SidParameters::default(), self.interp.frames());
+        self.state = DtxState::Speech;
+        self.sid_seen = false;
+    }
+
+    /// Dispatch one classified [`RxFrame`] per §6 and return its 160
+    /// linear PCM samples.
+    ///
+    /// * [`RxFrame::Speech`] — decode the frame through the shared §5.3
+    ///   speech decoder and return to / stay in [`DtxState::Speech`]. A
+    ///   speech frame ends any comfort-noise period.
+    /// * [`RxFrame::Sid`] — *"start or update"* comfort noise (§6): the
+    ///   parameters are applied to the §6.1 interpolator (ramped from the
+    ///   value currently in effect, so a mid-burst update is smooth),
+    ///   the state becomes [`DtxState::ComfortNoise`], and one §6.1
+    ///   comfort-noise frame is synthesised through the shared decoder.
+    /// * [`RxFrame::NoData`] — inside a comfort-noise period, keep
+    ///   synthesising §6.1 comfort noise from the parameters in effect
+    ///   (§4 *"at a regular low rate afterwards"*), advancing the §6.1
+    ///   update ramp. Before any SID has opened a period (`!has_sid()`),
+    ///   there are no comfort-noise parameters and no speech to conceal;
+    ///   §6.12 does not cover this case (it is GSM 06.31 bad-frame
+    ///   handling, not staged), so the shared decoder is driven with the
+    ///   all-zero comfort parameters and the state stays
+    ///   [`DtxState::Speech`] — a defined, click-free fallback that does
+    ///   not pretend to implement the unstaged 06.31 substitution/muting.
+    pub fn receive(&mut self, frame: RxFrame) -> [i16; FRAME_SAMPLES] {
+        match frame {
+            RxFrame::Speech(f) => {
+                self.state = DtxState::Speech;
+                self.decoder.decode_frame(&f)
+            }
+            RxFrame::Sid(sid) => {
+                // §6: "started or updated whenever a valid SID frame is
+                // received". The first SID opens the period; a later one
+                // ramps from the value currently in effect.
+                if self.sid_seen {
+                    self.interp.update(sid);
+                } else {
+                    // First SID: snap straight to it (there is no prior
+                    // comfort-noise value to ramp from) by re-seating the
+                    // interpolator with the new value already settled.
+                    self.interp = SidInterpolator::new(sid, self.interp.frames());
+                    self.sid_seen = true;
+                }
+                self.state = DtxState::ComfortNoise;
+                self.synthesise_comfort_noise()
+            }
+            RxFrame::NoData => {
+                if self.sid_seen && self.state == DtxState::ComfortNoise {
+                    self.synthesise_comfort_noise()
+                } else {
+                    // Out of 06.12 scope (no SID yet → GSM 06.31 bad-frame
+                    // handling). Drive the decoder with the all-zero
+                    // comfort parameters so output stays continuous;
+                    // remain in Speech state.
+                    let sid = self.interp.current();
+                    let cn = comfort_noise_frame(&sid, &mut self.rng);
+                    self.decoder.decode_frame(&cn)
+                }
+            }
+        }
+    }
+
+    /// Build one §6.1 comfort-noise frame from the parameters currently
+    /// in effect and synthesise it through the shared §5.3 decoder,
+    /// advancing the §6.1 update ramp by one frame.
+    fn synthesise_comfort_noise(&mut self) -> [i16; FRAME_SAMPLES] {
+        let sid = self.interp.current();
+        let cn = comfort_noise_frame(&sid, &mut self.rng);
+        let pcm = self.decoder.decode_frame(&cn);
+        self.interp.advance();
+        pcm
+    }
+}
+
 /// The §5.1 averaging-window length: comfort-noise parameters are
 /// evaluated over *"N = 4 consecutive frames marked with VAD = 0"*.
 pub const NOISE_EVAL_FRAMES: usize = 4;
@@ -1082,6 +1353,201 @@ mod tests {
                 "ramped comfort-noise frame did not survive §1.7 packing"
             );
         }
+    }
+
+    // ----- §6 receive-side DTX dispatch (DtxReceiver) -----
+
+    fn speech_frame() -> Box<UnpackedFrame> {
+        // A non-homing, non-trivial speech frame: distinct LARs and a
+        // varied sub-frame so it exercises the §5.3 pipeline.
+        let mut f = UnpackedFrame {
+            lar_c: [0, 30, 20, 18, 12, 10, 6, 4, 3],
+            sub: [SubFrame::default(); SUBFRAMES],
+        };
+        for (j, sf) in f.sub.iter_mut().enumerate() {
+            sf.n_c = 40 + j as u8 * 10;
+            sf.b_c = 1;
+            sf.m_c = (j % 4) as u8;
+            sf.xmax_c = 20 + j as u8;
+            for (i, p) in sf.x_mc.iter_mut().enumerate() {
+                *p = (i as u8) % 8;
+            }
+        }
+        Box::new(f)
+    }
+
+    /// A fresh receiver starts in the Speech state with no SID seen.
+    #[test]
+    fn receiver_starts_in_speech_state() {
+        let r = DtxReceiver::new(1);
+        assert_eq!(r.state(), DtxState::Speech);
+        assert!(!r.is_generating_comfort_noise());
+        assert!(!r.has_sid());
+        assert_eq!(r.sid(), SidParameters::default());
+    }
+
+    /// A speech frame is decoded and keeps the receiver in Speech state;
+    /// it produces exactly the same PCM as the bare §5.3 decoder.
+    #[test]
+    fn speech_frame_matches_bare_decoder() {
+        let mut r = DtxReceiver::new(5);
+        let f = speech_frame();
+        let got = r.receive(RxFrame::Speech(f.clone()));
+
+        let mut dec = DecoderState::new();
+        let want = dec.decode_frame(&f);
+        assert_eq!(got, want);
+        assert_eq!(r.state(), DtxState::Speech);
+        assert!(!r.has_sid());
+    }
+
+    /// A valid SID frame opens a comfort-noise period: state flips to
+    /// ComfortNoise, has_sid() becomes true, and the parameters in effect
+    /// are the received SID (first SID snaps, no ramp).
+    #[test]
+    fn sid_opens_comfort_noise_period() {
+        let mut r = DtxReceiver::new(9);
+        let sid = SidParameters::new([0, 9, 23, 15, 8, 7, 3, 3, 2], [5, 5, 5, 5]);
+        let _ = r.receive(RxFrame::Sid(sid));
+        assert_eq!(r.state(), DtxState::ComfortNoise);
+        assert!(r.is_generating_comfort_noise());
+        assert!(r.has_sid());
+        assert_eq!(r.sid(), sid);
+    }
+
+    /// Inside a comfort-noise period, NoData keeps synthesising noise
+    /// from the last SID and stays in ComfortNoise state.
+    #[test]
+    fn no_data_continues_comfort_noise() {
+        let mut r = DtxReceiver::new(11);
+        let sid = SidParameters::new([0, 9, 23, 15, 8, 7, 3, 3, 2], [7, 7, 7, 7]);
+        let _ = r.receive(RxFrame::Sid(sid));
+        let mut any_nonzero = false;
+        for _ in 0..8 {
+            let pcm = r.receive(RxFrame::NoData);
+            assert_eq!(r.state(), DtxState::ComfortNoise);
+            if pcm.iter().any(|&s| s != 0) {
+                any_nonzero = true;
+            }
+        }
+        assert!(any_nonzero, "comfort noise was digital silence");
+    }
+
+    /// A speech frame ends a comfort-noise period (state returns to
+    /// Speech) but leaves has_sid() set.
+    #[test]
+    fn speech_ends_comfort_noise_period() {
+        let mut r = DtxReceiver::new(13);
+        let sid = SidParameters::new([0, 1, 2, 3, 4, 5, 6, 7, 8], [4, 4, 4, 4]);
+        let _ = r.receive(RxFrame::Sid(sid));
+        assert_eq!(r.state(), DtxState::ComfortNoise);
+        let _ = r.receive(RxFrame::Speech(speech_frame()));
+        assert_eq!(r.state(), DtxState::Speech);
+        assert!(r.has_sid());
+    }
+
+    /// A second SID *updates* (does not re-open) the period and is ramped
+    /// from the value currently in effect (smooth §6.1 transition).
+    #[test]
+    fn second_sid_updates_with_ramp() {
+        let mut r = DtxReceiver::new(17);
+        let first = SidParameters::new([0; 9], [0, 0, 0, 0]);
+        let second = SidParameters::new([0; 9], [80, 80, 80, 80]);
+        let _ = r.receive(RxFrame::Sid(first));
+        // First SID is in effect immediately.
+        assert_eq!(r.sid().xmax_cr, [0, 0, 0, 0]);
+        // The synthesise step inside receive() advanced the ramp once,
+        // but the first SID had no ramp (snapped), so it stays settled.
+        let _ = r.receive(RxFrame::Sid(second));
+        // The update ramps from 0 toward 80 over DEFAULT frames; the SID
+        // synthesised in this very call already advanced the ramp once,
+        // so the value in effect for the *next* frame is 20 (80*1/4).
+        assert_eq!(r.sid().xmax_cr, [20, 20, 20, 20]);
+    }
+
+    /// NoData before any SID is the out-of-06.12-scope fallback: state
+    /// stays Speech, output is well-formed 160 samples, no panic.
+    #[test]
+    fn no_data_before_sid_is_safe_fallback() {
+        let mut r = DtxReceiver::new(19);
+        let pcm = r.receive(RxFrame::NoData);
+        assert_eq!(pcm.len(), FRAME_SAMPLES);
+        assert_eq!(r.state(), DtxState::Speech);
+        assert!(!r.has_sid());
+        // §5.3.7 output format still holds on the fallback path.
+        for s in pcm {
+            assert_eq!(s & 0b111, 0);
+        }
+    }
+
+    /// reset() homes the decoder, drops the SID, and returns to Speech.
+    #[test]
+    fn reset_returns_to_speech_and_drops_sid() {
+        let mut r = DtxReceiver::new(21);
+        let sid = SidParameters::new([0, 1, 2, 3, 4, 5, 6, 7, 8], [3, 3, 3, 3]);
+        let _ = r.receive(RxFrame::Sid(sid));
+        for _ in 0..3 {
+            let _ = r.receive(RxFrame::NoData);
+        }
+        r.reset();
+        assert_eq!(r.state(), DtxState::Speech);
+        assert!(!r.has_sid());
+        assert_eq!(r.sid(), SidParameters::default());
+        assert!(r.decoder.is_home_state());
+    }
+
+    /// Two receivers with the same seed driven by the same RxFrame
+    /// sequence produce bit-identical PCM (deterministic comfort noise).
+    #[test]
+    fn receiver_is_deterministic_for_fixed_seed() {
+        let seq = || {
+            vec![
+                RxFrame::Speech(speech_frame()),
+                RxFrame::Sid(SidParameters::new(
+                    [0, 9, 23, 15, 8, 7, 3, 3, 2],
+                    [6, 6, 6, 6],
+                )),
+                RxFrame::NoData,
+                RxFrame::NoData,
+                RxFrame::Sid(SidParameters::new(
+                    [0, 5, 10, 8, 6, 4, 3, 2, 1],
+                    [10, 10, 10, 10],
+                )),
+                RxFrame::NoData,
+                RxFrame::Speech(speech_frame()),
+            ]
+        };
+        let mut a = DtxReceiver::new(123);
+        let mut b = DtxReceiver::new(123);
+        for (fa, fb) in seq().into_iter().zip(seq()) {
+            assert_eq!(a.receive(fa), b.receive(fb));
+        }
+    }
+
+    /// Filter continuity: the comfort-noise frame synthesised right after
+    /// a speech burst uses the decoder memory the speech burst left
+    /// behind. Driving a *fresh* decoder with the same §6.1 frame gives a
+    /// different result, proving the shared-decoder memory carries over.
+    #[test]
+    fn comfort_noise_inherits_speech_decoder_memory() {
+        // Receiver A: speech burst, then a SID.
+        let mut r = DtxReceiver::new(31);
+        for _ in 0..4 {
+            let _ = r.receive(RxFrame::Speech(speech_frame()));
+        }
+        let sid = SidParameters::new([0, 9, 23, 15, 8, 7, 3, 3, 2], [8, 8, 8, 8]);
+        let warm = r.receive(RxFrame::Sid(sid));
+
+        // Reproduce the *same* §6.1 frame on a fresh (home-state) decoder.
+        let mut rng = NoiseRng::new(31);
+        let cn = comfort_noise_frame(&sid, &mut rng);
+        let mut cold = DecoderState::new();
+        let cold_pcm = cold.decode_frame(&cn);
+
+        assert_ne!(
+            warm, cold_pcm,
+            "comfort noise ignored the carried-over speech decoder memory"
+        );
     }
 
     // ----- §5.1 transmit-side background-acoustic-noise evaluation -----
