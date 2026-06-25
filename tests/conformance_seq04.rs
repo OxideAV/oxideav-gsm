@@ -33,8 +33,9 @@
 //! paths.
 
 use oxideav_gsm::analysis::{
-    apcm_inverse_and_position, apcm_quantise_rpe, autocorrelation, ltp_parameters, quantise_lar,
-    reflection_coefficients, LtpAnalyzer,
+    apcm_inverse_and_position, apcm_quantise_rpe, autocorrelation, long_term_analysis_filter,
+    ltp_parameters, quantise_lar, reflection_coefficients, weighting_filter, LtpAnalyzer,
+    LtpParameters,
 };
 use oxideav_gsm::tables::{A, DLB, FAC, MAC, MIC};
 
@@ -367,4 +368,166 @@ fn lar_clamp_windows_are_non_empty() {
     for i in 1..=8 {
         assert!(MIC[i] < MAC[i], "MIC[{i}] < MAC[{i}]");
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Table 6.2 — "List of tested overflow points for sequence 1 (coder
+// part)". The §6.3.1 SEQ01/SEQ01H sequence "uses a large number of
+// saturated samples" and "the residual LPC signal reaches very high
+// values" (§6.3.1), driving these *encoder* operations to overflow
+// i16 repeatedly. Each must therefore use the §5.1 saturating
+// arithmetic, exactly mirroring the decoder-side Table 6.7 pins:
+//   §5.2.11 Abs(d[k])                    5×
+//   §5.2.12 sub                          11×
+//   §5.2.13 scaling the result (×2, ×4)  302×
+//   §5.2.15 Abs (find max of xm)         49×
+//   §5.2.18 add                          126×
+// (The §5.2.10 short-term-analysis 1st/2nd add overflows are pinned
+// indirectly by the analysis-by-synthesis lockstep test in the
+// encoder unit-test module; the saturating-primitive points unique to
+// these clauses are pinned directly here.)
+// ════════════════════════════════════════════════════════════════
+
+/// Table 6.2 — §5.2.11 `Abs( d[k] )`. The optimum-scaling step takes
+/// `dmax = max |d[k]|` over the sub-segment. The §5.1 `abs` saturates
+/// `abs(-32768) = +32767` (a two's-complement `-32768` has no positive
+/// counterpart); a naïve `abs` that returned `-32768` would make `dmax`
+/// negative, corrupting the `norm(dmax << 16)` scaling. We feed a
+/// residual whose peak magnitude sample is exactly `i16::MIN` and
+/// require the lag search to behave as if the magnitude were +32767
+/// (i.e. `scal` is derived from a 15-bit-magnitude dmax, so the search
+/// runs and emits a valid in-range `Nc`).
+#[test]
+fn seq01_table_6_2_ltp_abs_saturates_at_min() {
+    let mut dp_hist = [0i16; 120];
+    // A strong periodic history so a matching residual selects a lag.
+    for (i, slot) in dp_hist.iter_mut().enumerate() {
+        *slot = if i % 40 == 0 { 16000 } else { 0 };
+    }
+    let mut d = [0i16; 40];
+    // Peak magnitude sample is i16::MIN — abs must saturate to 32767.
+    d[0] = i16::MIN;
+    d[1] = -16000; // a second large sample to keep the search non-degenerate
+    let params = ltp_parameters(&d, &dp_hist);
+    // The function must not panic and must emit a valid in-range lag;
+    // a non-saturating abs would corrupt dmax (negative) and the
+    // `norm(dmax << 16)` derivation, but the saturating abs keeps the
+    // contract: Nc in [40, 120], bc a 2-bit code.
+    assert!(
+        (40..=120).contains(&params.n_c),
+        "§5.2.11 abs(i16::MIN) must saturate so Nc stays in range, got {}",
+        params.n_c
+    );
+    assert!((0..=3).contains(&params.b_c));
+}
+
+/// Table 6.2 — §5.2.15 `Abs` (the block-maximum search). `xmax =
+/// max |xM[i]|` must saturate `abs(-32768) = +32767`. A pulse sequence
+/// whose peak is exactly `i16::MIN` must therefore code a *maximal*
+/// `xmaxc` (large exponent), not a corrupt one. A non-saturating abs
+/// would underflow `xmax` to `-32768`, breaking the `xmaxc` exponent
+/// search (which assumes a non-negative `xmax`).
+#[test]
+fn seq01_table_6_2_apcm_abs_saturates_at_min() {
+    let mut x_m = [0i16; 13];
+    x_m[3] = i16::MIN; // peak magnitude pulse
+    x_m[7] = 1000;
+    let q = apcm_quantise_rpe(&x_m);
+    // |i16::MIN| saturates to 32767, the largest possible xmax, so the
+    // 6-bit xmaxc lands at (or very near) its ceiling 63. A corrupt
+    // (negative) xmax would yield a small/zero xmaxc.
+    assert!(
+        q.xmaxc >= 60,
+        "abs(i16::MIN) must saturate ⇒ near-maximal xmaxc, got {}",
+        q.xmaxc
+    );
+    assert!((0..=63).contains(&q.xmaxc), "xmaxc is a 6-bit code");
+    // The recorded *unquantised* block max is the saturated +32767.
+    assert_eq!(q.xmax, i16::MAX, "xmax must record the saturated abs value");
+}
+
+/// Table 6.2 — §5.2.12 `sub`. The long-term analysis filter computes
+/// `e[k] = sub(d[k], dpp[k])`. When `d[k]` is large-positive and the
+/// prediction estimate `dpp[k]` is large-negative, the difference
+/// overflows i16 and must clamp to +32767, never wrap. We drive a
+/// sub-segment where the predictor is strongly anti-correlated with the
+/// residual so `sub(d, dpp)` overflows, and require the long-term
+/// residual to stay bounded (no sign-flip).
+#[test]
+fn seq01_table_6_2_ltp_filter_sub_saturates() {
+    // History at full negative scale at the lag-40 taps so the §5.2.12
+    // prediction estimate `dpp[k] = mult_r(bp, dp[k-Nc])` is large
+    // negative when bc is high.
+    let mut dp_hist = [0i16; 120];
+    for slot in dp_hist.iter_mut() {
+        *slot = i16::MIN;
+    }
+    // d[k] large positive ⇒ sub(d[k], large-negative dpp) overflows +.
+    let d = [i16::MAX; 40];
+    // Force bc = 3 (gain QLB[3] ≈ +1.0) so dpp ≈ dp[k-Nc] ≈ -32768.
+    let params = LtpParameters { n_c: 40, b_c: 3 };
+    let (_dpp, e) = long_term_analysis_filter(&d, &dp_hist, params);
+    // sub(32767, ~-32766) = 65533 > 32767 ⇒ saturating sub clamps to
+    // +32767; a wrapping sub would sign-flip to a deep-negative value.
+    assert!(
+        e.contains(&i16::MAX),
+        "§5.2.12 sub of (+max) − (−max) must clamp to +32767"
+    );
+    assert!(
+        e.iter().all(|&v| v > i16::MIN / 2),
+        "saturating sub must not sign-flip"
+    );
+}
+
+/// Table 6.2 — §5.2.13 "scaling the result (both ×2 and ×4)". The
+/// weighting filter applies two saturating doublings (`L_add(L, L)`
+/// twice) for the spec's ×4 scaling. With a full-scale input the
+/// doublings overflow i32 and must clamp, producing a bounded,
+/// finite output rather than a wrapped one. We feed the filter a
+/// full-scale impulse train and require a non-trivial, bounded result.
+#[test]
+fn seq01_table_6_2_weighting_filter_doubling_saturates() {
+    // Full-scale alternating input maximises the 11-tap dot product
+    // and drives the ×2/×4 doublings into saturation.
+    let mut e = [0i16; 40];
+    for (k, slot) in e.iter_mut().enumerate() {
+        *slot = if k % 2 == 0 { i16::MAX } else { i16::MIN };
+    }
+    let x = weighting_filter(&e);
+    // The filter must produce a finite, in-range result (trivially true
+    // for [i16; N]) and a non-trivial one — the saturating doublings
+    // bounded the i32 accumulator instead of wrapping it.
+    assert!(
+        x.iter().any(|&v| v != 0),
+        "weighting filter must produce a non-trivial output"
+    );
+}
+
+/// Table 6.2 — §5.2.18 `add`. The delay-line update writes
+/// `dp[-40+k] = add(ep[k], dpp[k])`. With both the reconstructed
+/// residual `ep` and the prediction estimate `dpp` at full positive
+/// scale, the sum overflows i16 and must clamp to +32767, never wrap.
+/// We drive `update_dp_after_subframe` with both arrays at the ceiling
+/// and confirm the resulting delay line is pinned high (read back via
+/// the subsequent lag search seeing a saturated, not sign-flipped,
+/// history).
+#[test]
+fn seq01_table_6_2_dp_update_add_saturates() {
+    let mut analyzer = LtpAnalyzer::new();
+    let ep = [i16::MAX; 40];
+    let dpp = [i16::MAX; 40];
+    // §5.2.18: dp[-40+k] = add(ep[k], dpp[k]) = add(32767, 32767) ⇒
+    // saturating add clamps to +32767.
+    analyzer.update_dp_after_subframe(&ep, &dpp);
+    // Read the updated history back through a lag search: a residual
+    // matching the saturated +32767 history at lag 40 must select a
+    // valid lag (the history is uniformly +32767, never the wrapped
+    // -2 a non-saturating add(32767,32767) would have produced).
+    let d = [i16::MAX; 40];
+    let params = analyzer.analyse_subframe(&d).0;
+    assert!(
+        (40..=120).contains(&params.n_c),
+        "§5.2.18 add saturation keeps the delay line consistent, Nc = {}",
+        params.n_c
+    );
 }

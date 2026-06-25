@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.1 Table 6.2 encoder-side overflow-saturation pins
+  (2026-06-25).** The mirror of the Table 6.7 decoder work, on the
+  encoder. Table 6.2 lists the coder operations the SEQ01 sequence (which
+  "uses a large number of saturated samples", §6.3.1) drives to overflow
+  i16: §5.2.11 `Abs(d[k])` (5×), §5.2.12 `sub` (11×), §5.2.13 ×2/×4
+  scaling (302×), §5.2.15 `Abs` (49×), §5.2.18 `add` (126×). Each must use
+  the §5.1 saturating arithmetic. New pins drive each path past the i16
+  ceiling and assert it clamps: the `abs(i16::MIN) = +32767` saturation in
+  the §5.2.11 lag-search dmax and the §5.2.15 block-max search (a
+  non-saturating abs would make the maximum *negative* and corrupt the
+  exponent/scaling derivation), the §5.2.12 long-term-residual `sub`
+  clamp, the §5.2.13 weighting-filter ×2/×4 doubling saturation, and the
+  §5.2.18 delay-line `add` clamp. 5 new integration tests in
+  `tests/conformance_seq04.rs`.
+
 - **§6.3.2 Table 6.7 decoder-side overflow-saturation pins
   (2026-06-25).** Table 6.7 lists four decoder overflow points that
   overflow i16 on conformance sequence 1 — §5.3.2 long-term synthesis

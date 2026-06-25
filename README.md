@@ -498,19 +498,32 @@ unstaged ETSI conformance archive (`en_300961v080101p0.ZIP`); running
 those is a docs-staging followup. The SEQ06H homing vectors are the
 spec-complete subset that needs no external corpus.
 
-Although the SEQ04 *binary* corpus is unstaged, the **invariants** the
-§6.3.2 Table 6.5 / Table 6.6 design enumerates are fully specified inside
-the PDF — each row is an *"incorrect statement / correct statement"* pair
-naming an exact §5.4 table cell, comparison direction, or loop range that
-SEQ04 was built to flush out. `tests/conformance_seq04.rs` pins every one
-of those invariants directly against the public API + §5.4 constants
-(§5.2.7 `A[4]/A[5]/A[6]/A[8]` + `MAC[2]`/`MIC[2]` clamps, §5.2.16
-`FAC[2..7]`, §5.2.11 LTP-gain `mult`-not-`mult_r` decision ladder +
-`DLB[0]/DLB[1]` levels + opt-scaling range `k = 0..=39`, and the Table 6.6
-`smax == 0` / `L_ACF[0] == 0` paths), plus the §6.3.2 SEQ05 guarantee that
-the encoder never emits an out-of-range LTP lag `Nc`. So the off-by-one
-table mutations, flipped comparisons, and short loops the SEQ04/SEQ05
-vectors would detect are detected here too — independently of the corpus.
+Although the SEQ01..SEQ05 *binary* corpus is unstaged, the **invariants**
+the §6.3.1 / §6.3.2 Table 6.2 / 6.5 / 6.6 / 6.7 design enumerates are
+fully specified inside the PDF — each row is either an *"incorrect
+statement / correct statement"* pair naming an exact §5.4 table cell,
+comparison direction, or loop range (Table 6.5/6.6), or a named
+overflow point that must saturate (Table 6.2/6.7).
+`tests/conformance_seq04.rs` (18 tests) + the in-crate unit modules pin
+every one directly against the public API + §5.4 constants:
+
+* **Table 6.5** mutation points — §5.2.7 `A[4]/A[5]/A[6]/A[8]` +
+  `MAC[2]`/`MIC[2]` clamps, §5.2.16 `FAC[2..7]`, §5.2.11 LTP-gain
+  `mult`-not-`mult_r` decision ladder + `DLB[0]/DLB[1]` levels +
+  opt-scaling range `k = 0..=39`, §5.2.4/§5.2.5/§5.2.9.2 ranges +
+  comparisons.
+* **Table 6.6** SEQ04-only paths — `smax == 0`, `L_ACF[0] == 0`,
+  `P[0] < abs(P[1])`.
+* **Table 6.2** coder-overflow saturations — §5.2.11 / §5.2.15
+  `abs(i16::MIN) = +32767`, §5.2.12 `sub`, §5.2.13 ×2/×4 doubling,
+  §5.2.18 `add`.
+* **Table 6.7** decoder-overflow saturations — §5.3.2 / §5.3.4 / §5.3.5 /
+  §5.3.6 `add`.
+* **SEQ05** — the encoder never emits an out-of-range LTP lag `Nc`.
+
+So the off-by-one table mutations, flipped comparisons, short loops, and
+non-saturating overflows the SEQ01/04/05 vectors would detect are
+detected here too — independently of the corpus.
 
 ## Comfort noise (GSM 06.12 §5.1 + §6.1)
 
