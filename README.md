@@ -498,6 +498,20 @@ unstaged ETSI conformance archive (`en_300961v080101p0.ZIP`); running
 those is a docs-staging followup. The SEQ06H homing vectors are the
 spec-complete subset that needs no external corpus.
 
+Although the SEQ04 *binary* corpus is unstaged, the **invariants** the
+§6.3.2 Table 6.5 / Table 6.6 design enumerates are fully specified inside
+the PDF — each row is an *"incorrect statement / correct statement"* pair
+naming an exact §5.4 table cell, comparison direction, or loop range that
+SEQ04 was built to flush out. `tests/conformance_seq04.rs` pins every one
+of those invariants directly against the public API + §5.4 constants
+(§5.2.7 `A[4]/A[5]/A[6]/A[8]` + `MAC[2]`/`MIC[2]` clamps, §5.2.16
+`FAC[2..7]`, §5.2.11 LTP-gain `mult`-not-`mult_r` decision ladder +
+`DLB[0]/DLB[1]` levels + opt-scaling range `k = 0..=39`, and the Table 6.6
+`smax == 0` / `L_ACF[0] == 0` paths), plus the §6.3.2 SEQ05 guarantee that
+the encoder never emits an out-of-range LTP lag `Nc`. So the off-by-one
+table mutations, flipped comparisons, and short loops the SEQ04/SEQ05
+vectors would detect are detected here too — independently of the corpus.
+
 ## Comfort noise (GSM 06.12 §5.1 + §6.1)
 
 The transmit-side **background-acoustic-noise evaluation** (§5.1) and

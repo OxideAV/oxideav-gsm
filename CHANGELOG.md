@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.2 Table 6.5 / Table 6.6 conformance-boundary suite
+  (`tests/conformance_seq04.rs`, 2026-06-25).** Pins the
+  mutation-detection invariants the **SEQ04/SEQ04H** "critical parts"
+  configuration-1 test sequence is *designed to catch* (§6.3.1 / §6.3.2).
+  Each Table 6.5 row names an *"incorrect statement / correct statement"*
+  pair (an exact §5.4 table cell, comparison direction, or loop range);
+  the SEQ04 binary corpus that replays them ships in the unstaged ETSI
+  conformance archive (Disk1/2/3.zip, a docs-gap), but the invariants
+  themselves are fully specified in the staged PDF. This suite asserts
+  each one directly against the public API + §5.4 constants: §5.2.7
+  LAR-quantiser coefficients (`A[4]/A[5]/A[6]/A[8]`, `MAC[2]` clamp,
+  `MIC[2]` clamp), §5.2.16 APCM-inverse `FAC[2..7]` cells, §5.2.11
+  LTP-gain coding (the `mult`-not-`mult_r` decision ladder + `DLB[0]`/
+  `DLB[1]` levels + opt-scaling range `k = 0..=39` including sample 39),
+  and the Table 6.6 `smax == 0` / `L_ACF[0] == 0` algorithm paths, plus
+  the §6.3.2 SEQ05 property that the encoder never emits an out-of-range
+  LTP lag `Nc` (the [40,120] guarantee SEQ05 stresses on the decoder
+  side). 13 new integration tests; complements the in-crate unit pins
+  for the already-covered Table 6.5 rows (§5.2.4 `k=0..=159`, §5.2.5
+  strict `P[0] < abs(P[1])`, §5.2.9 rp breakpoints, §5.3.6 saturation).
+
 - **GSM 06.12 §6 receive-side DTX dispatcher `DtxReceiver`
   (2026-06-20).** Implements the receive-side Discontinuous-Transmission
   dispatch the staged EN 300 963 §6 fully defines: comfort-noise
