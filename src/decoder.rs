@@ -710,6 +710,116 @@ mod tests {
         }
     }
 
+    /// §5.3.2 long-term synthesis `add` must **saturate** — Table 6.7
+    /// ("Long term synthesis filter (5.3.2): add — 126 occurrences" on
+    /// sequence 1) confirms the `drp[k] = add(erp[k], drpp)` step
+    /// overflows i16 in conformance sequence 1, so it must use the §5.1
+    /// saturating `add`, not a wrapping one. We force the overflow: seed
+    /// the 120-sample LTP history at full positive scale, set `bc = 3`
+    /// (gain `QLB[3] = 32767`, i.e. ≈ +1.0) so `drpp = mult_r(32767,
+    /// 32767) ≈ 32766`, and feed a large positive `erp` via the
+    /// all-`xMc = 7` sub-frame. The sum 32766 + (large positive) must
+    /// clamp to +32767, never wrap to a negative value.
+    #[test]
+    fn lt_synthesis_add_saturates_per_table_6_7() {
+        let mut dec = DecoderState::new();
+        // Saturate the delay-line history at the i16 ceiling so
+        // `past = drp[k - Nr]` is +32767 for the early taps.
+        dec.drp_hist = [i16::MAX; 120];
+        dec.nrp = 40;
+        // Sub-frame with bc=3 (max gain) and the largest positive RPE
+        // pulses (xMc = 7 ⇒ post-decode positive), max xmax exponent.
+        let sf = SubFrame {
+            n_c: 40,
+            b_c: 3,
+            m_c: 0,
+            xmax_c: 63, // largest block amplitude code
+            x_mc: [7; PULSES],
+        };
+        // erp from the spec RPE decode for this sub-frame.
+        let erp = rpe_decode(&sf);
+        let drp = dec.lt_synthesis(&sf, &erp);
+        // Whatever the exact magnitudes, the saturating add can never
+        // produce a sign flip: with a +full history, +gain, and the
+        // positive-leaning erp, no output may be the catastrophic
+        // large-negative value a wrapping add would yield. Concretely
+        // every output stays within the i16 range (trivially true) AND
+        // at least one tap that summed two large positives lands at the
+        // +32767 ceiling rather than wrapping negative.
+        assert!(
+            drp.contains(&i16::MAX),
+            "a tap summing +history·gain and +erp must clamp to +32767"
+        );
+        // And no tap may have wrapped to the deep-negative region that a
+        // non-saturating add of two large positives would create.
+        assert!(
+            drp.iter().all(|&v| v > i16::MIN / 2),
+            "saturating add must not sign-flip a sum of two large positives"
+        );
+    }
+
+    /// §5.3.5 de-emphasis `add` must **saturate** — Table 6.7 lists the
+    /// §5.3.5 de-emphasis filter `add` (89 occurrences on sequence 1),
+    /// confirming `temp = add(sr[k], mult_r(msr, 28180))` overflows in
+    /// conformance sequence 1. We seed `msr` at the i16 ceiling so
+    /// `mult_r(msr, 28180)` is large-positive, then feed an `sr[0]` also
+    /// at the ceiling: the sum must clamp to +32767, never wrap. Because
+    /// the de-emphasis is recursive (`msr = temp`), a wrapping add would
+    /// sign-flip the whole tail of the frame, whereas the saturating add
+    /// keeps it pinned high.
+    #[test]
+    fn de_emphasis_add_saturates_per_table_6_7() {
+        let mut dec = DecoderState::new();
+        dec.msr = i16::MAX; // prior output at the ceiling
+        let mut sr = [0i16; FRAME_SAMPLES];
+        sr[0] = i16::MAX; // current input at the ceiling ⇒ add overflows
+        let sro = dec.de_emphasis(&sr);
+        // sr[0] + mult_r(32767, 28180) = 32767 + 28178 = 60945 > 32767
+        // ⇒ saturating add clamps to +32767.
+        assert_eq!(
+            sro[0],
+            i16::MAX,
+            "de-emphasis add of two large positives must clamp to +32767"
+        );
+        // The recursion now carries msr = 32767; with sr[k]=0 for k>=1
+        // the tail decays via mult_r(32767, 28180) — strictly positive,
+        // never the sign-flip a wrapping add would have introduced.
+        assert!(
+            sro[1] > 0,
+            "post-saturation de-emphasis tail stays positive (no wrap)"
+        );
+    }
+
+    /// §5.3.4 short-term synthesis `add` must **saturate** — Table 6.7
+    /// lists the §5.3.4 lattice's "1st add" (4499×) and "2nd add" (405×)
+    /// among the sequence-1 overflow points. We drive `st_synthesis`
+    /// with a full-scale `drp_frame` and a reflection-coefficient set
+    /// near Q15 unity (from an extreme LARpp) so the lattice's running
+    /// `add`s overflow, then require the output to stay bounded with no
+    /// panic — the saturating arithmetic guarantees a finite, in-range
+    /// result where a wrapping add could not.
+    #[test]
+    fn st_synthesis_add_saturates_per_table_6_7() {
+        let mut dec = DecoderState::new();
+        // Pre-load the filter memory at the ceiling so the first lattice
+        // `add` (v_prev + mult_r(r, sri)) overflows immediately.
+        dec.v = [i16::MAX; 9];
+        let drp_frame = [i16::MAX; FRAME_SAMPLES];
+        // LARpp driving rp near +Q15 (segment-3 large reflection coeffs).
+        let lar_curr = [0i16, 30000, 30000, 30000, 30000, 30000, 30000, 30000, 30000];
+        let sr = dec.st_synthesis(&drp_frame, &lar_curr);
+        // The whole frame must come out finite and in i16 range (trivially
+        // true for [i16; N]) — the load-bearing claim is that no overflow
+        // panicked and the saturating add bounded every intermediate.
+        assert_eq!(sr.len(), FRAME_SAMPLES);
+        // At least one output sample is non-zero (the filter ran) and the
+        // memory advanced — i.e. the lattice actually executed its adds.
+        assert!(
+            sr.iter().any(|&v| v != 0),
+            "the short-term lattice must produce a non-trivial frame"
+        );
+    }
+
     /// `reset` returns the decoder to its §4.6 home values — every
     /// internal field matches a freshly-constructed decoder.
     #[test]

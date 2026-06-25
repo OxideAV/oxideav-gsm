@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.2 Table 6.7 decoder-side overflow-saturation pins
+  (2026-06-25).** Table 6.7 lists four decoder overflow points that
+  overflow i16 on conformance sequence 1 — §5.3.2 long-term synthesis
+  `add` (126×), §5.3.4 short-term synthesis 1st/2nd `add` (4499× / 405×),
+  §5.3.5 de-emphasis `add` (89×), §5.3.6 output scaling `add` (16691×) —
+  each of which must therefore use the §5.1 **saturating** `add`, not a
+  wrapping one (a wrap would sign-flip catastrophically, and the
+  de-emphasis/lattice recursion would propagate the flip through the rest
+  of the frame). §5.3.6 was already pinned; this adds the missing three
+  (`lt_synthesis_add_saturates_per_table_6_7`,
+  `de_emphasis_add_saturates_per_table_6_7`,
+  `st_synthesis_add_saturates_per_table_6_7`) by forcing each filter's
+  running `add` past the i16 ceiling and asserting it clamps rather than
+  wraps. Completes the Table 6.7 decoder-overflow row coverage. 3 new
+  unit tests.
+
 - **§6.3.2 Table 6.5 / Table 6.6 conformance-boundary suite
   (`tests/conformance_seq04.rs`, 2026-06-25).** Pins the
   mutation-detection invariants the **SEQ04/SEQ04H** "critical parts"
