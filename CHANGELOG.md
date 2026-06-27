@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.2 conformance harness over the §6.1 word formats
+  (2026-06-28).** A new end-to-end harness (`tests/conformance_confio.rs`)
+  driving the §6.2.1/§6.2.2 configurations through the `confio` `*.INP`/
+  `*.COD`/`*.OUT` converters: a multi-frame `*.INP` PCM stream encoded
+  to a `*.COD` word stream (Config 1, each frame re-readable and matching
+  the encoder output), a `*.COD` word stream decoded to a `*.OUT` PCM
+  stream (Config 2, every output word's three low bits zero per Table
+  6.1c), a homing-frame loop-back through the word formats, and the
+  §6.3.2 SEQ05 "scan all possible codes for each parameter" full-range
+  sweep (every `Nc ∈ [0,127]` per sub-frame, full `xmaxc`/`bc`/`Mc`/
+  `LARc[1]`/`xMc` ranges) read through the `*.COD` reader into the §5.3
+  decoder with no panic and §5.3.7 shaping preserved. 4 new tests.
+
 - **§6.1 Table 6.1 word-oriented conformance I/O format (`confio`)
   (2026-06-28).** A new `confio` module implementing the §6.1
   test-sequence on-disk formats, distinct from the §1.7 packed in-band
