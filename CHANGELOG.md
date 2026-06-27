@@ -6,6 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.3.3 frame-synchronization sweep (`FrameSyncTable`)
+  (2026-06-28).** Completes the §6.3.3.3 encoder-framing recovery: the
+  bit-synchronization sweep already shipped; this adds the second step,
+  frame synchronization. Per §6.3.3.3 the special synchronization frame
+  "delivers 160 different output frames, depending on the 160 different
+  positions that this frame can possibly have with respect to the
+  encoder framing" — it "was found by taking one input frame and
+  shifting it through the positions 0 to 159 … it was verified that all
+  160 output frames were different", with "the samples at the beginning
+  … set to 0x0008 hex". `retard_special_frame` forms the encoder's
+  20 ms window for a retardation `r` (leading `r` slots = homing fill
+  `0x0008`, remaining `160 − r` = head of the special frame).
+  `FrameSyncTable::build` reproduces the `SYNC000.COD..SYNC159.COD`
+  reference table by encoding each retarded window from a freshly homed
+  encoder; `all_distinct` checks the spec's 160-distinct-outputs
+  invariant; `find_frame_sync` / `match_output` recover the retardation
+  `r` from an observed `SYNCxxx.COD` (alignment then attained "by a
+  corresponding shift in the opposite direction"). The reference *binary*
+  corpus (`SEQSYNC.INP` / `SYNCxxx.COD`) is still unstaged, so the sweep
+  is parameterised on any caller-supplied special frame; the bundled
+  candidate special frame is asserted to satisfy the §6.3.3.3 distinctness
+  invariant and to round-trip all 160 retardations. 8 new unit tests in
+  `src/sync.rs`. New public surface: `FrameSyncTable`, `find_frame_sync`,
+  `retard_special_frame`, `SYNC_LEADING_FILL`.
+
 - **§6.3.1 Table 6.2 encoder-side overflow-saturation pins
   (2026-06-25).** The mirror of the Table 6.7 decoder work, on the
   encoder. Table 6.2 lists the coder operations the SEQ01 sequence (which

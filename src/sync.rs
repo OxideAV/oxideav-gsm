@@ -9,14 +9,58 @@
 //! crate (§4.2 encoder-homing-frame, §4.3 encoder homing, §4.4
 //! decoder-homing-frame).
 //!
-//! This module implements **bit synchronization**: the part of
-//! §6.3.3.3 that is fully specified textually and depends only on
-//! features this crate owns. The actual `BITSYNC.INP` /
-//! `SEQSYNC.INP` / `SYNCxxx.COD` reference sequences live in the
-//! ETSI conformance archive (not staged under `docs/audio/gsm/`), so
-//! the frame-synchronization sweep that recovers the 0..159 sample
-//! offset against `SYNC000.COD..SYNC159.COD` is deferred to a
-//! follow-up round; the formats are documented in [`SyncFormats`].
+//! This module implements **both** synchronization steps of §6.3.3.3
+//! that are fully specified textually and depend only on features this
+//! crate owns:
+//!
+//! * **bit synchronization** — the 13-trial homing-frame sweep
+//!   ([`find_bit_sync`] / [`run_bit_sync_trial`]); and
+//! * **frame synchronization** — the 160-position special-frame sweep
+//!   ([`FrameSyncTable`] / [`find_frame_sync`]), which recovers the
+//!   0..159 sample retardation of the encoder's 20 ms window once bit
+//!   synchronization is known.
+//!
+//! The actual `BITSYNC.INP` / `SEQSYNC.INP` / `SYNCxxx.COD` reference
+//! *binary* sequences live in the ETSI conformance archive (not staged
+//! under `docs/audio/gsm/`), so this module does not ship those exact
+//! bytes. Instead it implements the §6.3.3.3 *procedure* that built
+//! them and the *invariant* the spec states they satisfy (160 distinct
+//! output frames), parameterised on any caller-supplied "special
+//! synchronization frame". The §6.3.3.4 reference-file formats and
+//! sizes are recorded in [`SyncFormats`].
+//!
+//! ## Frame synchronization (§6.3.3.3)
+//!
+//! > *"Once bit synchronization is found, frame synchronization can be
+//! > found by inputting one special frame that delivers 160 different
+//! > output frames, depending on the 160 different positions that this
+//! > frame can possibly have with respect to the encoder framing."*
+//!
+//! > *"This special synchronization frame was found by taking one input
+//! > frame and shifting it through the positions 0 to 159. The
+//! > corresponding 160 encoded speech frames were calculated and it was
+//! > verified that all 160 output frames were different. When shifting
+//! > the input synchronization frame, the samples at the beginning were
+//! > set to 0x0008 hex, which corresponds to the samples of the
+//! > encoder-homing-frame."* (§6.3.3.3)
+//!
+//! > *"The corresponding 160 different output frames are given in
+//! > SYNC000.COD through SYNC159.COD. The three digit number in the
+//! > filename indicates the number of samples by which the input is
+//! > retarded with respect to the encoder framing. By a corresponding
+//! > shift in the opposite direction, alignment with the encoder
+//! > framing can be attained."* (§6.3.3.3)
+//!
+//! [`FrameSyncTable::build`] reproduces that construction: for each
+//! retardation `r ∈ 0..160` it forms the encoder's 20 ms window as the
+//! special frame retarded by `r` samples — the leading `r` slots filled
+//! with the homing-frame value `0x0008`, the remaining `160 - r` slots
+//! taken from the head of the special frame — and encodes it from a
+//! freshly homed encoder (the §6.3.3.3 procedure precedes the special
+//! frame with encoder-homing-frames, leaving the encoder in its §4.5
+//! home state). [`FrameSyncTable::all_distinct`] checks the spec's
+//! stated property, and [`find_frame_sync`] recovers `r` from an
+//! observed `SYNCxxx.COD` output frame by table match.
 //!
 //! ## Bit synchronization (§6.3.3.3)
 //!
@@ -57,7 +101,7 @@
 //! frames, so no decoder-homing-frame appears. That presence/absence
 //! is the bit-sync decision.
 
-use crate::bitstream::FRAME_SAMPLES;
+use crate::bitstream::{UnpackedFrame, FRAME_SAMPLES};
 use crate::decoder::is_decoder_homing_frame;
 use crate::encoder::EncoderState;
 
@@ -147,6 +191,132 @@ where
         let frames = triplet_for_shift(shift);
         run_bit_sync_trial(shift, &frames).decoder_homing_detected
     })
+}
+
+/// The homing-frame sample value `0x0008` (§4.2 / §6.3.3.3) used to
+/// fill the "samples at the beginning" of a retarded special
+/// synchronization frame.
+///
+/// §6.3.3.3: *"When shifting the input synchronization frame, the
+/// samples at the beginning were set to 0x0008 hex, which corresponds
+/// to the samples of the encoder-homing-frame."*
+pub const SYNC_LEADING_FILL: i16 = 0x0008;
+
+/// The 160 reference encoder output frames of the §6.3.3.3 frame-
+/// synchronization sweep (`SYNC000.COD..SYNC159.COD`).
+///
+/// Entry `r` (`0..`[`SyncFormats::FRAME_SYNC_POSITIONS`]) is the
+/// encoder output when the special synchronization frame is retarded by
+/// `r` samples relative to the encoder's 20 ms framing — exactly what
+/// the spec's `SYNCr.COD` file holds. The table is built by encoding,
+/// from a freshly homed encoder, the retarded window
+/// [`retard_special_frame`] produces for each `r`.
+///
+/// Holding the table lets [`find_frame_sync`] map a captured
+/// `SYNCxxx.COD` output frame back to its retardation `r`; per §6.3.3.3
+/// alignment is then attained "by a corresponding shift in the opposite
+/// direction".
+#[derive(Debug, Clone)]
+pub struct FrameSyncTable {
+    /// `outputs[r]` is the encoder output for retardation `r`.
+    outputs: Vec<UnpackedFrame>,
+}
+
+/// Form the encoder's 20 ms input window when the `special` frame is
+/// retarded by `r` samples (§6.3.3.3).
+///
+/// A retardation of `r` means the encoder's window starts `r` samples
+/// *before* the special frame begins; those `r` leading window slots
+/// are filled with the homing-frame value [`SYNC_LEADING_FILL`]
+/// (§6.3.3.3 "the samples at the beginning were set to 0x0008 hex"),
+/// and the remaining `160 - r` slots carry the first `160 - r` samples
+/// of `special`. `r == 0` is the special frame itself; `r == 160`
+/// (not a valid sweep index) would be an all-fill homing frame.
+pub fn retard_special_frame(special: &[i16; FRAME_SAMPLES], r: usize) -> [i16; FRAME_SAMPLES] {
+    let r = r.min(FRAME_SAMPLES);
+    let mut win = [SYNC_LEADING_FILL; FRAME_SAMPLES];
+    // The non-fill tail copies the head of the special frame.
+    win[r..].copy_from_slice(&special[..FRAME_SAMPLES - r]);
+    win
+}
+
+impl FrameSyncTable {
+    /// Build the 160-entry reference table for a given special
+    /// synchronization frame, reproducing the §6.3.3.3 construction.
+    ///
+    /// Each entry is encoded from a **fresh** [`EncoderState`] (the
+    /// §4.5 home state), matching the procedure's "reset by one
+    /// encoder-homing-frame" precondition: the homing frames that
+    /// precede the special frame in `SEQSYNC.INP` leave the encoder
+    /// homed, so the special frame is encoded against home-state
+    /// history.
+    pub fn build(special: &[i16; FRAME_SAMPLES]) -> Self {
+        let mut outputs = Vec::with_capacity(SyncFormats::FRAME_SYNC_POSITIONS);
+        for r in 0..SyncFormats::FRAME_SYNC_POSITIONS {
+            let win = retard_special_frame(special, r);
+            let mut enc = EncoderState::new();
+            outputs.push(enc.encode_frame(&win));
+        }
+        Self { outputs }
+    }
+
+    /// The reference output frame for retardation `r`
+    /// (the `SYNCr.COD` content). Returns `None` for `r` outside
+    /// `0..`[`SyncFormats::FRAME_SYNC_POSITIONS`].
+    pub fn output(&self, r: usize) -> Option<&UnpackedFrame> {
+        self.outputs.get(r)
+    }
+
+    /// All [`SyncFormats::FRAME_SYNC_POSITIONS`] reference frames.
+    pub fn outputs(&self) -> &[UnpackedFrame] {
+        &self.outputs
+    }
+
+    /// Whether all 160 reference output frames are pairwise distinct —
+    /// the §6.3.3.3 property that makes the special frame usable for
+    /// frame synchronization ("it was verified that all 160 output
+    /// frames were different").
+    ///
+    /// A special frame that fails this is unsuitable: two retardations
+    /// would produce the same `SYNCxxx.COD`, leaving [`find_frame_sync`]
+    /// unable to disambiguate them.
+    pub fn all_distinct(&self) -> bool {
+        for (i, a) in self.outputs.iter().enumerate() {
+            for b in &self.outputs[i + 1..] {
+                if a == b {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Recover the retardation `r` of an observed encoder output
+    /// `observed` (a captured `SYNCxxx.COD`) by table match.
+    ///
+    /// Returns the index `r` of the matching reference frame, or `None`
+    /// if `observed` matches no entry (which, for a conforming encoder
+    /// fed the genuine special frame, should not happen). When the
+    /// table [`all_distinct`](Self::all_distinct), the match is unique.
+    pub fn match_output(&self, observed: &UnpackedFrame) -> Option<usize> {
+        self.outputs.iter().position(|o| o == observed)
+    }
+}
+
+/// Recover the 20 ms frame retardation of a black-box encoder
+/// (§6.3.3.3 frame synchronization).
+///
+/// `special` is the §6.3.3.3 special synchronization frame; `observed`
+/// is the `SYNCxxx.COD` output frame the encoder under test produced
+/// for the special frame at its (unknown) framing offset. The function
+/// builds the reference [`FrameSyncTable`] from `special` and returns
+/// the retardation `r` whose reference output matches `observed`.
+///
+/// Per §6.3.3.3, alignment with the encoder framing is then attained
+/// "by a corresponding shift in the opposite direction" — i.e. advance
+/// the encoder input by `r` samples.
+pub fn find_frame_sync(special: &[i16; FRAME_SAMPLES], observed: &UnpackedFrame) -> Option<usize> {
+    FrameSyncTable::build(special).match_output(observed)
 }
 
 /// The §6.3.3.4 reference-sequence file formats and sizes.
@@ -297,6 +467,118 @@ mod tests {
             [g, g, g]
         });
         assert_eq!(seen, BIT_SYNC_TRIALS);
+    }
+
+    // ─── §6.3.3.3 frame synchronization ───
+
+    /// A candidate "special synchronization frame": a rich, position-
+    /// dependent waveform in the 13-bit linear PCM range (low three
+    /// bits cleared per the §6.3.3.4 input format "13 bit left
+    /// justified with the three least significant bits set to zero").
+    /// The spec's own special frame is empirically found; any frame
+    /// whose 160 retarded encodings come out pairwise distinct serves
+    /// the same role, which `frame_sync_table_outputs_are_distinct`
+    /// asserts for this one.
+    fn candidate_special_frame() -> [i16; FRAME_SAMPLES] {
+        core::array::from_fn(|i| {
+            let n = i as i32;
+            // A blend of two incommensurate ramps + a quadratic term so
+            // adjacent positions differ markedly through the analysis
+            // filters; kept inside ±4096 then aligned to the 13-bit grid.
+            let v = (n * 53 + (n * n) / 7 + (n % 11) * 211) % 4096 - 2048;
+            ((v as i16) << 3) & 0x7ff8 | if v < 0 { 0x8000u16 as i16 } else { 0 }
+        })
+    }
+
+    #[test]
+    fn retard_fills_leading_samples_with_homing_value() {
+        // §6.3.3.3: retardation r fills the first r window slots with
+        // 0x0008 and slides the special frame's head into the rest.
+        let special: [i16; FRAME_SAMPLES] = core::array::from_fn(|i| ((i as i16) << 3) & 0x7ff8);
+        let win = retard_special_frame(&special, 5);
+        for w in win.iter().take(5) {
+            assert_eq!(*w, SYNC_LEADING_FILL);
+        }
+        // Slot 5 onward carries special[0], special[1], …
+        for (k, w) in win.iter().enumerate().skip(5) {
+            assert_eq!(*w, special[k - 5]);
+        }
+    }
+
+    #[test]
+    fn retard_zero_is_the_special_frame_itself() {
+        let special = candidate_special_frame();
+        assert_eq!(retard_special_frame(&special, 0), special);
+    }
+
+    #[test]
+    fn retard_full_is_all_homing_fill() {
+        // r == 160 ⇒ every slot is the leading fill (an all-homing
+        // frame); clamped to FRAME_SAMPLES so larger r behaves the same.
+        let special = candidate_special_frame();
+        assert_eq!(
+            retard_special_frame(&special, FRAME_SAMPLES),
+            [SYNC_LEADING_FILL; FRAME_SAMPLES]
+        );
+        assert_eq!(
+            retard_special_frame(&special, FRAME_SAMPLES + 9),
+            [SYNC_LEADING_FILL; FRAME_SAMPLES]
+        );
+    }
+
+    #[test]
+    fn frame_sync_table_has_160_entries() {
+        let table = FrameSyncTable::build(&candidate_special_frame());
+        assert_eq!(table.outputs().len(), SyncFormats::FRAME_SYNC_POSITIONS);
+        assert!(table.output(0).is_some());
+        assert!(table.output(159).is_some());
+        assert!(table.output(160).is_none());
+    }
+
+    #[test]
+    fn frame_sync_table_outputs_are_distinct() {
+        // §6.3.3.3: the special frame "delivers 160 different output
+        // frames" — "it was verified that all 160 output frames were
+        // different." Our candidate special frame must satisfy that
+        // invariant, otherwise frame sync would be ambiguous.
+        let table = FrameSyncTable::build(&candidate_special_frame());
+        assert!(
+            table.all_distinct(),
+            "candidate special frame must yield 160 distinct encoder outputs"
+        );
+    }
+
+    #[test]
+    fn find_frame_sync_recovers_every_retardation() {
+        // Round-trip the §6.3.3.3 recovery: for each retardation r,
+        // the encoder output of the r-retarded special frame must map
+        // back to exactly r. This is the heart of the frame-sync step.
+        let special = candidate_special_frame();
+        let table = FrameSyncTable::build(&special);
+        for r in 0..SyncFormats::FRAME_SYNC_POSITIONS {
+            let observed = table.output(r).unwrap();
+            assert_eq!(
+                table.match_output(observed),
+                Some(r),
+                "retardation {r} must be recovered uniquely"
+            );
+            // The standalone front-end re-encodes from scratch and must
+            // agree (it rebuilds the same table internally).
+            let win = retard_special_frame(&special, r);
+            let mut enc = EncoderState::new();
+            let out = enc.encode_frame(&win);
+            assert_eq!(find_frame_sync(&special, &out), Some(r));
+        }
+    }
+
+    #[test]
+    fn find_frame_sync_none_for_foreign_output() {
+        // An output frame that is not in the reference table (here the
+        // §4.4 decoder-homing-frame, which is not a SYNCxxx.COD entry
+        // for this special frame) yields no match.
+        let special = candidate_special_frame();
+        let foreign = crate::decoder::decoder_homing_frame();
+        assert_eq!(find_frame_sync(&special, &foreign), None);
     }
 
     #[test]

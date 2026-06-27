@@ -122,8 +122,9 @@ pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};
 pub use error::Error;
 pub use sync::{
-    find_bit_sync, run_bit_sync_trial, BitSyncTrial, SyncFormats, BIT_SYNC_TRIALS,
-    HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
+    find_bit_sync, find_frame_sync, retard_special_frame, run_bit_sync_trial, BitSyncTrial,
+    FrameSyncTable, SyncFormats, BIT_SYNC_TRIALS, HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
+    SYNC_LEADING_FILL,
 };
 
 use oxideav_core::RuntimeContext;
