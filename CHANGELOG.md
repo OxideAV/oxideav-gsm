@@ -6,6 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.3.3.2 `HOMING01` decoder-homing state-machine conformance
+  (2026-06-28).** A new end-to-end harness (`tests/conformance_homing01.rs`)
+  that reconstructs a `HOMING01`-shaped coded stream from the §6.3.3.2
+  description ("2 complete decoder-homing-frames at the beginning and
+  inside there is a mixture of complete and fractional (incomplete)
+  decoder-homing-frames") and drives it through the public `make_decoder`
+  registry adapter, pinning the §4.4 / §4.4-NOTE-2 state machine
+  frame-by-frame at the byte level: a non-home decoder homes only on a
+  *complete* homing frame (a fractional one decodes as speech), a homed
+  decoder homes on a *fractional* homing frame (§4.4 NOTE 2), every
+  homing event emits the encoder-homing-frame (160 × `0x0008`) and resets
+  to §4.6 home, and the post-reset output is history-independent
+  (§6.2.2). The full 13-frame mixture trace alternates homed/non-home
+  entry states so the "fractional only homes when already homed"
+  soundness boundary is exercised in both directions. 4 new tests. The
+  reference `HOMING01.COD/OUT` *binary* corpus remains unstaged (the
+  behaviour is fully spec-defined; the exact bytes are not).
+
 - **§6.3.3.3 frame-synchronization sweep (`FrameSyncTable`)
   (2026-06-28).** Completes the §6.3.3.3 encoder-framing recovery: the
   bit-synchronization sweep already shipped; this adds the second step,
