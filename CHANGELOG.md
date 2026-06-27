@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§5.1 non-valid-bit robustness pins (2026-06-28).** §5.1 requires
+  "At the receiving part it shall therefore be ensured that only valid
+  bits … are used. In verification tests, the testing system may
+  introduce random bit at non valid places inside these samples
+  (3 LSBs) or parameters (MSBs) to test this function." Two new tests
+  pin both halves: a `*.COD` word whose unused high bits (above its
+  Table 6.1b field width) are set to garbage decodes to the identical
+  frame (the §6.1 reader masks each word), and an `*.INP` frame with
+  garbage in the 3 LSBs of every sample encodes identically to the
+  clean one (the §5.2.1 downscale clears those bits). 2 new tests in
+  `src/confio.rs`.
+
 - **§6.2 conformance harness over the §6.1 word formats
   (2026-06-28).** A new end-to-end harness (`tests/conformance_confio.rs`)
   driving the §6.2.1/§6.2.2 configurations through the `confio` `*.INP`/

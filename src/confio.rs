@@ -401,4 +401,62 @@ mod tests {
             "both carriage formats must decode to the same 76 parameters"
         );
     }
+
+    /// §5.1 non-valid-bit robustness (parameter side). The spec
+    /// requires: *"At the receiving part it shall therefore be ensured
+    /// that only valid bits … (two to seven bits for coded parameters)
+    /// are used. In verification tests, the testing system may
+    /// introduce random bit at non valid places inside these … or
+    /// parameters (MSBs) to test this function."* So a `*.COD` word
+    /// whose **high** (unused) bits are set to garbage must decode to
+    /// the same parameters as the clean word — the reader masks each
+    /// word to its Table 6.1b field width.
+    #[test]
+    fn cod_reader_ignores_garbage_high_bits() {
+        let clean = decoder_homing_frame();
+        let clean_words = unpacked_to_cod_words(&clean);
+
+        // Set every bit ABOVE each field's width (the "MSBs … non valid
+        // places") to 1, leaving the valid low bits intact.
+        let mut dirty = clean_words;
+        for (i, w) in dirty.iter_mut().enumerate() {
+            let valid_mask = (1u16 << COD_FIELD_WIDTHS[i]) - 1;
+            *w |= !valid_mask; // pollute all high bits
+        }
+        // The polluted words must decode to the identical frame.
+        let decoded = cod_words_to_unpacked(&dirty);
+        assert_eq!(
+            decoded, clean,
+            "§5.1: garbage in a *.COD word's MSBs must be ignored"
+        );
+
+        // And the same through the byte path.
+        let mut bytes = [0u8; COD_BYTES_PER_FRAME];
+        for (w, chunk) in dirty.iter().zip(bytes.chunks_exact_mut(2)) {
+            chunk.copy_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(cod_bytes_le_to_unpacked(&bytes).unwrap(), clean);
+    }
+
+    /// §5.1 non-valid-bit robustness (sample side). The spec also
+    /// allows random bits "inside these samples (3 LSBs)" of the
+    /// 13-bit PCM. The §5.2.1 encoder downscale clears those three
+    /// low bits, so an `*.INP` frame with garbage in the 3 LSBs of
+    /// every sample encodes identically to the clean one.
+    #[test]
+    fn encoder_ignores_garbage_sample_lsbs() {
+        let clean: [i16; FRAME_SAMPLES] =
+            core::array::from_fn(|i| (((i as i16) - 80) << 3) & 0x7ff8);
+        // Pollute the 3 LSBs of every sample.
+        let dirty: [i16; FRAME_SAMPLES] = core::array::from_fn(|i| clean[i] | 0b111);
+
+        let mut a = crate::EncoderState::new();
+        let mut b = crate::EncoderState::new();
+        let ca = a.encode_frame(&clean);
+        let cb = b.encode_frame(&dirty);
+        assert_eq!(
+            ca, cb,
+            "§5.1 / §5.2.1: garbage in a sample's 3 LSBs must not affect the coded output"
+        );
+    }
 }
