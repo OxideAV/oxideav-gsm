@@ -6,6 +6,36 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **§6.1 Table 6.1 word-oriented conformance I/O format (`confio`)
+  (2026-06-28).** A new `confio` module implementing the §6.1
+  test-sequence on-disk formats, distinct from the §1.7 packed in-band
+  stream: `*.COD` stores the 76 coded parameters each in its own 16-bit
+  word, **right** justified (Table 6.1b), 152 bytes/frame (§6.3.3.4
+  "76 * 2 bytes"); `*.INP` / `*.OUT` store `sop`/`srop` as 13-bit
+  **left**-justified words, 320 bytes/frame (Table 6.1a/c, the OUT's
+  three low bits zero). Conversions both directions, little- and
+  big-endian word order: `unpacked_to_cod_words` / `cod_words_to_unpacked`,
+  `*_cod_bytes_le/be`, `pcm_to_inp_bytes_le` / `inp_bytes_le_to_pcm`,
+  with `COD_FIELD_WIDTHS` (the per-word Table 6.1b widths, summing to
+  the 260 frame bits). A cross-format equivalence test pins that the
+  word-oriented `*.COD` and the §1.7 in-band stream carry the same 76
+  parameters. Lets a future round read/write the ETSI `*.INP`/`*.COD`/
+  `*.OUT` conformance files directly once they are staged. 14 new tests
+  (13 in `src/confio.rs` + 1 §6.3.2-SEQ05 decoder test in
+  `src/decoder.rs`).
+
+- **§6.3.2 SEQ05 out-of-range-`Nr` decoder robustness pin
+  (2026-06-28).** SEQ05 "is an artificial sequence … the delay value
+  Nr belonging to [40,120] … takes in this sequence its value in
+  [0,127] … the decoder behaviour on non-allowed values of Nr will be
+  tested." New decoder test sweeps every `Nc ∈ [0,127]` through the
+  §5.3.2 long-term synthesis and verifies the spec's "check the limits
+  of Nr" rule: an in-range lag is used verbatim, an out-of-range lag
+  reuses the previous valid `nrp`, no out-of-bounds delay-line index
+  ever occurs, and §5.3.7 output shaping holds throughout. Also covered
+  in `confio` (a 7-bit `Nc` survives the `*.COD` round-trip across the
+  full [0,127] range).
+
 - **§6.3.3.2 `HOMING01` decoder-homing state-machine conformance
   (2026-06-28).** A new end-to-end harness (`tests/conformance_homing01.rs`)
   that reconstructs a `HOMING01`-shaped coded stream from the §6.3.3.2

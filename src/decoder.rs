@@ -651,6 +651,71 @@ mod tests {
         assert_eq!(s.nrp, 40);
     }
 
+    /// §5.3.2 / §6.3.2 SEQ05 — the LTP-lag limit check. SEQ05 "is an
+    /// artificial sequence … the delay value Nr belonging to [40,120]
+    /// in an error-free transmission condition, takes in this sequence
+    /// its value in [0,127]. In this case the decoder behaviour on
+    /// non-allowed values of Nr will be tested." §5.3.2 says: "check
+    /// the limits of Nr" — when `Nc` decodes to a lag outside
+    /// `[40,120]`, the decoder substitutes the previous valid lag
+    /// `nrp` (home value 40) and never indexes the delay line out of
+    /// bounds. We feed every `Nc ∈ [0,127]` and require (a) no panic
+    /// (no OOB index), (b) in-range Nc is used verbatim, (c) out-of-
+    /// range Nc reuses the standing `nrp`.
+    #[test]
+    fn seq05_out_of_range_nr_substitutes_previous_lag() {
+        for nc in 0u8..=127 {
+            let mut dec = DecoderState::new();
+            // First decode a normal in-range frame to set nrp to a
+            // known non-default value (use lag 77).
+            let mut warmup = UnpackedFrame::default();
+            for sf in &mut warmup.sub {
+                sf.n_c = 77;
+            }
+            let _ = dec.decode_frame(&warmup);
+            assert_eq!(dec.nrp, 77, "warm-up sets nrp = 77");
+
+            // Now a frame whose first sub-frame carries the candidate
+            // Nc; the other sub-frames stay at a valid lag.
+            let mut f = UnpackedFrame::default();
+            f.sub[0].n_c = nc;
+            for sf in &mut f.sub[1..] {
+                sf.n_c = 60;
+            }
+            // Must not panic (the OOB-index guard) and must shape output.
+            let out = dec.decode_frame(&f);
+            for s in out {
+                assert_eq!(s & 0b111, 0, "§5.3.7 shaping holds for Nc = {nc}");
+            }
+            // The standing lag after sub-frame 0: in range ⇒ nc itself;
+            // out of range ⇒ the warm-up nrp (77) carried through.
+            // (Sub-frames 1..=3 then overwrite nrp with 60, so we re-run
+            // a single-sub-frame check to isolate sub-frame 0's effect.)
+            let mut dec2 = DecoderState::new();
+            let mut warm2 = UnpackedFrame::default();
+            for sf in &mut warm2.sub {
+                sf.n_c = 77;
+            }
+            let _ = dec2.decode_frame(&warm2);
+            let mut probe = UnpackedFrame::default();
+            probe.sub[0].n_c = nc;
+            // Leave sub-frames 1..=3 at the same Nc so nrp reflects the
+            // last sub-frame's decision; but to isolate sub-frame 0 we
+            // only assert via lt_synthesis on sub-frame 0 directly.
+            let erp = [0i16; SUBFRAME_SAMPLES];
+            let _ = dec2.lt_synthesis(&probe.sub[0], &erp);
+            let expect = if (40..=120).contains(&(nc as i16)) {
+                nc as i16
+            } else {
+                77
+            };
+            assert_eq!(
+                dec2.nrp, expect,
+                "Nc = {nc}: out-of-range must reuse previous lag (77), in-range uses Nc"
+            );
+        }
+    }
+
     /// Decode is deterministic — feeding the same frame to two
     /// freshly-homed decoders yields the same 160 samples.
     #[test]

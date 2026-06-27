@@ -93,6 +93,15 @@
 //! different per-container framing that is **not** specified in
 //! EN 300 961 itself — those wrappers will be addressed in a
 //! follow-up round once trace docs for them are staged.
+//!
+//! Separately, the ETSI §6 *conformance test sequences* use a
+//! **word-oriented** on-disk format (each parameter in its own
+//! 16-bit word, the §6.1 Table 6.1 justification rules). That format
+//! is handled by the [`confio`] module: [`unpacked_to_cod_words`] /
+//! [`cod_words_to_unpacked`] and the `*.COD` / `*.INP` / `*.OUT`
+//! byte converters. It is the counterpart to [`bitstream`]'s packed
+//! 260-bit in-band stream, for reading/writing the `*.INP`/`*.COD`/
+//! `*.OUT` reference files once they are staged.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -101,6 +110,7 @@ pub mod arith;
 pub mod bitstream;
 pub mod codec;
 pub mod comfort_noise;
+pub mod confio;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
@@ -113,6 +123,12 @@ pub use comfort_noise::{
     comfort_noise_frame, ComfortNoiseGenerator, DtxReceiver, DtxState, NoiseEvaluator,
     NoiseFrameParameters, NoiseRng, RxFrame, SidInterpolator, SidParameters, COMFORT_NOISE_NCR,
     DEFAULT_INTERPOLATION_FRAMES, NOISE_EVAL_FRAMES,
+};
+pub use confio::{
+    cod_bytes_be_to_unpacked, cod_bytes_le_to_unpacked, cod_words_to_unpacked, inp_bytes_le_to_pcm,
+    pcm_to_inp_bytes_le, unpacked_to_cod_bytes_be, unpacked_to_cod_bytes_le, unpacked_to_cod_words,
+    COD_BYTES_PER_FRAME, COD_FIELD_WIDTHS, COD_WORDS_PER_FRAME, PCM_BYTES_PER_FRAME,
+    PCM_WORDS_PER_FRAME,
 };
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
