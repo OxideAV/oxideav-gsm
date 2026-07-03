@@ -1,5 +1,7 @@
 # oxideav-gsm
 
+[![CI](https://github.com/OxideAV/oxideav-gsm/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-gsm/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-gsm.svg)](https://crates.io/crates/oxideav-gsm) [![docs.rs](https://docs.rs/oxideav-gsm/badge.svg)](https://docs.rs/oxideav-gsm) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **GSM 06.10 RPE-LTP** speech codec — the original 13 kbit/s GSM
 Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 
