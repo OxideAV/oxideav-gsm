@@ -636,6 +636,40 @@ decides *when* a SID is emitted (GSM 06.31). The transmit side
 therefore stops at the §5.1 parameter mean ([`SidParameters`]) rather
 than packing a SID bitstream.
 
+## Robustness & round-trip quality gates
+
+Four test suites harden every untrusted-input surface and pin the
+whole-codec fidelity that a spec-level regression would break:
+
+* **`tests/robustness_decode.rs`** — no-panic / §5.3.7-output-shaping
+  fuzz over every byte surface that reaches the §5.3 decoder: the §1.7
+  packed 260-bit stream, the §6.1 word-oriented `*.COD` words, and both
+  little- and big-endian `*.COD` byte parsers, plus the `make_decoder`
+  registry adapter. Sweeps every `Nc ∈ 0..=127` in each sub-frame (the
+  §5.3.2 out-of-range-lag limit check), every `xmaxc ∈ 0..=63` (§5.3.1
+  APCM inverse `exp`/`mant` derivation), every `(Mc, bc)`, and extreme
+  LARc codewords, confirming the pipeline saturates rather than
+  indexing out of bounds.
+* **`tests/roundtrip_quality.rs`** — six speech-band signal classes
+  (tones, two-tone, AM tone, decaying bursts) each round-tripped
+  encode→decode and gated on a per-class segmental-SNR floor set below
+  the correct fixed-point pipeline and far above any mis-wired one.
+  Because the codec is pure integer arithmetic the floors are hard, not
+  statistical. Also pins determinism, §1.7 bitstream transparency, and
+  the silence noise floor (the 3-bit RPE code has no exact-zero level —
+  §5.2.16 sign-restores to the odd integers ±1..±7 — so silence settles
+  to a bounded ≈±16 floor, not to zero).
+* **`tests/dtx_robustness.rs`** — long random speech/SID/no-data
+  streams through the §6 [`DtxReceiver`]: no-panic + shaping on every
+  dispatch (including hostile out-of-range SID parameters), the §6
+  two-state-machine transitions, §6.1 generator determinism, and
+  `reset()` history-independence.
+* **`tests/encoder_robustness.rs`** — the §5.2 encoder's PCM-input
+  surface: extreme amplitudes (`i16::MIN`/`MAX`, max-slew) drive the
+  §5.2.4 / §5.2.11 `abs(i16::MIN)` saturation path; the `make_encoder`
+  adapter's rebuffering conserves samples (packet count
+  `= ceil(total/160)`, pts `+160`/packet) and rejects malformed input.
+
 ## Public API
 
 Two API tiers (the workspace's dual-API convention):
