@@ -266,6 +266,144 @@ pub const GSM_BYTE_FRAME_LEN: usize = 33;
 /// de-facto `.gsm` byte-frame.
 pub const GSM_BYTE_FRAME_MAGIC: u8 = 0xD;
 
+/// Length in bytes of one MS-GSM block: two 260-bit frames packed
+/// back-to-back = 520 bits = 65 bytes exactly.
+pub const MSGSM_BLOCK_LEN: usize = 65;
+
+/// PCM samples carried by one MS-GSM block (two 160-sample frames).
+pub const MSGSM_BLOCK_SAMPLES: usize = 2 * FRAME_SAMPLES;
+
+impl UnpackedFrame {
+    /// Decode the two frames of one MS-GSM 65-byte block — the
+    /// packaging WAVE format tag `0x0031` uses (`wBlockAlign` = 65,
+    /// 320 samples per block).
+    ///
+    /// Layout (derived **empirically** from black-box validator
+    /// output, parameter-for-parameter against this crate's §5.2
+    /// encoder over hundreds of blocks — see
+    /// `tests/blackbox_fixtures.rs`): the 76 Table 1.1 parameters of
+    /// frame A, then those of frame B, with **no** marker nibble;
+    /// every field is packed LSB-first, and bits fill each byte
+    /// starting at its **least**-significant bit (little-endian bit
+    /// order — the opposite byte-filling direction from the `.gsm`
+    /// byte-frame). 2 × 260 bits fill the 65 bytes exactly, so frame
+    /// B starts mid-byte: its first bit is bit 4 of byte 32.
+    ///
+    /// Returns [`Error::ShortFrame`] when `bytes.len() < 65`.
+    pub fn pair_from_msgsm_block(bytes: &[u8]) -> Result<(Self, Self), Error> {
+        if bytes.len() < MSGSM_BLOCK_LEN {
+            return Err(Error::ShortFrame);
+        }
+        let mut r = LsbBitReader::new(bytes);
+        let a = r.read_frame();
+        debug_assert_eq!(r.bit_pos, FRAME_BITS);
+        let b = r.read_frame();
+        debug_assert_eq!(r.bit_pos, 2 * FRAME_BITS);
+        Ok((a, b))
+    }
+
+    /// Pack two frames into one MS-GSM 65-byte block — the exact
+    /// mirror of [`Self::pair_from_msgsm_block`].
+    pub fn pair_to_msgsm_block(a: &Self, b: &Self) -> [u8; MSGSM_BLOCK_LEN] {
+        let mut w = LsbBitWriter::new();
+        w.write_frame(a);
+        debug_assert_eq!(w.bit_pos, FRAME_BITS);
+        w.write_frame(b);
+        debug_assert_eq!(w.bit_pos, 2 * FRAME_BITS);
+        w.bytes
+    }
+}
+
+/// Little-endian bit reader for the MS-GSM block layout: bit 0 of
+/// byte 0 is the first bit of the stream, fields are LSB-first.
+struct LsbBitReader<'a> {
+    bytes: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> LsbBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit_pos: 0 }
+    }
+
+    fn read(&mut self, n: u8) -> u32 {
+        debug_assert!(n <= 16);
+        let mut out: u32 = 0;
+        for i in 0..n {
+            let byte_idx = self.bit_pos / 8;
+            let bit = if byte_idx < self.bytes.len() {
+                (self.bytes[byte_idx] >> (self.bit_pos % 8)) & 1
+            } else {
+                0
+            };
+            out |= (bit as u32) << i;
+            self.bit_pos += 1;
+        }
+        out
+    }
+
+    /// One 260-bit frame's worth of Table 1.1 parameters.
+    fn read_frame(&mut self) -> UnpackedFrame {
+        let mut f = UnpackedFrame::default();
+        let lar_widths: [u8; 8] = [6, 6, 5, 5, 4, 4, 3, 3];
+        for (i, &w) in lar_widths.iter().enumerate() {
+            f.lar_c[i + 1] = self.read(w) as i16;
+        }
+        for sf in f.sub.iter_mut() {
+            sf.n_c = self.read(7) as u8;
+            sf.b_c = self.read(2) as u8;
+            sf.m_c = self.read(2) as u8;
+            sf.xmax_c = self.read(6) as u8;
+            for slot in sf.x_mc.iter_mut() {
+                *slot = self.read(3) as u8;
+            }
+        }
+        f
+    }
+}
+
+/// Little-endian bit writer mirroring [`LsbBitReader`].
+struct LsbBitWriter {
+    bytes: [u8; MSGSM_BLOCK_LEN],
+    bit_pos: usize,
+}
+
+impl LsbBitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: [0u8; MSGSM_BLOCK_LEN],
+            bit_pos: 0,
+        }
+    }
+
+    fn write(&mut self, v: u32, n: u8) {
+        debug_assert!(n <= 16);
+        debug_assert_eq!(v >> n, 0, "codeword exceeds its field width");
+        for i in 0..n {
+            if (v >> i) & 1 != 0 {
+                self.bytes[self.bit_pos / 8] |= 1 << (self.bit_pos % 8);
+            }
+            self.bit_pos += 1;
+        }
+    }
+
+    fn write_frame(&mut self, f: &UnpackedFrame) {
+        let lar_widths: [u8; 8] = [6, 6, 5, 5, 4, 4, 3, 3];
+        for (i, &width) in lar_widths.iter().enumerate() {
+            self.write(f.lar_c[i + 1] as u32, width);
+        }
+        for sf in &f.sub {
+            self.write(sf.n_c as u32, 7);
+            self.write(sf.b_c as u32, 2);
+            self.write(sf.m_c as u32, 2);
+            self.write(sf.xmax_c as u32, 6);
+            for &pulse in &sf.x_mc {
+                self.write(pulse as u32, 3);
+            }
+        }
+    }
+}
+
 /// Bit-stream reader over a byte buffer holding `b1..bN` packed
 /// MSB-first (`b1` is the most-significant bit of `bytes[0]`).
 ///
@@ -648,6 +786,88 @@ mod tests {
         ));
         assert!(matches!(
             UnpackedFrame::from_gsm_byte_frame(&[0xD0; 32]),
+            Err(Error::ShortFrame)
+        ));
+    }
+
+    // ─── MS-GSM 65-byte block ───
+
+    /// Two all-zero frames pack to 65 zero bytes (no marker nibble in
+    /// this layout).
+    #[test]
+    fn msgsm_all_zero_block_is_all_zero_bytes() {
+        let z = UnpackedFrame::default();
+        assert_eq!(
+            UnpackedFrame::pair_to_msgsm_block(&z, &z),
+            [0u8; MSGSM_BLOCK_LEN]
+        );
+    }
+
+    /// Bit-order pins: the stream starts at bit 0 of byte 0
+    /// (little-endian bit order), and frame B starts at bit 260 =
+    /// byte 32, bit 4.
+    #[test]
+    fn msgsm_bit_order_and_frame_b_offset() {
+        let z = UnpackedFrame::default();
+        let mut a = UnpackedFrame::default();
+        a.lar_c[1] = 1;
+        let bytes = UnpackedFrame::pair_to_msgsm_block(&a, &z);
+        assert_eq!(bytes[0], 0x01, "frame A LARc[1] LSB = byte 0 bit 0");
+        assert_eq!(bytes[1..], [0u8; MSGSM_BLOCK_LEN - 1]);
+
+        let bytes = UnpackedFrame::pair_to_msgsm_block(&z, &a);
+        assert_eq!(bytes[32], 0x10, "frame B LARc[1] LSB = byte 32 bit 4");
+        assert_eq!(bytes[..32], [0u8; 32]);
+        assert_eq!(bytes[33..], [0u8; MSGSM_BLOCK_LEN - 33]);
+    }
+
+    /// pack ∘ unpack = identity on a patterned frame pair.
+    #[test]
+    fn msgsm_roundtrip_patterned_pair() {
+        let a = patterned_frame();
+        let mut b = patterned_frame();
+        b.lar_c[3] = 7;
+        b.sub[2].x_mc[5] = 6;
+        let bytes = UnpackedFrame::pair_to_msgsm_block(&a, &b);
+        let (ra, rb) = UnpackedFrame::pair_from_msgsm_block(&bytes).unwrap();
+        assert_eq!(ra, a);
+        assert_eq!(rb, b);
+    }
+
+    /// unpack ∘ pack = byte identity over LCG-random blocks (all 520
+    /// payload bits exercised).
+    #[test]
+    fn msgsm_unpack_pack_roundtrip_bytes() {
+        let mut seed: u32 = 0x5EED_CAFE;
+        for round in 0..8 {
+            let mut bytes = [0u8; MSGSM_BLOCK_LEN];
+            for b in bytes.iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *b = (seed >> 24) as u8;
+            }
+            let (a, b) = UnpackedFrame::pair_from_msgsm_block(&bytes).unwrap();
+            let repacked = UnpackedFrame::pair_to_msgsm_block(&a, &b);
+            assert_eq!(bytes, repacked, "byte roundtrip failed on round {round}");
+        }
+    }
+
+    /// The MS-GSM block and the other packings carry the same
+    /// parameters.
+    #[test]
+    fn msgsm_equivalent_to_other_packings() {
+        let f = patterned_frame();
+        let bytes = UnpackedFrame::pair_to_msgsm_block(&f, &f);
+        let (a, b) = UnpackedFrame::pair_from_msgsm_block(&bytes).unwrap();
+        let c = UnpackedFrame::from_bit_stream_msb_first(&f.to_bit_stream_msb_first()).unwrap();
+        assert_eq!(a, c);
+        assert_eq!(b, c);
+    }
+
+    /// Length enforcement.
+    #[test]
+    fn msgsm_rejects_short_input() {
+        assert!(matches!(
+            UnpackedFrame::pair_from_msgsm_block(&[0u8; 64]),
             Err(Error::ShortFrame)
         ));
     }

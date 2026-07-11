@@ -33,7 +33,7 @@
 //!   known to disagree with the reference decode (see the fixtures
 //!   README); the digest pinned here is the reference decoder's.
 
-use oxideav_gsm::{DecoderState, EncoderState, UnpackedFrame, GSM_BYTE_FRAME_LEN};
+use oxideav_gsm::{DecoderState, EncoderState, UnpackedFrame, GSM_BYTE_FRAME_LEN, MSGSM_BLOCK_LEN};
 
 const FRAME: usize = 160;
 
@@ -245,6 +245,153 @@ fn decoder_sample_exact_blackbox_rand() {
     let pcm = decode_all(include_bytes!("fixtures/blackbox_rand.gsm"));
     assert_eq!(pcm.len(), 300 * FRAME);
     assert_eq!(fnv1a64_pcm(&pcm), 0x9F59_2FC0_68F4_C105);
+}
+
+// ─── MS-GSM: same black-box encoder, 65-byte two-frame blocks ───
+
+fn encode_all_msgsm(pcm: &[i16]) -> Vec<u8> {
+    let mut enc = EncoderState::new();
+    let mut out = Vec::with_capacity(pcm.len() / (2 * FRAME) * MSGSM_BLOCK_LEN);
+    for pair in pcm.chunks_exact(2 * FRAME) {
+        let mut buf_a = [0i16; FRAME];
+        let mut buf_b = [0i16; FRAME];
+        buf_a.copy_from_slice(&pair[..FRAME]);
+        buf_b.copy_from_slice(&pair[FRAME..]);
+        let a = enc.encode_frame(&buf_a);
+        let b = enc.encode_frame(&buf_b);
+        out.extend_from_slice(&UnpackedFrame::pair_to_msgsm_block(&a, &b));
+    }
+    out
+}
+
+fn decode_all_msgsm(blocks: &[u8]) -> Vec<i16> {
+    let mut dec = DecoderState::new();
+    let mut out = Vec::with_capacity(blocks.len() / MSGSM_BLOCK_LEN * 2 * FRAME);
+    for blk in blocks.chunks_exact(MSGSM_BLOCK_LEN) {
+        let (a, b) = UnpackedFrame::pair_from_msgsm_block(blk).expect("block must parse");
+        out.extend_from_slice(&dec.decode_frame(&a));
+        out.extend_from_slice(&dec.decode_frame(&b));
+    }
+    out
+}
+
+/// The MS-GSM fixtures are the same black-box encoder's output for
+/// the same PCM programs, repackaged by its WAVE (format tag 0x0031)
+/// writer into 65-byte blocks. Our encoder + `pair_to_msgsm_block`
+/// must reproduce them byte-for-byte — pinning both the §5.2 chain
+/// and the empirically-derived block layout (LSB-first fields,
+/// little-endian bit order, frame B starting at bit 260).
+#[test]
+fn encoder_bit_exact_blackbox_msgsm() {
+    for (name, pcm, fixture) in [
+        (
+            "quiet",
+            gen_amp(200, 1024, 512),
+            &include_bytes!("fixtures/blackbox_quiet.msgsm")[..],
+        ),
+        (
+            "loud",
+            gen_amp(200, 8192, 2048),
+            &include_bytes!("fixtures/blackbox_loud.msgsm")[..],
+        ),
+        (
+            "hostile",
+            gen_hostile(),
+            &include_bytes!("fixtures/blackbox_hostile.msgsm")[..],
+        ),
+        (
+            "rand",
+            gen_rand(),
+            &include_bytes!("fixtures/blackbox_rand.msgsm")[..],
+        ),
+    ] {
+        let ours = encode_all_msgsm(&pcm);
+        assert_eq!(ours.len(), fixture.len(), "{name}: length");
+        for (i, (a, b)) in ours
+            .chunks_exact(MSGSM_BLOCK_LEN)
+            .zip(fixture.chunks_exact(MSGSM_BLOCK_LEN))
+            .enumerate()
+        {
+            assert_eq!(a, b, "{name}: MS-GSM block {i} differs");
+        }
+    }
+}
+
+/// The MS-GSM blocks carry the identical parameter streams as the
+/// `.gsm` fixtures, so decoding them must reproduce the identical
+/// reference PCM (same digests, independently confirmed against the
+/// reference decoder's WAVE output at minting time).
+#[test]
+fn decoder_sample_exact_blackbox_msgsm() {
+    for (name, frames, fixture, digest) in [
+        (
+            "quiet",
+            200usize,
+            &include_bytes!("fixtures/blackbox_quiet.msgsm")[..],
+            0x645C_67C8_EECD_64A5u64,
+        ),
+        (
+            "loud",
+            200,
+            &include_bytes!("fixtures/blackbox_loud.msgsm")[..],
+            0x88FA_3B64_F1F8_CA3C,
+        ),
+        (
+            "hostile",
+            40,
+            &include_bytes!("fixtures/blackbox_hostile.msgsm")[..],
+            0xA084_5E7B_5CF2_1871,
+        ),
+        (
+            "rand",
+            300,
+            &include_bytes!("fixtures/blackbox_rand.msgsm")[..],
+            0x9F59_2FC0_68F4_C105,
+        ),
+    ] {
+        let pcm = decode_all_msgsm(fixture);
+        assert_eq!(pcm.len(), frames * FRAME, "{name}: sample count");
+        assert_eq!(fnv1a64_pcm(&pcm), digest, "{name}: PCM digest");
+    }
+}
+
+/// Cross-packaging consistency: each MS-GSM fixture block carries the
+/// same two frames as the corresponding pair of `.gsm` fixture
+/// frames.
+#[test]
+fn msgsm_fixtures_carry_same_parameters_as_gsm_fixtures() {
+    for (name, gsm, msgsm) in [
+        (
+            "quiet",
+            &include_bytes!("fixtures/blackbox_quiet.gsm")[..],
+            &include_bytes!("fixtures/blackbox_quiet.msgsm")[..],
+        ),
+        (
+            "loud",
+            &include_bytes!("fixtures/blackbox_loud.gsm")[..],
+            &include_bytes!("fixtures/blackbox_loud.msgsm")[..],
+        ),
+        (
+            "hostile",
+            &include_bytes!("fixtures/blackbox_hostile.gsm")[..],
+            &include_bytes!("fixtures/blackbox_hostile.msgsm")[..],
+        ),
+        (
+            "rand",
+            &include_bytes!("fixtures/blackbox_rand.gsm")[..],
+            &include_bytes!("fixtures/blackbox_rand.msgsm")[..],
+        ),
+    ] {
+        let frames: Vec<UnpackedFrame> = gsm
+            .chunks_exact(GSM_BYTE_FRAME_LEN)
+            .map(|fb| UnpackedFrame::from_gsm_byte_frame(fb).unwrap())
+            .collect();
+        for (i, blk) in msgsm.chunks_exact(MSGSM_BLOCK_LEN).enumerate() {
+            let (a, b) = UnpackedFrame::pair_from_msgsm_block(blk).unwrap();
+            assert_eq!(a, frames[2 * i], "{name} block {i} frame A");
+            assert_eq!(b, frames[2 * i + 1], "{name} block {i} frame B");
+        }
+    }
 }
 
 // ─── Container sanity over the fixture corpus ───

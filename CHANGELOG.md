@@ -31,6 +31,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **MS-GSM 65-byte block support (2026-07-11).**
+  `UnpackedFrame::pair_to_msgsm_block` / `pair_from_msgsm_block`
+  implement the two-frame packaging the WAVE format tag `0x0031`
+  carries (`wBlockAlign` = 65, 320 samples per block): the 76
+  Table 1.1 parameters of frame A then frame B, no marker nibble,
+  every field LSB-first, bits filling each byte from its least-
+  significant bit (little-endian bit order), frame B starting
+  mid-byte at bit 260. Derived empirically the same way as the
+  `.gsm` byte-frame (black-box candidate-layout parsing, 740 frames
+  parameter-exact) and pinned by four `.msgsm` fixture streams:
+  encoder byte-exact per block, decoder digest-exact against the
+  independent reference decode, and cross-packaging equality with
+  the `.gsm` fixtures. New `MSGSM_BLOCK_LEN` / `MSGSM_BLOCK_SAMPLES`
+  constants; 6 unit tests + 3 fixture tests.
+
 - **De-facto `.gsm` 33-byte byte-frame support (2026-07-11).**
   `UnpackedFrame::to_gsm_byte_frame` / `from_gsm_byte_frame` implement
   the byte layout raw `.gsm` files use in the wild: a constant `0xD`

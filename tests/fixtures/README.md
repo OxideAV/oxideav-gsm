@@ -41,5 +41,25 @@ Cross-checks performed when the fixtures were minted:
   saturation-heavy frames — two independent implementations against
   one, so the reference digest is the one pinned.
 
+## MS-GSM (`.msgsm`)
+
+`blackbox_*.msgsm` are the **same encoder's** output for the same PCM
+programs, written through its WAVE writer with the MS-GSM encoding
+(format tag `0x0031`, `wBlockAlign` = 65, 320 samples/block), with the
+RIFF framing stripped — the files hold the raw 65-byte two-frame
+blocks of the `data` chunk only:
+
+```sh
+sox -t raw -r 8000 -e signed -b 16 -c 1 <name>.raw -e gsm-full-rate blackbox_<name>_ms.wav
+# then extract the data chunk payload
+```
+
+Cross-checks at minting time: the blocks carry parameter streams
+identical to the corresponding `.gsm` fixtures (pinned by
+`msgsm_fixtures_carry_same_parameters_as_gsm_fixtures`), and both
+`sox` and `ffmpeg` (the `gsm_ms` decoder) decode the WAVE files to
+PCM identical to our decode — except `ffmpeg` on `rand`, the same
+saturation-heavy divergence as the `.gsm` case.
+
 These files are validator *outputs* (transcodes of our own generated
 test signals), not third-party media.
