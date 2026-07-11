@@ -287,11 +287,13 @@ fn seq04_ltp_opt_scaling_includes_sample_39() {
 /// sequence to reach.
 #[test]
 fn seq06_table_6_6_autocorrelation_smax_zero_path() {
-    let s = [0i16; 160];
-    let l_acf = autocorrelation(&s);
+    let mut s = [0i16; 160];
+    let l_acf = autocorrelation(&mut s);
     for (k, v) in l_acf.iter().enumerate() {
         assert_eq!(*v, 0, "smax == 0 path: L_ACF[{k}] must be 0");
     }
+    // smax == 0 ⇒ scalauto = 0 ⇒ the §5.2.4 rescale leaves s alone.
+    assert_eq!(s, [0i16; 160]);
 }
 
 /// Table 6.6 — §5.2.5 `L_ACF[0] == 0` path. When the autocorrelation
@@ -307,7 +309,7 @@ fn seq06_table_6_6_schur_l_acf0_zero_path() {
     }
     // And end-to-end: an all-zero frame (smax == 0 ⇒ L_ACF[0] == 0)
     // exercises both Table 6.6 paths in series.
-    let l_acf2 = autocorrelation(&[0i16; 160]);
+    let l_acf2 = autocorrelation(&mut [0i16; 160]);
     assert_eq!(l_acf2[0], 0);
     let r2 = reflection_coefficients(&l_acf2);
     for v in r2 {

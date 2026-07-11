@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **§5.2.4 "Rescaling of the array s[0..159]" conformance fix
+  (2026-07-11).** The clause's closing step — `s[k] = s[k] <<
+  scalauto` applied to the `mult_r`-downscaled array — is a *lossy*
+  round-trip (the low `scalauto` bits of every sample are rounded
+  away), and the spec's pipeline hands exactly this round-tripped
+  `s[]` to the §5.2.10 short-term analysis filter. The encoder was
+  running §5.2.10 on the pristine §5.2.3 output instead, so encoded
+  parameters deviated from the bit-exact contract whenever the
+  §5.2.4 dynamic scaling engaged (`smax >= 2048`, i.e. any input
+  louder than ~1/16 of full scale). Quiet material was unaffected —
+  which is why every existing test kept passing. Found by black-box
+  byte-exact comparison against an independent encoder binary; after
+  the fix the encoder is parameter-for-parameter identical to it on
+  every stream tried (5 460 frames: quiet/mid/loud sweeps, hostile
+  full-scale/max-slew/impulse extremes, and clipped random noise).
+  `analysis::autocorrelation` now takes `&mut s` and applies the
+  clause's full scale → L_ACF → rescale sequence in place (the
+  rescale saturates per the §5.1 left shift at the `32767 →
+  mult_r → 2048 << 4` edge); `Analyzer::analyse_frame` feeds the
+  rescaled array to the lattice. 3 new regression tests pin the
+  round-trip arithmetic, the saturation edge, and the
+  rescaled-s-into-§5.2.10 pipeline wiring.
+
 ### Added
 
 - **§5.1 non-valid-bit robustness pins (2026-06-28).** §5.1 requires

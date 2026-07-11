@@ -661,17 +661,23 @@ pub mod analysis {
     /// ```
     ///
     /// The §5.2.4 "Rescaling of the array s[0..159]" step at the end
-    /// of the spec restores `s[]` to its pre-scaling magnitude — the
-    /// scaling exists purely to keep the inner-product accumulator
-    /// from overflowing. Since this helper takes `s` by value (a
-    /// fixed 160-sample array), the upscale step is a no-op for the
-    /// caller and is omitted. Callers who need the §5.2.10 short-term
-    /// analysis filter input simply pass the unscaled `s` array
-    /// returned by [`PreProcessor::process_frame`].
-    pub fn autocorrelation(s_in: &[i16; FRAME_SAMPLES]) -> [i32; 9] {
+    /// of the spec is **not** a lossless restore: the down-scaling is
+    /// `mult_r(s[k], 16384 >> (scalauto-1))` — a *rounding* divide —
+    /// and the rescale is `s[k] << scalauto` applied to the rounded
+    /// value, so whenever `scalauto > 0` the low `scalauto` bits of
+    /// every sample are quantised away (e.g. `scalauto = 1` maps 4097
+    /// → 2049 → 4098). The spec's pipeline hands exactly this
+    /// round-tripped `s[]` to the §5.2.10 short-term analysis filter,
+    /// so the rescale is part of the encoder's bit-exact contract,
+    /// not an implementation detail. This helper therefore mutates
+    /// `s` in place with the full scale → L_ACF → rescale sequence,
+    /// mirroring the clause: on return `s` holds the §5.2.4-rescaled
+    /// array the §5.2.10 lattice must consume (unchanged when
+    /// `scalauto <= 0`).
+    pub fn autocorrelation(s: &mut [i16; FRAME_SAMPLES]) -> [i32; 9] {
         // §5.2.4 — search for smax = max |s[k]|.
         let mut smax: i16 = 0;
-        for &v in s_in.iter() {
+        for &v in s.iter() {
             let t = abs(v);
             if t > smax {
                 smax = t;
@@ -691,13 +697,8 @@ pub mod analysis {
             sub(4, norm((smax as i32) << 16))
         };
 
-        // §5.2.4 — scale s[] if scalauto > 0.
-        //
-        // We work in a local mutable buffer so the caller's `s_in`
-        // isn't disturbed; the §5.2.4 "Rescaling" step at the end of
-        // the spec restores s[] for the next analysis pass anyway, so
-        // the net effect on `s_in` is zero.
-        let mut s = *s_in;
+        // §5.2.4 — scale s[] if scalauto > 0 (in place, per the
+        // clause: the spec's s[0..159] is shared pipeline state).
         if scalauto > 0 {
             // §5.2.4: `temp = 16384 >> sub(scalauto, 1)` — this gives
             // 2^(15 - scalauto). For scalauto=1 we get 16384 (the
@@ -720,6 +721,20 @@ pub mod analysis {
                 acc = l_add(acc, l_temp);
             }
             l_acf[k] = acc;
+        }
+
+        // §5.2.4 — "Rescaling of the array s[0..159]": s[k] = s[k] <<
+        // scalauto. The shift is the §5.1 saturating 16-bit left
+        // shift (the rounding in the down-scaling step can round a
+        // full-scale sample up so that the shift-back would land on
+        // +32768, e.g. 32767 → mult_r(·, 2048) = 2048 → 2048 << 4;
+        // §5.1 semantics clamp that to 32767). The rescaled s[] —
+        // with its low `scalauto` bits round-tripped away — is the
+        // array the §5.2.10 short-term analysis filter consumes.
+        if scalauto > 0 {
+            for slot in s.iter_mut() {
+                *slot = shl_signed(*slot, scalauto);
+            }
         }
 
         l_acf
@@ -898,8 +913,16 @@ pub mod analysis {
     /// Convenience wrapper: run §5.2.4 + §5.2.5 + §5.2.6 end-to-end
     /// on a pre-processed frame `s[0..159]` and return the per-frame
     /// `LAR[1..=8]` array the §5.2.7 quantiser consumes.
+    ///
+    /// The §5.2.4 rescale side effect (see [`autocorrelation`]) is
+    /// applied to an internal copy and discarded — the LAR outputs
+    /// depend only on `L_ACF[..]`, not on the rescaled `s[]`. Callers
+    /// running the *full* §5.2 pipeline must feed the §5.2.10 lattice
+    /// the rescaled array; [`Analyzer::analyse_frame`] does exactly
+    /// that.
     pub fn analyse_frame(s: &[i16; FRAME_SAMPLES]) -> [i16; 9] {
-        let l_acf = autocorrelation(s);
+        let mut s_work = *s;
+        let l_acf = autocorrelation(&mut s_work);
         let r = reflection_coefficients(&l_acf);
         reflection_to_lar(&r)
     }
@@ -1086,8 +1109,10 @@ pub mod analysis {
         ///
         /// The pipeline matches the §5.2 "encoder loop" outline:
         ///
-        /// 1. §5.2.4..§5.2.7 — autocorrelation, Schur, LAR, quantise
-        ///    + code into `LARc[1..=8]`.
+        /// 1. §5.2.4..§5.2.7 — autocorrelation (including the §5.2.4
+        ///    scale → rescale round-trip of `s[]` that engages when
+        ///    `scalauto > 0`), Schur, LAR, quantise + code into
+        ///    `LARc[1..=8]`.
         /// 2. §5.2.8 — decode the `LARc[1..=8]` back into the
         ///    `LARpp(j)[1..=8]` set the **decoder** will see, so
         ///    encoder and decoder run on bit-identical reflection
@@ -1096,9 +1121,10 @@ pub mod analysis {
         ///    13..=26, 27..=39, 40..=159) compute `LARp` by
         ///    interpolating `LARpp(j-1)` and `LARpp(j)`.
         /// 4. §5.2.9.2 — convert each `LARp` into `rp[1..=8]`.
-        /// 5. §5.2.10 — run the 8-stage lattice on
-        ///    `s[k_start..=k_end]` using that block's `rp`,
-        ///    persisting `u[0..=7]` across blocks and frames.
+        /// 5. §5.2.10 — run the 8-stage lattice on the
+        ///    §5.2.4-rescaled `s[k_start..=k_end]` using that
+        ///    block's `rp`, persisting `u[0..=7]` across blocks and
+        ///    frames.
         ///
         /// After the four blocks complete, `LARpp(j-1)` is updated
         /// to the current frame's `LARpp(j)` per the §5.2.9.1
@@ -1107,8 +1133,22 @@ pub mod analysis {
             &mut self,
             s: &[i16; FRAME_SAMPLES],
         ) -> ([i16; 9], [i16; FRAME_SAMPLES]) {
-            // §5.2.4..§5.2.7 — produce LARc[1..=8].
-            let lar_c = analyse_and_quantise_frame(s);
+            // §5.2.4 — autocorrelation, mutating the working copy of
+            // s[] with the clause's scale → L_ACF → rescale sequence.
+            // Whenever the dynamic scaling engages (scalauto > 0) the
+            // rescaled array differs from the §5.2.3 input in its low
+            // `scalauto` bits, and it is THIS array the §5.2.10
+            // short-term analysis filter must consume (the spec's
+            // s[0..159] is shared pipeline state across §5.2.4 →
+            // §5.2.10).
+            let mut s_work = *s;
+            let l_acf = autocorrelation(&mut s_work);
+
+            // §5.2.5..§5.2.7 — reflection coefficients → LAR →
+            // LARc[1..=8].
+            let r = reflection_coefficients(&l_acf);
+            let lar = reflection_to_lar(&r);
+            let lar_c = quantise_lar(&lar);
 
             // §5.2.8 — decode LARc[..] → LARpp(j)[..], the same set
             // the receiver will see.
@@ -1126,8 +1166,9 @@ pub mod analysis {
                 let lar_p = interpolate_lar(&self.lar_pp_prev, &lar_pp_curr, block_id);
                 // §5.2.9.2 — LARp → rp.
                 let rp = larp_to_rp(&lar_p);
-                // §5.2.10 — short-term analysis filter for this block.
-                let d_block = short_term_analysis_filter(s, &rp, &mut self.u, k_start, k_end);
+                // §5.2.10 — short-term analysis filter for this
+                // block, over the §5.2.4-rescaled s[].
+                let d_block = short_term_analysis_filter(&s_work, &rp, &mut self.u, k_start, k_end);
                 d_frame[k_start..=k_end].copy_from_slice(&d_block[k_start..=k_end]);
             }
 
@@ -2148,8 +2189,8 @@ pub mod analysis {
         /// `smax == 0` branch sets `scalauto = 0`, so no scaling.
         #[test]
         fn autocorrelation_zero_input() {
-            let s = [0i16; FRAME_SAMPLES];
-            let l_acf = autocorrelation(&s);
+            let mut s = [0i16; FRAME_SAMPLES];
+            let l_acf = autocorrelation(&mut s);
             for v in l_acf {
                 assert_eq!(v, 0);
             }
@@ -2164,7 +2205,7 @@ pub mod analysis {
         fn autocorrelation_single_sample_is_l_mult_squared() {
             let mut s = [0i16; FRAME_SAMPLES];
             s[0] = 100;
-            let l_acf = autocorrelation(&s);
+            let l_acf = autocorrelation(&mut s);
             assert_eq!(l_acf[0], 20000);
             for k in 1..=8 {
                 assert_eq!(l_acf[k], 0, "L_ACF[{k}] must be 0");
@@ -2181,7 +2222,7 @@ pub mod analysis {
             let mut s = [0i16; FRAME_SAMPLES];
             s[0] = 100;
             s[1] = 100;
-            let l_acf = autocorrelation(&s);
+            let l_acf = autocorrelation(&mut s);
             // L_ACF[0] = L_mult(100,100) + L_mult(100,100) = 40000.
             assert_eq!(l_acf[0], 40000);
             // L_ACF[1] = L_mult(s[1],s[0]) = 20000.
@@ -2201,8 +2242,8 @@ pub mod analysis {
         /// L_ACF[0] thus is bounded well below i32::MAX.
         #[test]
         fn autocorrelation_dynamic_scaling_avoids_overflow() {
-            let s = [16384i16; FRAME_SAMPLES];
-            let l_acf = autocorrelation(&s);
+            let mut s = [16384i16; FRAME_SAMPLES];
+            let l_acf = autocorrelation(&mut s);
             // Just confirm we didn't saturate L_ACF[0] (and that the
             // result is positive non-zero).
             assert!(l_acf[0] > 0);
@@ -2221,9 +2262,11 @@ pub mod analysis {
         /// L_ACF[0] = 160 * L_mult(1,1) = 160 * 2 = 320.
         #[test]
         fn autocorrelation_small_input_no_scaling() {
-            let s = [1i16; FRAME_SAMPLES];
-            let l_acf = autocorrelation(&s);
+            let mut s = [1i16; FRAME_SAMPLES];
+            let l_acf = autocorrelation(&mut s);
             assert_eq!(l_acf[0], 320);
+            // scalauto <= 0 ⇒ the §5.2.4 rescale leaves s untouched.
+            assert_eq!(s, [1i16; FRAME_SAMPLES]);
         }
 
         /// §5.2.4 inner-product upper bound — Table 6.5 ("Autocorrelation
@@ -2239,7 +2282,7 @@ pub mod analysis {
         fn autocorrelation_includes_the_last_sample_159() {
             let mut s = [0i16; FRAME_SAMPLES];
             s[FRAME_SAMPLES - 1] = 1; // s[159] = 1, everything else 0
-            let l_acf = autocorrelation(&s);
+            let l_acf = autocorrelation(&mut s);
             assert_eq!(
                 l_acf[0], 2,
                 "s[159] must contribute to L_ACF[0] (k = 0..=159, not 0..=158)"
@@ -2247,6 +2290,99 @@ pub mod analysis {
             // L_ACF[1] pairs s[k]*s[k-1]; s[159]*s[158] = 1*0 = 0, so
             // the single non-zero sample contributes only to lag 0.
             assert_eq!(l_acf[1], 0, "lag-1 has no contributing pair");
+        }
+
+        /// §5.2.4 "Rescaling of the array s[0..159]" is a *lossy*
+        /// round-trip, not a restore: `s[k] = mult_r(s[k], 16384 >>
+        /// (scalauto-1))` followed by `s[k] = s[k] << scalauto`
+        /// quantises away the low `scalauto` bits (with mult_r's
+        /// round-half-up). The §5.2.10 lattice consumes this
+        /// round-tripped array, so `autocorrelation` must hand it
+        /// back. Pin the arithmetic with hand-computed samples at
+        /// scalauto = 1 (smax = 4097 ⇒ norm(4097<<16) = 2 ⇒
+        /// scalauto = 2 — so pick smax below 4096 instead: smax =
+        /// 4095 ⇒ norm = 3 ⇒ scalauto = 1; temp = 16384):
+        ///   4095 → mult_r(4095, 16384) = 2048 → 2048 << 1 = 4096
+        ///   4094 → 2047 → 4094 (even ⇒ survives)
+        ///  -4095 → mult_r(-4095, 16384) = -2047 → -4094
+        #[test]
+        fn autocorrelation_rescale_is_lossy_round_trip() {
+            let mut s = [0i16; FRAME_SAMPLES];
+            s[0] = 4095;
+            s[1] = 4094;
+            s[2] = -4095;
+            let smax_before = 4095i16;
+            let scalauto = sub(4, norm((smax_before as i32) << 16));
+            assert_eq!(scalauto, 1, "test premise: scalauto must be 1");
+            let _ = autocorrelation(&mut s);
+            assert_eq!(s[0], 4096, "odd low bit rounds half-up");
+            assert_eq!(s[1], 4094, "even sample survives the round-trip");
+            assert_eq!(s[2], -4094, "mult_r rounds -2047.5 up to -2047");
+            for &v in &s[3..] {
+                assert_eq!(v, 0);
+            }
+        }
+
+        /// §5.2.4 rescale at the saturation edge: a full-scale frame
+        /// (smax = 32767 ⇒ scalauto = 4, temp = 2048) downscales to
+        /// mult_r(32767, 2048) = 2048, and the rescale `2048 << 4`
+        /// would be +32768 — the §5.1 left shift saturates it to
+        /// 32767 rather than wrapping.
+        #[test]
+        fn autocorrelation_rescale_saturates_at_full_scale() {
+            let mut s = [32767i16; FRAME_SAMPLES];
+            let _ = autocorrelation(&mut s);
+            assert_eq!(s, [32767i16; FRAME_SAMPLES]);
+        }
+
+        /// The full-pipeline consequence of the §5.2.4 rescale: for a
+        /// loud frame (scalauto > 0) the short-term residual `d[]`
+        /// must be computed from the round-tripped `s[]`, not the
+        /// pristine §5.2.3 output. Build the expectation explicitly
+        /// from the public pieces and require `Analyzer::analyse_frame`
+        /// to match it; a regression to the pristine-s pipeline
+        /// changes `d[]` and breaks bit-exactness on loud signals
+        /// (the §6.3.1 SEQ vectors exercise exactly this).
+        #[test]
+        fn analyzer_feeds_rescaled_s_to_short_term_filter() {
+            // Loud deterministic frame: alternating ±odd values large
+            // enough that the dynamic scaling engages and rounds low
+            // bits away.
+            let mut s = [0i16; FRAME_SAMPLES];
+            for (k, slot) in s.iter_mut().enumerate() {
+                let v = 8191 + (k as i32 * 7 % 129);
+                *slot = if k % 2 == 0 { v as i16 } else { -v as i16 };
+            }
+
+            // Expectation, assembled step by step per §5.2.4..§5.2.10.
+            let mut s_rescaled = s;
+            let l_acf = autocorrelation(&mut s_rescaled);
+            assert_ne!(
+                s_rescaled, s,
+                "test premise: dynamic scaling must engage and round bits away"
+            );
+            let r = reflection_coefficients(&l_acf);
+            let lar = reflection_to_lar(&r);
+            let lar_c = quantise_lar(&lar);
+            let lar_pp_curr = decode_lar(&lar_c);
+            let mut u = [0i16; 8];
+            let mut d_expect = [0i16; FRAME_SAMPLES];
+            for &(k_start, k_end, block_id) in &[
+                (0usize, 12usize, 0u8),
+                (13, 26, 1),
+                (27, 39, 2),
+                (40, 159, 3),
+            ] {
+                let lar_p = interpolate_lar(&[0i16; 9], &lar_pp_curr, block_id);
+                let rp = larp_to_rp(&lar_p);
+                let d_block = short_term_analysis_filter(&s_rescaled, &rp, &mut u, k_start, k_end);
+                d_expect[k_start..=k_end].copy_from_slice(&d_block[k_start..=k_end]);
+            }
+
+            let mut analyzer = Analyzer::new();
+            let (got_lar_c, got_d) = analyzer.analyse_frame(&s);
+            assert_eq!(got_lar_c, lar_c);
+            assert_eq!(got_d, d_expect, "d[] must come from the rescaled s[]");
         }
 
         // ─── §5.2.5 Schur recursion ───
@@ -2287,7 +2423,7 @@ pub mod analysis {
                 let v = ((k as i32 % 13) - 6) * 200;
                 *slot = v as i16;
             }
-            let l_acf = autocorrelation(&s);
+            let l_acf = autocorrelation(&mut s);
             let r = reflection_coefficients(&l_acf);
             for i in 1..=8 {
                 // |r[i]| must fit i16 and the spec's Q15 range gives
