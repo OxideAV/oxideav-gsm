@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.9...v0.0.10) - 2026-07-11
+
+### Other
+
+- gsm README: black-box conformance status + carriage formats + §5.2.4 rescale notes
+- robustness sweeps over the .gsm byte-frame and MS-GSM packet surfaces
+- extradata-selected frame packing on the codec adapters
+- MS-GSM 65-byte block pack/unpack + black-box fixture coverage
+- black-box conformance fixture corpus — encoder byte-exact, decoder sample-exact
+- de-facto .gsm 33-byte byte-frame pack/unpack (empirical, black-box derived)
+- §5.2.4 rescaling conformance fix — feed the round-tripped s[] to §5.2.10
+- gsm README: document the robustness + round-trip quality-gate suites
+- encoder input-surface robustness sweeps (§5.2 / adapter)
+- DTX receiver + comfort-noise robustness sweeps (GSM 06.12 §6)
+- whole-codec round-trip quality gates on synthetic signals
+- decode robustness sweep over §1.7 + §6.1 byte surfaces
+
 ### Fixed
 
 - **§5.2.4 "Rescaling of the array s[0..159]" conformance fix
