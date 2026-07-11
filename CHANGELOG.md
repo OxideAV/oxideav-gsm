@@ -31,6 +31,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **README refresh (2026-07-11).** Status rows carry the black-box
+  validation headline (encoder byte-exact / decoder sample-exact);
+  the carriage-format section documents all three packagings + the
+  adapter `extradata` selector and drops the former "wrappers pending
+  trace docs" gap (closed empirically); new black-box conformance
+  validation section.
+
 - **Robustness sweeps over the two new packet surfaces
   (2026-07-11).** `tests/robustness_decode.rs` gains three sweeps:
   LCG fuzz over `from_gsm_byte_frame` (marker-carrying frames must

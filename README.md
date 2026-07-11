@@ -9,8 +9,8 @@ Full Rate voice codec (20 ms frames, 160 samples at 8 kHz mono).
 
 | Direction | Coverage | Notes |
 |-----------|----------|-------|
-| Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) + §6.2/§6.3.3.1 conformance harness | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). The §6.2 verification configurations now run end-to-end against the §6.3.3.1 SEQ06H homing vectors (the only §6 vectors fully defined in the staged PDF) through the public registry adapters, plus a §6.3.3.2 `HOMING01`-shaped state-machine harness (`tests/conformance_homing01.rs`) that reconstructs the spec's described mixture — two complete decoder-homing-frames then interleaved complete + fractional homing frames and speech — and pins the §4.4 / §4.4-NOTE-2 reset machine frame-by-frame (non-home homes only on complete; homed homes on fractional; every reset emits 160 × `0x0008`; post-reset output is history-independent). The §6.3.2 Table 6.5/6.6/6.7 spec-named boundary statements are pinned in full: the Table 6.5 mutation points (§5.2.7 `A[]`/`MAC[]`/`MIC[]`, §5.2.11 LTP-gain `mult`/`DLB[]`/opt-scaling range, §5.2.16 `FAC[]`, §5.2.4/§5.2.5/§5.2.9.2 ranges + comparisons), the Table 6.6 `smax == 0` / `L_ACF[0] == 0` paths, and all four Table 6.7 decoder-overflow `add` points (§5.3.2 / §5.3.4 / §5.3.5 / §5.3.6 saturation). The §6.3.2 SEQ05 out-of-range-`Nr` robustness ("the delay value Nr … takes in this sequence its value in [0,127]") is pinned: every `Nc ∈ [0,127]` is swept through §5.3.2 and the spec's "check the limits of Nr" rule verified (in-range used verbatim, out-of-range reuses the previous valid lag, never an OOB delay-line index). The §6.1 Table 6.1 **word-oriented conformance I/O format** is also implemented (`confio`): the right-justified 76-word `*.COD` frame (152 bytes) and the left-justified `*.INP`/`*.OUT` PCM frames (320 bytes), little- and big-endian, with a cross-format equivalence proof against the §1.7 in-band stream — so the ETSI `*.INP`/`*.COD`/`*.OUT` files can be read directly once staged. The bulk SEQ01..SEQ05 *binary* test sequences remain pending — they ship in the `en_300961v080101p0.ZIP` archive ETSI distributes alongside the PDF; staging it is a docs followup. |
-| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing + §6.3.3.3 bit-sync + frame-sync | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. §6.3.3.3 encoder-framing synchronization is complete in **both** steps: **bit-synchronization** (`find_bit_sync` / `run_bit_sync_trial`) and **frame-synchronization** (`FrameSyncTable` / `find_frame_sync` / `retard_special_frame`) — the 160-position special-frame sweep that recovers the encoder's 20 ms retardation, reproducing the §6.3.3.3 construction and pinning the spec's "all 160 output frames different" invariant + the full retardation round-trip (parameterised on the caller's special frame, since the `SEQSYNC.INP` / `SYNCxxx.COD` *binary* corpus is unstaged). The §6 binary conformance sequences (SEQ01..SEQ05 + the `SYNCxxx.COD` reference bytes) remain the only encoder-side gap. |
+| Decoder   | §5.3 pipeline + §4.4 homing protocol (incl. §4.4 NOTE 2 / §6.3.3.2 partial detection) + §6.2/§6.3.3.1 conformance harness — **black-box validated sample-exact** (480 000+ samples identical to an independent decoder binary, including saturation-heavy extreme streams where a second decoder binary deviates) | Fixed-point pipeline (frame unpack, LAR decode, LAR interpolation, APCM inverse, RPE grid positioning, long-term + short-term lattice synthesis, de-emphasis, §5.3.7 output shaping) plus §4.4 decoder-homing-frame detection and substitution — both the full-frame check and the §4.4 NOTE 2 / §6.3.3.2 delay-optimised partial detection (LARs + first sub-frame only, valid from the home state). The §6.2 verification configurations now run end-to-end against the §6.3.3.1 SEQ06H homing vectors (the only §6 vectors fully defined in the staged PDF) through the public registry adapters, plus a §6.3.3.2 `HOMING01`-shaped state-machine harness (`tests/conformance_homing01.rs`) that reconstructs the spec's described mixture — two complete decoder-homing-frames then interleaved complete + fractional homing frames and speech — and pins the §4.4 / §4.4-NOTE-2 reset machine frame-by-frame (non-home homes only on complete; homed homes on fractional; every reset emits 160 × `0x0008`; post-reset output is history-independent). The §6.3.2 Table 6.5/6.6/6.7 spec-named boundary statements are pinned in full: the Table 6.5 mutation points (§5.2.7 `A[]`/`MAC[]`/`MIC[]`, §5.2.11 LTP-gain `mult`/`DLB[]`/opt-scaling range, §5.2.16 `FAC[]`, §5.2.4/§5.2.5/§5.2.9.2 ranges + comparisons), the Table 6.6 `smax == 0` / `L_ACF[0] == 0` paths, and all four Table 6.7 decoder-overflow `add` points (§5.3.2 / §5.3.4 / §5.3.5 / §5.3.6 saturation). The §6.3.2 SEQ05 out-of-range-`Nr` robustness ("the delay value Nr … takes in this sequence its value in [0,127]") is pinned: every `Nc ∈ [0,127]` is swept through §5.3.2 and the spec's "check the limits of Nr" rule verified (in-range used verbatim, out-of-range reuses the previous valid lag, never an OOB delay-line index). The §6.1 Table 6.1 **word-oriented conformance I/O format** is also implemented (`confio`): the right-justified 76-word `*.COD` frame (152 bytes) and the left-justified `*.INP`/`*.OUT` PCM frames (320 bytes), little- and big-endian, with a cross-format equivalence proof against the §1.7 in-band stream — so the ETSI `*.INP`/`*.COD`/`*.OUT` files can be read directly once staged. The bulk SEQ01..SEQ05 *binary* test sequences remain pending — they ship in the `en_300961v080101p0.ZIP` archive ETSI distributes alongside the PDF; staging it is a docs followup. |
+| Encoder   | §5.2 pipeline complete (§5.2.0..§5.2.18 + §1.7 packer) + §4.3 homing + §6.3.3.3 bit-sync + frame-sync — **black-box validated bit-exact** (byte-for-byte against an independent encoder binary over 6 200+ frames: quiet/mid/loud sweeps, full-scale/max-slew/impulse extremes, clipped random noise; a checked-in 740-frame fixture corpus pins it in CI) | Full fixed-point encode path: pre-processing, LPC analysis (autocorrelation → Schur → LAR quantisation), short-term analysis lattice, per-sub-segment LTP analysis + long-term filter, weighting filter, RPE grid selection, APCM forward quantisation, the §5.2.16..§5.2.18 local-decoder feedback loop, and the §1.7 Table 1.1 frame packer. `make_encoder` returns a working `oxideav_core::Encoder` (mono S16 8 kHz in, 33-byte frames out) with §4.3 encoder homing applied. §6.3.3.3 encoder-framing synchronization is complete in **both** steps: **bit-synchronization** (`find_bit_sync` / `run_bit_sync_trial`) and **frame-synchronization** (`FrameSyncTable` / `find_frame_sync` / `retard_special_frame`) — the 160-position special-frame sweep that recovers the encoder's 20 ms retardation, reproducing the §6.3.3.3 construction and pinning the spec's "all 160 output frames different" invariant + the full retardation round-trip (parameterised on the caller's special frame, since the `SEQSYNC.INP` / `SYNCxxx.COD` *binary* corpus is unstaged). The §6 binary conformance sequences (SEQ01..SEQ05 + the `SYNCxxx.COD` reference bytes) remain unstaged; in their place the checked-in black-box fixture corpus (`tests/blackbox_fixtures.rs`) enforces byte-for-byte equality with an independent encoder binary in CI — see the black-box validation section. |
 | Comfort noise (GSM 06.12) | §5.1 transmit evaluation + §5.2 parameter encoding + §6.1 receive generation + §6 receive-side DTX dispatch | **Transmit side** (`NoiseEvaluator`): the §5.1 `N = 4`-frame averaging of the **unquantised** parameters — per-coefficient `mean(LAR(i))` and the single `mean(xmax)` over all 16 sub-segment block maxima — then the §5.2 re-encoding *"as described in GSM 06.10"* (§5.2.7 `quantise_lar` + §5.2.15 `code_xmax`, replicated × 4) producing the `SidParameters` a SID carries. **Receive side** (`ComfortNoiseGenerator`): the §6.1 substitution (random RPE [1,6] / grid [0,3], `bcr = 0`, `Ncr = 40/120/40/120`, SID-carried LARs + block amplitudes) driving the §5.3 decoder, plus the §6.1 update-smoothing interpolation. **§6 DTX dispatch** (`DtxReceiver`): the receive-side two-state machine — speech frames decoded normally, a *valid SID* frame *"start[s] or update[s]"* comfort noise, `NoData` (radio cut / inter-SID gap) continues it *"at a regular low rate"* (§4), speech ends it — sharing **one** `DecoderState` across speech decode and §6.1 synthesis for click-free §4 cross-transition continuity. Frame *classification* is left to the caller (`RxFrame::Speech/Sid/NoData`), as `NoiseEvaluator` leaves VAD to the caller. Closes the §5.1 → §5.2 → §6.1 loop and the §6 dispatch. Still docs-blocked: the VAD flag (GSM 06.32), the §5.2 SID-frame *bit* layout incl. the class-I 95-bit code word (GSM 05.03 table 2), and DTX scheduling (GSM 06.31) — none staged. |
 
 ## Implementation
@@ -75,7 +75,16 @@ emit the `LARc[1..=8]` codewords the §1.7 bit packer consumes:
   The dynamic scaling computes `scalauto = sub(4, norm(smax << 16))`
   for the frame's max-magnitude `smax`, then applies
   `s[k] = mult_r(s[k], 16384 >> (scalauto-1))` whenever
-  `scalauto > 0` to keep the accumulator from overflowing.
+  `scalauto > 0` to keep the accumulator from overflowing. The
+  clause's closing "Rescaling of the array s[0..159]" step
+  (`s[k] = s[k] << scalauto`, saturating per §5.1) is applied **in
+  place** (`autocorrelation` takes `&mut s`): it is a *lossy*
+  round-trip — the low `scalauto` bits round away — and the spec
+  pipeline hands exactly this round-tripped array to the §5.2.10
+  short-term analysis filter, so it is part of the bit-exact
+  contract. (An earlier revision ran §5.2.10 on the pristine
+  §5.2.3 output; that deviation only manifested on loud input,
+  `smax ≥ 2048`, and was found by black-box byte-exact comparison.)
 * **§5.2.5 `reflection_coefficients`** — Schur recursion driving
   `r[i] = div(|P[1]|, P[0])` (Q15) with sign restored from
   `P[1]`, plus the spec's early-exit branch when `P[0] < |P[1]|`
@@ -700,16 +709,73 @@ let mut dec = DecoderState::new();
 let pcm: [i16; 160] = dec.decode_frame(&frame);
 ```
 
-## Carriage format
+## Carriage formats
 
-`UnpackedFrame::from_bit_stream_msb_first` accepts — and
-`UnpackedFrame::to_bit_stream_msb_first` produces — a 33-byte buffer
-holding the spec's `b1..b260` stream packed MSB-first. That bit numbering
-matches §1.7 Table 1.1 verbatim. The specific 33-byte container variants
-used in the wild (the `.gsm` byte format, RTP payload type 3, MS-GSM WAV
-`0x31` block) wrap these 260 bits with per-container framing that is
-**not** specified in EN 300 961 itself. Those wrappers will be addressed
-in a follow-up round once trace docs are staged.
+Three packet-level packagings of the same 76 coded parameters are
+implemented; all are proven mutually transparent (identical decoded
+PCM) by tests:
+
+* **In-band `b1..b260`** — `UnpackedFrame::from_bit_stream_msb_first`
+  / `to_bit_stream_msb_first`: the spec's abstract 260-bit stream
+  packed MSB-first into 33 bytes (4 trailing spare bits zero). The
+  bit numbering matches §1.7 Table 1.1 verbatim. This is the spec's
+  own contractual interface (§6.1) and the crate's historical
+  adapter format.
+* **De-facto `.gsm` byte-frame** — `UnpackedFrame::from_gsm_byte_frame`
+  / `to_gsm_byte_frame`: the 33-byte layout raw `.gsm` files use in
+  the wild — a constant `0xD` marker nibble in the high nibble of
+  byte 0, then the 76 Table 1.1 parameters in order, each MSB-first
+  within its field (264 bits exactly, no spare nibble).
+* **MS-GSM block** — `UnpackedFrame::pair_from_msgsm_block` /
+  `pair_to_msgsm_block`: the 65-byte two-frame block WAVE format tag
+  `0x0031` carries (`wBlockAlign` = 65, 320 samples per block) — no
+  marker, LSB-first fields, bits filling each byte from its
+  least-significant bit, frame B starting mid-byte at bit 260.
+
+The latter two layouts are **not** specified in EN 300 961. They were
+derived *empirically* — black-box validator binaries encoded known
+PCM, the produced bytes were parsed under candidate layouts, and the
+accepted layout is the one that matches this crate's §5.2 encoder
+parameter-for-parameter (thousands of frames, quiet through clipped
+extremes). The checked-in fixture corpus (`tests/fixtures/` +
+`tests/blackbox_fixtures.rs`) pins both byte-for-byte forever.
+
+The codec adapters select the packing via `CodecParameters::extradata`
+(a codec-defined field): empty or `b"inband"` (default), `b"gsm"`,
+or `b"msgsm"` — see [`FramePacking`]. The MS-GSM encoder emits one
+65-byte packet per two input frames and completes a trailing lone
+frame with an encoded silence frame on flush.
+
+## Black-box conformance validation
+
+GSM 06.10 defines a fully deterministic fixed-point pipeline, so any
+two conformant implementations must agree byte-for-byte (encode) and
+sample-for-sample (decode). With the ETSI §6.3 binary test sequences
+still unstaged, the crate is validated against independent
+implementations invoked as opaque black boxes:
+
+* **Encoder** — byte-exact against an independent encoder binary on
+  every stream tried: 6 200+ frames spanning quiet/mid/loud
+  staircases, full-scale squares, max-slew alternation, an
+  `i16::MIN` plateau, impulse trains, chirps, and amplitude-swept
+  random noise clipping at the rails. A 740-frame subset is checked
+  in as fixtures and enforced in CI (both `.gsm` and MS-GSM
+  packagings).
+* **Decoder** — sample-exact against the same implementation's
+  decoder over 480 000+ samples of the above corpus. A second,
+  unrelated black-box decoder agrees everywhere except
+  saturation-heavy clipped-random material, where it diverges from
+  both this crate and the reference — two independent
+  implementations against one corroborate this crate's §5.3
+  arithmetic (whose Table 6.7 saturation points are additionally
+  pinned by unit tests straight from the spec text).
+* The §4.3 construction sentence ("from the home state, the
+  encoder-homing-frame encodes to the decoder-homing-frame") also
+  holds on the black-box encoder's first frame; the black box does
+  not implement the §4.3 *reset* (a GSM-system feature file
+  transcoders omit), and its subsequent homing frames track this
+  crate's raw non-homing `encode_frame` output exactly — further
+  confirming the §5.2 chain across encoder state carry-over.
 
 ## Spec reference
 
