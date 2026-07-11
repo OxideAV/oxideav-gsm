@@ -47,6 +47,23 @@ All notable changes to this project will be documented in this file.
   both round-trip directions, marker/length enforcement, in-band
   cross-format equivalence).
 
+- **Black-box conformance fixture corpus (2026-07-11),
+  `tests/blackbox_fixtures.rs` + `tests/fixtures/`.** The ETSI §6.3
+  binary sequences remain unstaged, so the §5.2/§5.3 bit-exact
+  contract is now pinned against independent implementations instead:
+  four reference `.gsm` streams (quiet / loud / hostile-extremes /
+  clipped-random; 740 frames total) encoded by a black-box encoder
+  binary from deterministic integer-only PCM programs regenerated
+  in-test. The encoder tests require byte-for-byte equality with the
+  black-box bytes (the quiet fixture never engages §5.2.4 dynamic
+  scaling; the others engage it every frame, covering the §5.2.4
+  rescale fix); the decoder tests pin FNV-1a-64 digests of the
+  independent reference decode (sample-exact, §5.3.7-shaped). During
+  minting, a *second* black-box decoder agreed on three fixtures and
+  diverged from the reference on the saturation-heavy clipped-random
+  stream — two independent implementations against one confirm the
+  pinned reference. 10 new tests.
+
 - **§5.1 non-valid-bit robustness pins (2026-06-28).** §5.1 requires
   "At the receiving part it shall therefore be ensured that only valid
   bits … are used. In verification tests, the testing system may
