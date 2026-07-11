@@ -121,7 +121,7 @@ pub use bitstream::{
     SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, GSM_BYTE_FRAME_MAGIC,
     MSGSM_BLOCK_LEN, MSGSM_BLOCK_SAMPLES, PULSES, SUBFRAMES,
 };
-pub use codec::{make_decoder, make_encoder, CODEC_ID};
+pub use codec::{make_decoder, make_encoder, FramePacking, CODEC_ID};
 pub use comfort_noise::{
     comfort_noise_frame, ComfortNoiseGenerator, DtxReceiver, DtxState, NoiseEvaluator,
     NoiseFrameParameters, NoiseRng, RxFrame, SidInterpolator, SidParameters, COMFORT_NOISE_NCR,

@@ -31,6 +31,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Extradata-selected frame packing on the codec adapters
+  (2026-07-11).** `make_decoder` / `make_encoder` (and the registry
+  path) now honour `CodecParameters::extradata` as a packing
+  selector — empty or `b"inband"` keeps the historical §1.7
+  `b1..b260` MSB-first packets; `b"gsm"` speaks the de-facto 33-byte
+  `.gsm` byte-frame (0xD marker enforced on decode); `b"msgsm"`
+  speaks 65-byte MS-GSM blocks (one packet per two frames, 320-sample
+  pts/duration, trailing lone frame completed with an encoded silence
+  frame on flush; multi-unit packets still supported). The encoder
+  advertises the selected packing on its `output_params.extradata`.
+  Unknown tokens are rejected. New public `FramePacking` enum; 5 new
+  adapter tests including a three-way transparency proof (identical
+  decoded PCM under all packings).
+
 - **MS-GSM 65-byte block support (2026-07-11).**
   `UnpackedFrame::pair_to_msgsm_block` / `pair_from_msgsm_block`
   implement the two-frame packaging the WAVE format tag `0x0031`
