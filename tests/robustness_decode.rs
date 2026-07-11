@@ -1,11 +1,13 @@
 //! Robustness / fuzz sweeps over the GSM 06.10 decode entry points.
 //!
 //! Every parameter that reaches the §5.3 decoder arrives through one
-//! of two untrusted byte surfaces: the §1.7 packed 260-bit speech
-//! frame ([`UnpackedFrame::from_bit_stream_msb_first`]) and the §6.1
-//! word-oriented conformance frame (`confio`'s `*.COD` parsers). Both
-//! feed arbitrary attacker-controlled bytes into the fixed-point
-//! pipeline. The spec constrains the *encoder's* output codeword
+//! of four untrusted byte surfaces: the §1.7 packed 260-bit speech
+//! frame ([`UnpackedFrame::from_bit_stream_msb_first`]), the §6.1
+//! word-oriented conformance frame (`confio`'s `*.COD` parsers), the
+//! de-facto `.gsm` byte-frame ([`UnpackedFrame::from_gsm_byte_frame`]),
+//! and the MS-GSM 65-byte block
+//! ([`UnpackedFrame::pair_from_msgsm_block`]). All feed arbitrary
+//! attacker-controlled bytes into the fixed-point pipeline. The spec constrains the *encoder's* output codeword
 //! ranges (§1.7 Table 1.1 field widths, §5.3.2 lag range 40..=120),
 //! but a decoder fed a corrupt or hostile stream must still terminate
 //! and emit a well-formed frame — §5.3.2 itself carries the
@@ -329,5 +331,102 @@ fn registry_decoder_survives_hostile_packet_stream() {
             }
             other => panic!("expected audio frame, got {other:?}"),
         }
+    }
+}
+
+// ───────── byte-frame + MS-GSM packet surfaces (extradata packings) ─────────
+
+/// Any 33-byte buffer carrying the 0xD marker parses through
+/// `from_gsm_byte_frame` and decodes §5.3.7-shaped without panicking;
+/// buffers without the marker are rejected, never mis-decoded.
+#[test]
+fn gsm_byte_frame_fuzz_never_panics_and_stays_shaped() {
+    let mut rng = Lcg::new(0xB17E_F00D);
+    let mut dec = DecoderState::new();
+    for i in 0..iters(4000) {
+        let mut bytes = [0u8; 33];
+        for b in bytes.iter_mut() {
+            *b = rng.byte();
+        }
+        if i % 2 == 0 {
+            // Half the sweep carries the marker so the payload path
+            // runs; the other half exercises the rejection path on
+            // arbitrary first nibbles (some randomly valid).
+            bytes[0] = (bytes[0] & 0x0F) | 0xD0;
+        }
+        match UnpackedFrame::from_gsm_byte_frame(&bytes) {
+            Ok(frame) => {
+                let pcm = dec.decode_frame(&frame);
+                assert_output_shaped(&pcm);
+            }
+            Err(e) => {
+                assert_ne!(bytes[0] >> 4, 0xD, "marker frames must parse: {e}");
+            }
+        }
+    }
+}
+
+/// Any 65-byte buffer parses as an MS-GSM block (the layout has no
+/// marker — every bit pattern is a syntactically valid block) and
+/// both frames decode §5.3.7-shaped without panicking.
+#[test]
+fn msgsm_block_fuzz_never_panics_and_stays_shaped() {
+    let mut rng = Lcg::new(0x6535_6535);
+    let mut dec = DecoderState::new();
+    for _ in 0..iters(2000) {
+        let mut bytes = [0u8; 65];
+        for b in bytes.iter_mut() {
+            *b = rng.byte();
+        }
+        let (a, b) = UnpackedFrame::pair_from_msgsm_block(&bytes).unwrap();
+        assert_output_shaped(&dec.decode_frame(&a));
+        assert_output_shaped(&dec.decode_frame(&b));
+    }
+}
+
+/// The registry adapter under the `b"gsm"` and `b"msgsm"` packings
+/// survives hostile packet streams: parse failures surface as `Err`,
+/// never as a panic, and every emitted frame is shaped PCM of the
+/// packing's sample count.
+#[test]
+fn registry_decoder_survives_hostile_packets_all_packings() {
+    for (packing, unit, samples_per_pkt) in [(&b"gsm"[..], 33usize, 160u32), (b"msgsm", 65, 320)] {
+        let mut rng = Lcg::new(0xAD00_0001);
+        let mut p = params();
+        p.extradata = packing.to_vec();
+        let mut dec = make_decoder(&p).unwrap();
+        let mut decoded = 0usize;
+        for i in 0..iters(400) {
+            let mut data = vec![0u8; unit];
+            for b in data.iter_mut() {
+                *b = rng.byte();
+            }
+            if packing == b"gsm" && i % 2 == 0 {
+                data[0] = (data[0] & 0x0F) | 0xD0;
+            }
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 8000), data))
+                .unwrap();
+            match dec.receive_frame() {
+                Ok(Frame::Audio(AudioFrame { samples, data, .. })) => {
+                    decoded += 1;
+                    assert_eq!(samples, samples_per_pkt);
+                    let pcm: Vec<i16> = data[0]
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    assert_eq!(pcm.len(), samples_per_pkt as usize);
+                    for (k, &s) in pcm.iter().enumerate() {
+                        assert_eq!(s & 7, 0, "sample {k} must be §5.3.7-shaped");
+                    }
+                }
+                Ok(other) => panic!("expected audio frame, got {other:?}"),
+                Err(_) => {
+                    // Marker-less byte-frames are rejected; that is
+                    // the contract, not a robustness failure.
+                    assert_eq!(packing, b"gsm");
+                }
+            }
+        }
+        assert!(decoded > 0, "packing {packing:?} never decoded anything");
     }
 }

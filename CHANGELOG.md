@@ -31,6 +31,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Robustness sweeps over the two new packet surfaces
+  (2026-07-11).** `tests/robustness_decode.rs` gains three sweeps:
+  LCG fuzz over `from_gsm_byte_frame` (marker-carrying frames must
+  parse and decode §5.3.7-shaped; marker-less buffers must be
+  rejected, never mis-decoded), LCG fuzz over `pair_from_msgsm_block`
+  (every 65-byte pattern is syntactically valid — both frames must
+  decode shaped without panicking), and hostile packet streams
+  through the registry adapter under the `b"gsm"` / `b"msgsm"`
+  packings.
+
 - **Extradata-selected frame packing on the codec adapters
   (2026-07-11).** `make_decoder` / `make_encoder` (and the registry
   path) now honour `CodecParameters::extradata` as a packing
