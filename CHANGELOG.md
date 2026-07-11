@@ -31,6 +31,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **De-facto `.gsm` 33-byte byte-frame support (2026-07-11).**
+  `UnpackedFrame::to_gsm_byte_frame` / `from_gsm_byte_frame` implement
+  the byte layout raw `.gsm` files use in the wild: a constant `0xD`
+  marker nibble in the high nibble of byte 0, then the 76 §1.7
+  Table 1.1 parameters in order of occurrence, each packed MSB-first
+  within its field (4 + 260 bits fill the 33 bytes exactly — no spare
+  nibble). The layout is not part of EN 300 961; it was derived
+  empirically by black-box comparison against independent codec
+  binaries (candidate-layout parsing of their output against this
+  crate's §5.2 encoder, parameter-for-parameter over thousands of
+  frames) and is pinned by the checked-in fixture corpus. New
+  `GSM_BYTE_FRAME_LEN` / `GSM_BYTE_FRAME_MAGIC` constants and an
+  `Error::BadByteFrameMagic` variant; 6 new unit tests (layout pins,
+  both round-trip directions, marker/length enforcement, in-band
+  cross-format equivalence).
+
 - **§5.1 non-valid-bit robustness pins (2026-06-28).** §5.1 requires
   "At the receiving part it shall therefore be ensured that only valid
   bits … are used. In verification tests, the testing system may

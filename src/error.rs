@@ -9,6 +9,10 @@ pub enum Error {
     /// Caller fed fewer than 33 bytes — a GSM 06.10 frame is 260
     /// bits (rounded up to 33 bytes per §1.7 Table 1.1).
     ShortFrame,
+    /// The 33-byte `.gsm` byte-frame did not carry the 0xD marker
+    /// nibble in the high nibble of byte 0 (see
+    /// [`crate::UnpackedFrame::from_gsm_byte_frame`]).
+    BadByteFrameMagic,
 }
 
 impl core::fmt::Display for Error {
@@ -18,6 +22,10 @@ impl core::fmt::Display for Error {
             Self::ShortFrame => write!(
                 f,
                 "oxideav-gsm: input shorter than the 33-byte minimum for one 260-bit frame"
+            ),
+            Self::BadByteFrameMagic => write!(
+                f,
+                "oxideav-gsm: .gsm byte-frame missing the 0xD marker nibble"
             ),
         }
     }

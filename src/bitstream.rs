@@ -22,23 +22,32 @@
 //! Per §6.1 the frame is transmitted as "words … of 16 bits" with
 //! left justification, i.e. the abstract 260-bit stream `b1..b260`
 //! is the contractual interface; how that stream is then packed
-//! into bytes (the `.gsm` 33-byte byte format, RTP payload type 3,
-//! MS-GSM WAV chunk, TRAU 320-bit, …) is **outside** the scope of
-//! EN 300 961. The on-wire byte layout for those specific container
-//! forms is NOT specified in the staged PDF and is reported as a
-//! docs gap.
+//! into bytes (the `.gsm` 33-byte byte format, MS-GSM WAV chunk,
+//! TRAU 320-bit, …) is **outside** the scope of EN 300 961.
 //!
-//! This module therefore exposes two layers:
+//! This module therefore exposes three layers:
 //!
 //! * [`UnpackedFrame`] — the typed structure of 76 parameters that
 //!   §5.3 decoder consumes directly.
 //! * [`UnpackedFrame::from_bit_stream_msb_first`] — a 260-bit stream
 //!   unpacker whose only assumption is "stream is `b1..b260` packed
-//!   MSB-first into a `[u8; 33]`-or-larger byte buffer." That is the
-//!   widely-used in-band convention shared by every container the
-//!   spec lists in §6.1 (the bit positions match Table 1.1 verbatim);
-//!   only the per-container framing wrapper outside those 260 bits
-//!   varies, and that wrapper is the docs gap above.
+//!   MSB-first into a `[u8; 33]`-or-larger byte buffer" (the bit
+//!   positions match Table 1.1 verbatim).
+//! * [`UnpackedFrame::from_gsm_byte_frame`] /
+//!   [`UnpackedFrame::to_gsm_byte_frame`] — the de-facto 33-byte
+//!   byte-frame used by raw `.gsm` files in the wild. This layout is
+//!   not in the staged spec; it was derived **empirically** by
+//!   black-box comparison against validator binaries (encode known
+//!   PCM with an independent encoder binary, parse the produced
+//!   bytes under candidate layouts, and require a parameter-for-
+//!   parameter match with this crate's §5.2 encoder over thousands
+//!   of frames — the match is exact, see `tests/blackbox_fixtures.rs`).
+//!   Layout: a constant `0xD` marker nibble in the high nibble of
+//!   byte 0, then the 76 Table 1.1 parameters in order of
+//!   occurrence, each packed **MSB-first within its field** (unlike
+//!   the spec's in-band LSB-first-within-field convention), bits
+//!   filled MSB-first through the bytes; 4 + 260 = 264 bits fill the
+//!   33 bytes exactly, so there is no spare nibble.
 
 use crate::error::Error;
 
@@ -177,7 +186,85 @@ impl UnpackedFrame {
         debug_assert_eq!(w.bit_pos, FRAME_BITS);
         w.bytes
     }
+
+    /// Decode one frame from the de-facto 33-byte `.gsm` byte-frame
+    /// (see the module docs): a `0xD` marker nibble in the high
+    /// nibble of byte 0, then the 76 Table 1.1 parameters in order,
+    /// each packed MSB-first within its field.
+    ///
+    /// Returns [`Error::ShortFrame`] when `bytes.len() < 33` and
+    /// [`Error::BadByteFrameMagic`] when the marker nibble is not
+    /// `0xD`.
+    ///
+    /// This layout is **not** part of EN 300 961 — it was derived
+    /// empirically from validator binaries treated as black boxes
+    /// and is pinned byte-for-byte by the checked-in fixtures in
+    /// `tests/blackbox_fixtures.rs`.
+    pub fn from_gsm_byte_frame(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < GSM_BYTE_FRAME_LEN {
+            return Err(Error::ShortFrame);
+        }
+        let mut r = BitReader::new(bytes);
+        if r.read_msb_first(4) != GSM_BYTE_FRAME_MAGIC as u32 {
+            return Err(Error::BadByteFrameMagic);
+        }
+
+        let mut f = UnpackedFrame::default();
+        let lar_widths: [u8; 8] = [6, 6, 5, 5, 4, 4, 3, 3];
+        for (i, &w) in lar_widths.iter().enumerate() {
+            f.lar_c[i + 1] = r.read_msb_first(w) as i16;
+        }
+        for sf in f.sub.iter_mut() {
+            sf.n_c = r.read_msb_first(7) as u8;
+            sf.b_c = r.read_msb_first(2) as u8;
+            sf.m_c = r.read_msb_first(2) as u8;
+            sf.xmax_c = r.read_msb_first(6) as u8;
+            for slot in sf.x_mc.iter_mut() {
+                *slot = r.read_msb_first(3) as u8;
+            }
+        }
+        Ok(f)
+    }
+
+    /// Pack this frame into the de-facto 33-byte `.gsm` byte-frame —
+    /// the exact mirror of [`Self::from_gsm_byte_frame`]: marker
+    /// nibble `0xD`, then the 76 Table 1.1 parameters in order, each
+    /// MSB-first within its field. 4 + 260 bits fill the 33 bytes
+    /// exactly.
+    ///
+    /// Each parameter value is masked to its Table 1.1 field width
+    /// before emission (with a debug assertion on overflow), matching
+    /// [`Self::to_bit_stream_msb_first`].
+    pub fn to_gsm_byte_frame(&self) -> [u8; GSM_BYTE_FRAME_LEN] {
+        let mut w = BitWriter::new();
+        w.write_msb_first(GSM_BYTE_FRAME_MAGIC as u32, 4);
+
+        let lar_widths: [u8; 8] = [6, 6, 5, 5, 4, 4, 3, 3];
+        for (i, &width) in lar_widths.iter().enumerate() {
+            w.write_msb_first(self.lar_c[i + 1] as u32, width);
+        }
+        for sf in &self.sub {
+            w.write_msb_first(sf.n_c as u32, 7);
+            w.write_msb_first(sf.b_c as u32, 2);
+            w.write_msb_first(sf.m_c as u32, 2);
+            w.write_msb_first(sf.xmax_c as u32, 6);
+            for &pulse in &sf.x_mc {
+                w.write_msb_first(pulse as u32, 3);
+            }
+        }
+
+        debug_assert_eq!(w.bit_pos, GSM_BYTE_FRAME_LEN * 8);
+        w.bytes
+    }
 }
+
+/// Length in bytes of the de-facto `.gsm` byte-frame (and of the
+/// spec's own 260-bit frame rounded up): 33.
+pub const GSM_BYTE_FRAME_LEN: usize = 33;
+
+/// Marker nibble carried in the high nibble of byte 0 of every
+/// de-facto `.gsm` byte-frame.
+pub const GSM_BYTE_FRAME_MAGIC: u8 = 0xD;
 
 /// Bit-stream reader over a byte buffer holding `b1..bN` packed
 /// MSB-first (`b1` is the most-significant bit of `bytes[0]`).
@@ -206,6 +293,18 @@ impl<'a> BitReader<'a> {
         let mut out: u32 = 0;
         for i in 0..n {
             out |= (self.pull_bit() as u32) << i;
+        }
+        out
+    }
+
+    /// Read `n` bits in the parameter's MSB-first order (the first
+    /// bit pulled is the MSB of the result) — the de-facto `.gsm`
+    /// byte-frame field convention.
+    fn read_msb_first(&mut self, n: u8) -> u32 {
+        debug_assert!(n <= 16);
+        let mut out: u32 = 0;
+        for _ in 0..n {
+            out = (out << 1) | self.pull_bit() as u32;
         }
         out
     }
@@ -251,6 +350,19 @@ impl BitWriter {
         debug_assert!(n <= 16);
         debug_assert_eq!(v >> n, 0, "codeword exceeds its Table 1.1 field width");
         for i in 0..n {
+            self.push_bit(((v >> i) & 1) as u8);
+        }
+    }
+
+    /// Write the low `n` bits of `v` in the parameter's MSB-first
+    /// order (the first bit pushed is the MSB of `v`'s n-bit field)
+    /// — the de-facto `.gsm` byte-frame field convention. Bits of
+    /// `v` above `n` are masked off (debug-asserted, mirroring
+    /// [`Self::write_lsb_first`]).
+    fn write_msb_first(&mut self, v: u32, n: u8) {
+        debug_assert!(n <= 16);
+        debug_assert_eq!(v >> n, 0, "codeword exceeds its field width");
+        for i in (0..n).rev() {
             self.push_bit(((v >> i) & 1) as u8);
         }
     }
@@ -465,5 +577,96 @@ mod tests {
         // b258 (bit-in-byte 1), b259 (2), b260 (3) all set.
         assert_eq!(bytes[32], 0b0111_0000);
         assert_eq!(bytes[32] & 0x0F, 0, "spare nibble must stay zero");
+    }
+
+    // ─── de-facto `.gsm` byte-frame ───
+
+    /// An all-zero frame packs to the marker nibble and nothing else.
+    #[test]
+    fn byte_frame_all_zero_is_magic_only() {
+        let bytes = UnpackedFrame::default().to_gsm_byte_frame();
+        assert_eq!(bytes[0], 0xD0);
+        for &b in &bytes[1..] {
+            assert_eq!(b, 0);
+        }
+    }
+
+    /// Field bit-order pin: LARc[1] = 1 occupies the 6-bit field at
+    /// bit positions 4..=9 MSB-first, so its LSB (the only set bit)
+    /// lands at absolute bit 9 = byte 1, bit-in-byte 1.
+    #[test]
+    fn byte_frame_fields_are_msb_first() {
+        let mut f = UnpackedFrame::default();
+        f.lar_c[1] = 1;
+        let bytes = f.to_gsm_byte_frame();
+        assert_eq!(bytes[0], 0xD0);
+        assert_eq!(bytes[1], 0b0100_0000);
+        for &b in &bytes[2..] {
+            assert_eq!(b, 0);
+        }
+
+        // And the MSB of the same field lands right after the magic:
+        // absolute bit 4 = byte 0, bit-in-byte 4.
+        let mut f = UnpackedFrame::default();
+        f.lar_c[1] = 0b10_0000;
+        let bytes = f.to_gsm_byte_frame();
+        assert_eq!(bytes[0], 0xD8);
+        for &b in &bytes[1..] {
+            assert_eq!(b, 0);
+        }
+    }
+
+    /// pack ∘ unpack = identity on a frame exercising every field.
+    #[test]
+    fn byte_frame_roundtrip_patterned() {
+        let f = patterned_frame();
+        let bytes = f.to_gsm_byte_frame();
+        let g = UnpackedFrame::from_gsm_byte_frame(&bytes).unwrap();
+        assert_eq!(f, g);
+    }
+
+    /// The byte-frame and the in-band 260-bit stream carry the same
+    /// 76 parameters: packing the same frame both ways and unpacking
+    /// each with its own reader yields equal structs.
+    #[test]
+    fn byte_frame_equivalent_to_in_band_stream() {
+        let f = patterned_frame();
+        let a = UnpackedFrame::from_gsm_byte_frame(&f.to_gsm_byte_frame()).unwrap();
+        let b = UnpackedFrame::from_bit_stream_msb_first(&f.to_bit_stream_msb_first()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// Marker-nibble and length enforcement.
+    #[test]
+    fn byte_frame_rejects_bad_magic_and_short_input() {
+        let f = patterned_frame();
+        let mut bytes = f.to_gsm_byte_frame();
+        bytes[0] = (bytes[0] & 0x0F) | 0xC0; // corrupt the marker
+        assert!(matches!(
+            UnpackedFrame::from_gsm_byte_frame(&bytes),
+            Err(Error::BadByteFrameMagic)
+        ));
+        assert!(matches!(
+            UnpackedFrame::from_gsm_byte_frame(&[0xD0; 32]),
+            Err(Error::ShortFrame)
+        ));
+    }
+
+    /// unpack ∘ pack = byte identity over LCG-random byte-frames
+    /// carrying the 0xD marker (all 260 payload bits exercised).
+    #[test]
+    fn byte_frame_unpack_pack_roundtrip_bytes() {
+        let mut seed: u32 = 0x0BAD_F00D;
+        for round in 0..8 {
+            let mut bytes = [0u8; GSM_BYTE_FRAME_LEN];
+            for b in bytes.iter_mut() {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *b = (seed >> 24) as u8;
+            }
+            bytes[0] = (bytes[0] & 0x0F) | 0xD0;
+            let f = UnpackedFrame::from_gsm_byte_frame(&bytes).unwrap();
+            let repacked = f.to_gsm_byte_frame();
+            assert_eq!(bytes, repacked, "byte roundtrip failed on round {round}");
+        }
     }
 }

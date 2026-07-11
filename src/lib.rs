@@ -117,7 +117,10 @@ pub mod error;
 pub mod sync;
 pub mod tables;
 
-pub use bitstream::{SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, PULSES, SUBFRAMES};
+pub use bitstream::{
+    SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, GSM_BYTE_FRAME_MAGIC,
+    PULSES, SUBFRAMES,
+};
 pub use codec::{make_decoder, make_encoder, CODEC_ID};
 pub use comfort_noise::{
     comfort_noise_frame, ComfortNoiseGenerator, DtxReceiver, DtxState, NoiseEvaluator,
