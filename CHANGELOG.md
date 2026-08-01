@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.20 half-rate foundation (2026-08-01).** New `hr` module
+  family beginning the half-rate (VSELP) arc: the annex A table A.1
+  parameter set (`HrParameters` with the MODE-dependent subframe
+  split), annex B `b1..b112` bit packing for both the unvoiced
+  (table B.1) and voiced (table B.2) layouts, the GSM 06.07
+  conformance word layouts, and `hr::tables` — the codec's complete
+  ROM data (reflection-coefficient VQ + prequantizer + scalar
+  dequantizer, R0 decode table, table-3 allowable lags, 10th/6th
+  order interpolating filters, GSP0 gain-VQ codebooks, sqrt(P0),
+  VSELP basis vectors for all modes, high-pass/SST/noise-weighting/
+  soft-interpolation coefficients) transcribed from the staged data
+  extracts with spec-fact shape/content tests (printed table 3 lag
+  values, equations (3)/(4) high-pass coefficients, table 2
+  interpolation weights). The GSM 06.07 corpus disks 1-2 are staged
+  under `tests/fixtures/etsi-hr/` and structurally validated:
+  every real coded frame parses, all fields fit their annex-A
+  widths, and the annex-B packing round-trips the whole corpus.
+  The clause 4.2 decode chain is the next arc.
+
 - **GSM 06.31 §6.1.2 RX DTX handler (2026-08-01).** `RxDtxHandler`
   bridges raw traffic frames + radio-subsystem flags (BFI, TAF) to
   the GSM 06.12 receive side: table-1 classification, valid-SID

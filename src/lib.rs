@@ -115,6 +115,7 @@ pub mod decoder;
 pub mod dtx;
 pub mod encoder;
 pub mod error;
+pub mod hr;
 pub mod sync;
 pub mod tables;
 pub mod vad;
@@ -147,6 +148,10 @@ pub use dtx::{
 pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor, VadTap};
 pub use error::Error;
+pub use hr::{
+    HrParameters, SubframeParams, VoicingMode, HR_FRAME_BITS, HR_FRAME_BYTES, HR_FRAME_SAMPLES,
+    HR_PARAMS_PER_FRAME, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES,
+};
 pub use sync::{
     find_bit_sync, find_frame_sync, retard_special_frame, run_bit_sync_trial, BitSyncTrial,
     FrameSyncTable, SyncFormats, BIT_SYNC_TRIALS, HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
