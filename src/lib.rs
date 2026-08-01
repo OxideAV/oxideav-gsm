@@ -112,6 +112,7 @@ pub mod codec;
 pub mod comfort_noise;
 pub mod confio;
 pub mod decoder;
+pub mod dtx;
 pub mod encoder;
 pub mod error;
 pub mod sync;
@@ -137,6 +138,11 @@ pub use confio::{
 pub use decoder::{
     decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
     is_partial_decoder_homing_frame, DecoderState,
+};
+pub use dtx::{
+    classify_rx_frame, make_sid_frame, sid_field_deviation, sid_flag, sid_frame_parameters,
+    RxClassification, SidFlag, TxDtxHandler, TxFrame, SHORT_BURST_ELAPSED_LIMIT,
+    SID_AVERAGING_FRAMES, SID_CODE_WORD_BITS,
 };
 pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor, VadTap};

@@ -34,7 +34,9 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::{EncoderState, UnpackedFrame, Vad, VadMode, FRAME_SAMPLES};
+use oxideav_gsm::{
+    EncoderState, TxDtxHandler, TxFrame, UnpackedFrame, Vad, VadMode, FRAME_SAMPLES,
+};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -119,9 +121,20 @@ fn read_vad_flags(name: &str) -> Vec<bool> {
         .collect()
 }
 
-/// Run one corpus case end-to-end: encoder + downlink VAD over the
-/// `*.INP` frames, checked against `*.VAD` and the `*.COD` flag bits
-/// and speech-frame parameters.
+/// Run one corpus case end-to-end through the complete transmit side
+/// — GSM 06.10 encoder + GSM 06.32 downlink VAD + GSM 06.31 TX DTX
+/// handler (with the GSM 06.12 SID encoding) — and require the
+/// `*.COD` stream to be reproduced **in full**, frame by frame:
+///
+/// * the VAD flag (vs both `*.VAD` and the `*.COD` LAR(1) bit 15);
+/// * the SP flag (`*.COD` LAR(2) bit 15);
+/// * every speech (SP=1) frame's 76 parameters — the raw encoder
+///   output during speech and the DTX hangover;
+/// * every SID (SP=0) frame's 76 parameters — the GSM 06.12 §5.1/§5.2
+///   averaged-and-encoded comfort-noise parameters, the all-zero SID
+///   code word, and the GSM 06.31 §5.1.1 scheduling (hangover /
+///   short-burst repeat / continuous updating) that decides *which*
+///   SID goes out *when*.
 fn run_case(case: &str) {
     if !corpus_present() {
         return;
@@ -134,10 +147,11 @@ fn run_case(case: &str) {
 
     let mut enc = EncoderState::new();
     let mut vad = Vad::new(VadMode::Downlink);
+    let mut tx = TxDtxHandler::new();
     for (n, (pcm, (want_cod, want_vad))) in
         inp.iter().zip(cod.iter().zip(vad_ref.iter())).enumerate()
     {
-        let (frame, tap) = enc.encode_frame_with_vad_tap(pcm);
+        let (frame, tap, noise) = enc.encode_frame_with_dtx_taps(pcm);
         let got_vad = vad.process_frame(&tap);
         assert_eq!(
             got_vad, *want_vad,
@@ -147,13 +161,23 @@ fn run_case(case: &str) {
             got_vad, want_cod.vad,
             "{case}: *.VAD and *.COD LAR(1) bit 15 disagree at frame {n}"
         );
-        if want_cod.sp {
-            assert_eq!(
-                frame,
-                want_cod.params(),
-                "{case}: speech-frame parameters diverge at frame {n}"
-            );
-        }
+
+        let tx_out = tx.process_frame(got_vad, &noise);
+        assert_eq!(
+            tx_out.sp(),
+            want_cod.sp,
+            "{case}: SP flag diverges at frame {n}"
+        );
+        let sent = match &tx_out {
+            TxFrame::Speech => &frame,
+            TxFrame::Sid(sid) => sid,
+        };
+        assert_eq!(
+            *sent,
+            want_cod.params(),
+            "{case}: transmitted frame diverges at frame {n} (sp={})",
+            want_cod.sp
+        );
     }
 }
 

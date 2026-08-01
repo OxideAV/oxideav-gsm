@@ -1144,17 +1144,19 @@ pub mod analysis {
             &mut self,
             s: &[i16; FRAME_SAMPLES],
         ) -> ([i16; 9], [i16; FRAME_SAMPLES]) {
-            let (lar_c, d, _, _) = self.analyse_frame_tapped(s);
+            let (lar_c, d, _, _, _) = self.analyse_frame_tapped(s);
             (lar_c, d)
         }
 
         /// [`Self::analyse_frame`] additionally returning the §5.2.4
         /// `(L_ACF[0..=8], scalauto)` pair, which the GSM 06.32 VAD
-        /// consumes (see [`autocorrelation_with_scaling`]).
+        /// consumes (see [`autocorrelation_with_scaling`]), and the
+        /// *unquantised* §5.2.6 `LAR[1..=8]`, which the GSM 06.12 §5.1
+        /// background-noise evaluation consumes.
         pub fn analyse_frame_tapped(
             &mut self,
             s: &[i16; FRAME_SAMPLES],
-        ) -> ([i16; 9], [i16; FRAME_SAMPLES], [i32; 9], i16) {
+        ) -> ([i16; 9], [i16; FRAME_SAMPLES], [i32; 9], i16, [i16; 9]) {
             // §5.2.4 — autocorrelation, mutating the working copy of
             // s[] with the clause's scale → L_ACF → rescale sequence.
             // Whenever the dynamic scaling engages (scalauto > 0) the
@@ -1198,7 +1200,7 @@ pub mod analysis {
             // next frame.
             self.lar_pp_prev = lar_pp_curr;
 
-            (lar_c, d_frame, l_acf, scalauto)
+            (lar_c, d_frame, l_acf, scalauto, lar)
         }
     }
 
@@ -4375,6 +4377,24 @@ impl EncoderState {
         &mut self,
         sop: &[i16; FRAME_SAMPLES],
     ) -> (UnpackedFrame, VadTap) {
+        let (frame, vad_tap, _) = self.encode_frame_with_dtx_taps(sop);
+        (frame, vad_tap)
+    }
+
+    /// [`Self::encode_frame_with_vad_tap`] additionally returning the
+    /// frame's **unquantised** GSM 06.12 §5.1 noise parameters (the
+    /// §5.2.6 `LAR[1..=8]` and the four §5.2.15 sub-segment block
+    /// maxima `xmax`) as [`crate::comfort_noise::NoiseFrameParameters`]
+    /// — the input of the background-acoustic-noise evaluation feeding
+    /// SID frames during DTX.
+    pub fn encode_frame_with_dtx_taps(
+        &mut self,
+        sop: &[i16; FRAME_SAMPLES],
+    ) -> (
+        UnpackedFrame,
+        VadTap,
+        crate::comfort_noise::NoiseFrameParameters,
+    ) {
         // §5.2.1..§5.2.3 — pre-processing, keeping the §5.2.2 output
         // sof[] (the VAD's tone-detection input) before the §5.2.3
         // pre-emphasis.
@@ -4383,8 +4403,9 @@ impl EncoderState {
         let s = self.pre.pre_emphasis(&sof);
 
         // §5.2.4..§5.2.10 — LARc codewords + short-term residual d[],
-        // tapping the §5.2.4 (L_ACF, scalauto) pair.
-        let (lar_c, d, l_acf, scalauto) = self.analyzer.analyse_frame_tapped(&s);
+        // tapping the §5.2.4 (L_ACF, scalauto) pair and the
+        // unquantised §5.2.6 LARs.
+        let (lar_c, d, l_acf, scalauto, lar_unq) = self.analyzer.analyse_frame_tapped(&s);
 
         let mut frame = UnpackedFrame {
             lar_c,
@@ -4392,6 +4413,7 @@ impl EncoderState {
         };
 
         // §5.2.11..§5.2.18 — four sub-segments.
+        let mut xmax_unq = [0i16; SUBFRAMES];
         for (j, sub_out) in frame.sub.iter_mut().enumerate().take(SUBFRAMES) {
             let mut d_sub = [0i16; analysis::SUBFRAME_SAMPLES];
             d_sub.copy_from_slice(
@@ -4408,6 +4430,7 @@ impl EncoderState {
             let apcm = analysis::apcm_quantise_rpe(&grid.x_m);
             // §5.2.16..§5.2.18 — local-decoder feedback (dp update).
             self.ltp.reconstruct_and_update(&apcm, grid.m_c, &dpp);
+            xmax_unq[j] = apcm.xmax;
 
             *sub_out = SubFrame {
                 n_c: ltp_params.n_c as u8,
@@ -4427,6 +4450,7 @@ impl EncoderState {
                 sof,
                 lags,
             },
+            crate::comfort_noise::NoiseFrameParameters::new(lar_unq, xmax_unq),
         )
     }
 

@@ -1076,17 +1076,26 @@ impl NoiseEvaluator {
     }
 }
 
-/// Round-to-nearest integer division (ties away from zero) for the
-/// §5.1 arithmetic means. `denom > 0`; `numer` may be negative (LAR
-/// codewords are signed). See [`NoiseEvaluator`] for why the rounding
-/// direction is an implementation choice the spec leaves open.
+/// §5.1 arithmetic mean: `floor(x + 1/2)` — add half the divisor,
+/// then divide rounding toward negative infinity. This is the
+/// classic fixed-point mean `(sum + N/2) >> log2(N)` (an arithmetic
+/// right shift after adding the rounding constant).
+///
+/// The staged 06.12 prose does not spell out the rounding, but the
+/// EN 300 965 conformance corpus pins this rule from both sides:
+///
+/// * PRED1 — a window of negative LARs summing to a −.5 tie must
+///   land on the *higher* value (−12697.5 → −12697, quantising to
+///   `LARc[1] = 17`; round-half-away's −12698 gives 16);
+/// * BAD_SP / ADAPT_I1 / ADAPT_M1 — positive means at .75/.8 must
+///   round up (e.g. 16 block maxima summing to 2045: 127.8 → 128,
+///   one `xmaxc` step above the truncated 127).
+///
+/// Only `floor(x + 1/2)` reproduces every reference SID frame
+/// bit-exactly (`tests/conformance_vad.rs`).
 fn mean_round(numer: i32, denom: i32) -> i32 {
     debug_assert!(denom > 0);
-    if numer >= 0 {
-        (numer + denom / 2) / denom
-    } else {
-        -((-numer + denom / 2) / denom)
-    }
+    (numer + denom / 2).div_euclid(denom)
 }
 
 #[cfg(test)]
@@ -1651,13 +1660,16 @@ mod tests {
     /// §5.1: `mean_round` is round-to-nearest, ties away from zero, and
     /// symmetric for negative LARs.
     #[test]
-    fn mean_round_is_nearest_ties_away() {
+    fn mean_round_is_floor_of_x_plus_half() {
+        // The corpus-pinned §5.1 mean: floor(x + 1/2) — the
+        // fixed-point `(sum + N/2) >> log2(N)` (see `mean_round`).
         assert_eq!(mean_round(0, 4), 0);
-        assert_eq!(mean_round(6, 4), 2); // 1.5 → 2 (tie up)
+        assert_eq!(mean_round(6, 4), 2); // 1.5  → 2 (tie up)
         assert_eq!(mean_round(5, 4), 1); // 1.25 → 1
         assert_eq!(mean_round(7, 4), 2); // 1.75 → 2
-        assert_eq!(mean_round(-6, 4), -2); // tie away from zero
-        assert_eq!(mean_round(-5, 4), -1);
+        assert_eq!(mean_round(-6, 4), -1); // -1.5 → -1 (tie UP, not away)
+        assert_eq!(mean_round(-5, 4), -1); // -1.25 → -1
+        assert_eq!(mean_round(-7, 4), -2); // -1.75 → -2
         assert_eq!(mean_round(10, 4), 3); // 2.5 → 3
     }
 

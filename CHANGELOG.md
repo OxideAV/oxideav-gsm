@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.31 DTX transmit side + GSM 06.12 SID-frame encoding,
+  conformance-exact (2026-08-01).** New `dtx` module: the §5.2 SID
+  frame (mean LARs + the mean block amplitude repeated four times +
+  the 95-bit all-zero SID code word in the class-I `Xmc` positions
+  per GSM 05.03 table 2, every remaining parameter zero), the
+  GSM 06.31 §5.1.1 `TxDtxHandler` (after-reset and normal hangover,
+  the <24-frames-elapsed short-burst rule that repeats the last SID,
+  continuous per-frame SID updating during pauses), the §6.1.1
+  ternary SID frame detector (`sid_flag` / `sid_field_deviation`,
+  thresholds n<2 / n<16), and the §6.1 table-1 receive-side
+  classification (`classify_rx_frame`). `EncoderState::
+  encode_frame_with_dtx_taps` additionally surfaces the frame's
+  unquantised §5.1 noise parameters. The complete transmit chain —
+  encoder + VAD + DTX + SID — reproduces all 20 EN 300 965 corpus
+  `*.COD` streams bit-exactly (SP flags, SID frames and their
+  scheduling included) in `tests/conformance_vad.rs`.
+
+### Changed
+
+- **GSM 06.12 §5.1 SID averaging semantics corrected against the
+  conformance corpus (2026-08-01).** Two previously
+  spec-underdetermined choices in `NoiseEvaluator` are now pinned by
+  the EN 300 965 reference `*.COD` streams: (1) the SID passed
+  instead of frame `j` averages the four VAD=0 frames *preceding*
+  `j` (the replaced frame joins the window only for the next
+  update), which is also why §5.1.1 needs N+1 frames to make a SID
+  available; (2) the §5.1 means round as `floor(x + 1/2)` — the
+  fixed-point `(sum + N/2) >> log2(N)` — not round-half-away (a
+  negative-tie LAR mean in PRED1 and positive .75/.8 means in
+  BAD_SP/ADAPT_* discriminate all candidate roundings).
+
 - **GSM 06.32 Voice Activity Detector, conformance-exact
   (2026-08-01).** New `vad` module implementing the complete EN 300
   965 clause 3 fixed-point algorithm: adaptive filtering + energy
