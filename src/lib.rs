@@ -116,6 +116,7 @@ pub mod encoder;
 pub mod error;
 pub mod sync;
 pub mod tables;
+pub mod vad;
 
 pub use bitstream::{
     SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, GSM_BYTE_FRAME_MAGIC,
@@ -138,13 +139,14 @@ pub use decoder::{
     is_partial_decoder_homing_frame, DecoderState,
 };
 pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
-pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor};
+pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor, VadTap};
 pub use error::Error;
 pub use sync::{
     find_bit_sync, find_frame_sync, retard_special_frame, run_bit_sync_trial, BitSyncTrial,
     FrameSyncTable, SyncFormats, BIT_SYNC_TRIALS, HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
     SYNC_LEADING_FILL,
 };
+pub use vad::{Vad, VadMode};
 
 use oxideav_core::RuntimeContext;
 

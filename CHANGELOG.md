@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.32 Voice Activity Detector, conformance-exact
+  (2026-08-01).** New `vad` module implementing the complete EN 300
+  965 clause 3 fixed-point algorithm: adaptive filtering + energy
+  computation (pseudo-float `pvad`/`acf0`), 4-frame ACF averaging,
+  predictor values (Schur -> step-up -> autocorrelated predictors),
+  spectral comparison (`stat`), periodicity detection/updating
+  (`ptch`), threshold adaptation with the Table 3.2 pseudo-float
+  constants, VAD decision, hangover addition, and the clause 3.10
+  information-tone detector (Hanning window + 4th-order Schur + pole
+  frequency + prediction-gain tests; downlink mode). The encoder
+  gained `EncoderState::encode_frame_with_vad_tap`, surfacing the
+  clause-3 tap (`L_ACF[0..8]`, `scalauto`, the four LTP lags, and
+  the offset-compensated `sof[]` frame) as `VadTap`. Validated
+  bit-exactly against the official EN 300 965 corpus: all 20 test
+  cases (`tests/fixtures/etsi-vad/` + `tests/conformance_vad.rs`)
+  reproduce every `*.VAD` reference flag, agree with the `*.COD`
+  LAR(1) bit-15 flag, and the encoder reproduces every speech
+  (SP=1) `*.COD` frame bit-exactly.
+
+
 - **Official ETSI §6 conformance corpus, run bit-exactly in CI
   (2026-08-01).** The EN 300 961 digital test sequences are now staged
   under `tests/fixtures/etsi-fr/` (from the deliverable's electronic

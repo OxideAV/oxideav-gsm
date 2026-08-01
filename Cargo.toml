@@ -12,7 +12,7 @@ readme = "README.md"
 # The ETSI conformance corpus (≈5 MB of reference vectors) stays in the
 # git repo for CI but out of the published package; the conformance
 # tests that read it skip gracefully when the directory is absent.
-exclude = ["tests/fixtures/etsi-fr"]
+exclude = ["tests/fixtures/etsi-fr", "tests/fixtures/etsi-vad"]
 keywords = ["multimedia", "audio", "gsm", "telephony", "codec"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 

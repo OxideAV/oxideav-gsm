@@ -675,6 +675,17 @@ pub mod analysis {
     /// array the §5.2.10 lattice must consume (unchanged when
     /// `scalauto <= 0`).
     pub fn autocorrelation(s: &mut [i16; FRAME_SAMPLES]) -> [i32; 9] {
+        autocorrelation_with_scaling(s).0
+    }
+
+    /// §5.2.4 autocorrelation returning `(L_ACF[0..=8], scalauto)`.
+    ///
+    /// Identical to [`autocorrelation`] but additionally returns the
+    /// clause's dynamic scaling factor `scalauto`. The GSM 06.32 VAD
+    /// consumes exactly this pair — *"The VAD computation can start as
+    /// soon as the L_ACF[0..8] and scalauto variables are known"*
+    /// (GSM 06.32 §3) — so the encoder taps it here.
+    pub fn autocorrelation_with_scaling(s: &mut [i16; FRAME_SAMPLES]) -> ([i32; 9], i16) {
         // §5.2.4 — search for smax = max |s[k]|.
         let mut smax: i16 = 0;
         for &v in s.iter() {
@@ -737,7 +748,7 @@ pub mod analysis {
             }
         }
 
-        l_acf
+        (l_acf, scalauto)
     }
 
     /// §5.2.5 — Schur recursion producing the eight reflection
@@ -1133,6 +1144,17 @@ pub mod analysis {
             &mut self,
             s: &[i16; FRAME_SAMPLES],
         ) -> ([i16; 9], [i16; FRAME_SAMPLES]) {
+            let (lar_c, d, _, _) = self.analyse_frame_tapped(s);
+            (lar_c, d)
+        }
+
+        /// [`Self::analyse_frame`] additionally returning the §5.2.4
+        /// `(L_ACF[0..=8], scalauto)` pair, which the GSM 06.32 VAD
+        /// consumes (see [`autocorrelation_with_scaling`]).
+        pub fn analyse_frame_tapped(
+            &mut self,
+            s: &[i16; FRAME_SAMPLES],
+        ) -> ([i16; 9], [i16; FRAME_SAMPLES], [i32; 9], i16) {
             // §5.2.4 — autocorrelation, mutating the working copy of
             // s[] with the clause's scale → L_ACF → rescale sequence.
             // Whenever the dynamic scaling engages (scalauto > 0) the
@@ -1142,7 +1164,7 @@ pub mod analysis {
             // s[0..159] is shared pipeline state across §5.2.4 →
             // §5.2.10).
             let mut s_work = *s;
-            let l_acf = autocorrelation(&mut s_work);
+            let (l_acf, scalauto) = autocorrelation_with_scaling(&mut s_work);
 
             // §5.2.5..§5.2.7 — reflection coefficients → LAR →
             // LARc[1..=8].
@@ -1176,7 +1198,7 @@ pub mod analysis {
             // next frame.
             self.lar_pp_prev = lar_pp_curr;
 
-            (lar_c, d_frame)
+            (lar_c, d_frame, l_acf, scalauto)
         }
     }
 
@@ -4263,6 +4285,28 @@ pub struct EncoderState {
     ltp: analysis::LtpAnalyzer,
 }
 
+/// Per-frame tap of the encoder-internal variables the GSM 06.32
+/// Voice Activity Detector consumes (GSM 06.32 §3):
+///
+/// * `l_acf` / `scalauto` — the §5.2.4 autocorrelation function and
+///   its dynamic scaling factor;
+/// * `lags` — the four per-sub-segment §5.2.11 LTP lags `Nc`;
+/// * `sof` — the §5.2.2 offset-compensated signal frame (before
+///   §5.2.3 pre-emphasis), input to the VAD's tone detection.
+///
+/// Produced by [`EncoderState::encode_frame_with_vad_tap`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VadTap {
+    /// §5.2.4 `L_ACF[0..=8]`.
+    pub l_acf: [i32; 9],
+    /// §5.2.4 `scalauto`.
+    pub scalauto: i16,
+    /// §5.2.2 `sof[0..=159]`.
+    pub sof: [i16; FRAME_SAMPLES],
+    /// §5.2.11 `Nc` per sub-segment (`lags[0]` = first sub-segment).
+    pub lags: [i16; 4],
+}
+
 impl Default for EncoderState {
     fn default() -> Self {
         Self::new()
@@ -4316,11 +4360,31 @@ impl EncoderState {
     ///    next sub-segment's LTP search runs on the same history the
     ///    receiving decoder will build.
     pub fn encode_frame(&mut self, sop: &[i16; FRAME_SAMPLES]) -> UnpackedFrame {
-        // §5.2.1..§5.2.3 — pre-processing.
-        let s = self.pre.process_frame(sop);
+        self.encode_frame_with_vad_tap(sop).0
+    }
 
-        // §5.2.4..§5.2.10 — LARc codewords + short-term residual d[].
-        let (lar_c, d) = self.analyzer.analyse_frame(&s);
+    /// [`Self::encode_frame`] additionally returning the [`VadTap`] —
+    /// the encoder-internal variables the GSM 06.32 Voice Activity
+    /// Detector consumes for this frame.
+    ///
+    /// GSM 06.32 §3: *"The VAD algorithm takes as input the following
+    /// variables of the RPE-LTP encoder: L_ACF[0..8] […]; scalauto
+    /// […]; Nc, LTP lag (one for each sub-segment […]); sof, offset
+    /// compensated signal frame"*.
+    pub fn encode_frame_with_vad_tap(
+        &mut self,
+        sop: &[i16; FRAME_SAMPLES],
+    ) -> (UnpackedFrame, VadTap) {
+        // §5.2.1..§5.2.3 — pre-processing, keeping the §5.2.2 output
+        // sof[] (the VAD's tone-detection input) before the §5.2.3
+        // pre-emphasis.
+        let so = self.pre.downscale_frame(sop);
+        let sof = self.pre.offset_compensation(&so);
+        let s = self.pre.pre_emphasis(&sof);
+
+        // §5.2.4..§5.2.10 — LARc codewords + short-term residual d[],
+        // tapping the §5.2.4 (L_ACF, scalauto) pair.
+        let (lar_c, d, l_acf, scalauto) = self.analyzer.analyse_frame_tapped(&s);
 
         let mut frame = UnpackedFrame {
             lar_c,
@@ -4354,7 +4418,16 @@ impl EncoderState {
             };
         }
 
-        frame
+        let lags = core::array::from_fn(|j| frame.sub[j].n_c as i16);
+        (
+            frame,
+            VadTap {
+                l_acf,
+                scalauto,
+                sof,
+                lags,
+            },
+        )
     }
 
     /// Encode one frame applying the §4.3 encoder-homing protocol.
