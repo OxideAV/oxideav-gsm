@@ -344,6 +344,107 @@ pub fn classify_rx_frame(
     }
 }
 
+/// GSM 06.31 §6.1.2 RX DTX handler: the receive-side bridge from raw
+/// traffic frames + radio-subsystem flags to the crate's GSM 06.12
+/// [`DtxReceiver`].
+///
+/// Per §6.1.2:
+///
+/// * a **good speech frame** passes directly to the speech decoder;
+/// * a **valid SID frame** starts/updates comfort-noise generation
+///   from its carried parameters;
+/// * an **invalid SID frame** *"shall be substituted by the last
+///   valid SID frame and the procedure for valid SID frames be
+///   applied"*. Per the §6.1.2 NOTE, when no valid SID has been seen
+///   yet (the first SID after a speech burst is already invalid) the
+///   parameters *"can be taken from … the last received good speech
+///   frame which, because of the VAD hangover time, may be supposed
+///   to contain noise only"* — this handler applies exactly that
+///   fallback;
+/// * **unusable frames** during comfort noise are ignored when no SID
+///   is expected (noise generation continues); a **lost SID** frame
+///   (`TAF=1`) and a **lost speech** frame call for the GSM 06.11
+///   substitution-and-muting procedure. GSM 06.11 is a separate,
+///   unstaged specification, so this handler *continues its current
+///   mode* for those frames (comfort noise keeps running; on the
+///   speech path the last decoder state simply carries) and surfaces
+///   the classification so a caller with a GSM 06.11 implementation
+///   can take over.
+#[derive(Debug)]
+pub struct RxDtxHandler {
+    rx: crate::comfort_noise::DtxReceiver,
+    last_valid_sid: Option<SidParameters>,
+    /// Noise parameters harvested from the most recent good speech
+    /// frame (the §6.1.2 NOTE fallback source).
+    last_speech_params: Option<SidParameters>,
+}
+
+impl RxDtxHandler {
+    /// Build a fresh handler. `seed` seeds the comfort-noise PRNG
+    /// (see [`crate::NoiseRng`]).
+    pub fn new(seed: u32) -> Self {
+        Self {
+            rx: crate::comfort_noise::DtxReceiver::new(seed),
+            last_valid_sid: None,
+            last_speech_params: None,
+        }
+    }
+
+    /// Whether the handler is currently generating comfort noise.
+    pub fn is_generating_comfort_noise(&self) -> bool {
+        self.rx.is_generating_comfort_noise()
+    }
+
+    /// Access the wrapped GSM 06.12 receiver.
+    pub fn receiver(&self) -> &crate::comfort_noise::DtxReceiver {
+        &self.rx
+    }
+
+    /// Reset to the initial state (codec homing / stream restart).
+    pub fn reset(&mut self) {
+        self.rx.reset();
+        self.last_valid_sid = None;
+        self.last_speech_params = None;
+    }
+
+    /// Process one received traffic frame with its radio-subsystem
+    /// flags, returning the §6.1 table-1 classification applied and
+    /// the 160 output samples.
+    pub fn receive_traffic_frame(
+        &mut self,
+        frame: &UnpackedFrame,
+        bfi: bool,
+        taf: bool,
+    ) -> (RxClassification, [i16; crate::FRAME_SAMPLES]) {
+        use crate::comfort_noise::RxFrame;
+        let class = classify_rx_frame(frame, bfi, taf, self.rx.is_generating_comfort_noise());
+        let out = match class {
+            RxClassification::GoodSpeechFrame => {
+                self.last_speech_params = Some(sid_frame_parameters(frame));
+                self.rx.receive(RxFrame::Speech(Box::new(*frame)))
+            }
+            RxClassification::ValidSidFrame => {
+                let sid = sid_frame_parameters(frame);
+                self.last_valid_sid = Some(sid);
+                self.rx.receive(RxFrame::Sid(sid))
+            }
+            RxClassification::InvalidSidFrame => {
+                // §6.1.2: substitute the last valid SID; NOTE fallback
+                // to the last good speech frame's parameters.
+                let sid = self
+                    .last_valid_sid
+                    .or(self.last_speech_params)
+                    .unwrap_or_default();
+                self.rx.receive(RxFrame::Sid(sid))
+            }
+            RxClassification::LostSidFrame
+            | RxClassification::LostSpeechFrame
+            | RxClassification::IgnoredUnusableFrame => self.rx.receive(RxFrame::NoData),
+        };
+        (class, out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +638,78 @@ mod tests {
             classify_rx_frame(&speech, true, false, true),
             IgnoredUnusableFrame
         );
+    }
+
+    /// §6.1.2 RX handler: valid SID starts noise; unusable frames are
+    /// ignored during noise; speech ends it.
+    #[test]
+    fn rx_handler_state_flow() {
+        let mut rx = RxDtxHandler::new(7);
+        let sid = make_sid_frame(&SidParameters::new(
+            [0, 8, -4, 2, -1, 1, 0, 1, -1],
+            [12; SUBFRAMES],
+        ));
+        // Valid SID -> comfort noise.
+        let (c, _) = rx.receive_traffic_frame(&sid, false, false);
+        assert_eq!(c, RxClassification::ValidSidFrame);
+        assert!(rx.is_generating_comfort_noise());
+        // Unusable frame, no SID expected -> ignored, noise continues.
+        let speechy = decoder_homing_frame();
+        let (c, _) = rx.receive_traffic_frame(&speechy, true, false);
+        assert_eq!(c, RxClassification::IgnoredUnusableFrame);
+        assert!(rx.is_generating_comfort_noise());
+        // Lost SID (TAF=1) -> noise continues (GSM 06.11 hook).
+        let (c, _) = rx.receive_traffic_frame(&speechy, true, true);
+        assert_eq!(c, RxClassification::LostSidFrame);
+        assert!(rx.is_generating_comfort_noise());
+        // Good speech ends the noise period.
+        let (c, _) = rx.receive_traffic_frame(&speechy, false, false);
+        assert_eq!(c, RxClassification::GoodSpeechFrame);
+        assert!(!rx.is_generating_comfort_noise());
+    }
+
+    /// §6.1.2 invalid-SID substitution: with a valid SID on record the
+    /// invalid frame behaves exactly like re-receiving that SID.
+    #[test]
+    fn rx_handler_invalid_sid_substitutes_last_valid() {
+        let params = SidParameters::new([0, 8, -4, 2, -1, 1, 0, 1, -1], [12; SUBFRAMES]);
+        let sid = make_sid_frame(&params);
+        let mut invalid = sid;
+        invalid.sub[0].x_mc[0] = 0b100;
+        invalid.sub[1].x_mc[2] = 0b100; // deviation 2 => SID=1
+
+        // Twin A receives valid, then invalid.
+        let mut a = RxDtxHandler::new(9);
+        let _ = a.receive_traffic_frame(&sid, false, false);
+        let (ca, out_a) = a.receive_traffic_frame(&invalid, false, false);
+        assert_eq!(ca, RxClassification::InvalidSidFrame);
+
+        // Twin B receives the valid SID twice.
+        let mut b = RxDtxHandler::new(9);
+        let _ = b.receive_traffic_frame(&sid, false, false);
+        let (_, out_b) = b.receive_traffic_frame(&sid, false, false);
+        assert_eq!(out_a, out_b, "substitution must equal re-received SID");
+    }
+
+    /// §6.1.2 NOTE — first SID after speech already invalid: fall back
+    /// to the last good speech frame's parameters (hangover frames may
+    /// be supposed to contain noise only).
+    #[test]
+    fn rx_handler_invalid_first_sid_uses_speech_fallback() {
+        let mut rx = RxDtxHandler::new(3);
+        // A good speech frame (hangover tail).
+        let mut speech = decoder_homing_frame();
+        speech.lar_c[1] = 20;
+        let (c, _) = rx.receive_traffic_frame(&speech, false, false);
+        assert_eq!(c, RxClassification::GoodSpeechFrame);
+        // First SID is invalid.
+        let mut invalid = make_sid_frame(&SidParameters::default());
+        invalid.sub[0].x_mc[0] = 0b100;
+        invalid.sub[2].x_mc[7] = 0b100;
+        let (c, _) = rx.receive_traffic_frame(&invalid, false, false);
+        assert_eq!(c, RxClassification::InvalidSidFrame);
+        assert!(rx.is_generating_comfort_noise());
+        // The parameters in effect came from the speech frame.
+        assert_eq!(rx.receiver().sid().lar_cr[1], 20);
     }
 }

@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.31 §6.1.2 RX DTX handler (2026-08-01).** `RxDtxHandler`
+  bridges raw traffic frames + radio-subsystem flags (BFI, TAF) to
+  the GSM 06.12 receive side: table-1 classification, valid-SID
+  start/update, the §6.1.2 invalid-SID substitution (last valid SID,
+  with the §6.1.2-NOTE fallback to the last good speech frame's
+  parameters when the first SID after a burst is already invalid),
+  unusable-frame handling per state, and a documented hook for the
+  GSM 06.11 substitution-and-muting procedure (a separate, unstaged
+  specification).
+
 - **GSM 06.31 DTX transmit side + GSM 06.12 SID-frame encoding,
   conformance-exact (2026-08-01).** New `dtx` module: the §5.2 SID
   frame (mean LARs + the mean block amplitude repeated four times +
