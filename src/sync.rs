@@ -20,14 +20,15 @@
 //!   0..159 sample retardation of the encoder's 20 ms window once bit
 //!   synchronization is known.
 //!
-//! The actual `BITSYNC.INP` / `SEQSYNC.INP` / `SYNCxxx.COD` reference
-//! *binary* sequences live in the ETSI conformance archive (not staged
-//! under `docs/audio/gsm/`), so this module does not ship those exact
-//! bytes. Instead it implements the §6.3.3.3 *procedure* that built
-//! them and the *invariant* the spec states they satisfy (160 distinct
-//! output frames), parameterised on any caller-supplied "special
-//! synchronization frame". The §6.3.3.4 reference-file formats and
-//! sizes are recorded in [`SyncFormats`].
+//! This module implements the §6.3.3.3 *procedure* and the
+//! *invariant* the spec states the reference sequences satisfy (160
+//! distinct output frames), parameterised on the caller-supplied
+//! "special synchronization frame". The actual `BITSYNC.INP` /
+//! `SEQSYNC.INP` / `SYNCxxx.COD` reference binaries are staged under
+//! `tests/fixtures/etsi-fr/`, and `tests/conformance_etsi_fr.rs`
+//! drives this module with them: the genuine special frame reproduces
+//! the `SYNCxxx.COD` bytes bit-exactly. The §6.3.3.4 reference-file
+//! formats and sizes are recorded in [`SyncFormats`].
 //!
 //! ## Frame synchronization (§6.3.3.3)
 //!
@@ -366,7 +367,7 @@ mod tests {
     /// A triplet of three encoder-homing-frames at the correct
     /// alignment (`shift == 0`), and an obviously non-homing triplet
     /// for every other shift. This mirrors the §6.3.3.3 mechanism
-    /// without needing the unstaged `BITSYNC.INP`: only the correct
+    /// without reading the staged `BITSYNC.INP`: only the correct
     /// alignment reconstructs genuine encoder-homing-frames.
     fn synthetic_triplet(shift: usize) -> [[i16; FRAME_SAMPLES]; HOMING_FRAMES_PER_TRIAL] {
         if shift == 0 {

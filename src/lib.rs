@@ -87,12 +87,11 @@
 //! [`UnpackedFrame::from_bit_stream_msb_first`] accepts a 33-byte
 //! buffer holding the spec's `b1..b260` stream packed MSB-first.
 //! That layout matches the `b`-numbered bit positions §1.7 Table
-//! 1.1 spells out verbatim. The specific 33-byte container
-//! variants used in the wild (the `.gsm` byte format, RTP payload
-//! type 3, MS-GSM WAV `0x31` block) wrap these 260 bits with
-//! different per-container framing that is **not** specified in
-//! EN 300 961 itself — those wrappers will be addressed in a
-//! follow-up round once trace docs for them are staged.
+//! 1.1 spells out verbatim. The de-facto `.gsm` byte-frame and the
+//! MS-GSM two-frame block are also implemented (empirically derived
+//! and fixture-pinned — see the README's carriage-formats section);
+//! the codec adapters select the packing via
+//! `CodecParameters::extradata` ([`FramePacking`]).
 //!
 //! Separately, the ETSI §6 *conformance test sequences* use a
 //! **word-oriented** on-disk format (each parameter in its own
@@ -100,8 +99,8 @@
 //! is handled by the [`confio`] module: [`unpacked_to_cod_words`] /
 //! [`cod_words_to_unpacked`] and the `*.COD` / `*.INP` / `*.OUT`
 //! byte converters. It is the counterpart to [`bitstream`]'s packed
-//! 260-bit in-band stream, for reading/writing the `*.INP`/`*.COD`/
-//! `*.OUT` reference files once they are staged.
+//! 260-bit in-band stream, and is the reader the staged ETSI
+//! conformance corpus (`tests/fixtures/etsi-fr/`) runs through.
 
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]

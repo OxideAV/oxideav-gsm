@@ -4481,9 +4481,11 @@ impl EncoderState {
     ///   decoder-homing-frame.
     ///
     /// §4.3 Step 2 also names VAD and DTX among the sub-modules to
-    /// home; this crate implements neither (GSM 06.32 / GSM 06.31
-    /// are separate specifications, not staged), so the reset covers
-    /// the complete §4.5 Table 4.2 set this encoder owns.
+    /// home. Those live in their own state machines here
+    /// ([`crate::Vad::reset`], [`crate::TxDtxHandler::reset`]); this
+    /// method resets the complete §4.5 Table 4.2 set the speech
+    /// encoder itself owns, and a DTX system driver homes the VAD and
+    /// DTX handler alongside it.
     ///
     /// For raw §5.2 encoding without the §4.3 reset, use
     /// [`Self::encode_frame`] directly.

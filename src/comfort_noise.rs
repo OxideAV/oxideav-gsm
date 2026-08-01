@@ -47,33 +47,25 @@
 //! ## What is *not* here (docs gap)
 //!
 //! Three parts of the DTX comfort-noise path depend on companion
-//! specifications that are **not** staged under `docs/audio/gsm/`, so
-//! they are deliberately left out:
+//! specifications, implemented by their own modules and composed on
+//! top of this one:
 //!
 //! * **Which frames are VAD = 0.** §5.1 averages only frames *"marked
 //!   with VAD = 0"*; the Voice Activity Detection algorithm producing
-//!   that mark is **GSM 06.32** (not staged). [`NoiseEvaluator`]
-//!   therefore averages the VAD = 0 frames the caller supplies rather
-//!   than detecting voice activity itself.
-//! * **The §5.2 SID-frame *bit* layout.** The §5.2 *parameter*
-//!   encoding (mean LARs / block amplitude → codewords) is implemented;
-//!   what remains is the SID *bit* layout — the 95-bit all-zero "SID
-//!   code word" inserted at *"those 95 bits of the encoded RPE-pulses
-//!   Xmc which are in the error protection class I (see GSM 05.03,
-//!   table 2)"*. **GSM 05.03 table 2** (not staged) holds those
-//!   positions, so the transmit side stops at the §5.2 [`SidParameters`]
-//!   codewords and does not pack a SID bitstream, nor implement the
-//!   matching receive-side "valid SID frame" detector.
-//! * **DTX scheduling.** When a SID frame is emitted or comfort noise
-//!   updated (§6 opening, §6.1 closing) is defined in **GSM 06.31**
-//!   (not staged).
+//!   that mark is **GSM 06.32** ([`crate::Vad`]). [`NoiseEvaluator`]
+//!   averages the VAD = 0 frames the caller supplies.
+//! * **The §5.2 SID-frame *bit* layout** — the 95-bit all-zero "SID
+//!   code word" at the GSM 05.03 table-2 class-I `Xmc` positions —
+//!   and the matching receive-side SID detector live in
+//!   [`crate::dtx`] ([`crate::make_sid_frame`], [`crate::sid_flag`]).
+//! * **DTX scheduling** (when a SID frame is emitted, GSM 06.31) is
+//!   [`crate::TxDtxHandler`] / [`crate::RxDtxHandler`].
 //!
 //! Accordingly the transmit side ([`NoiseEvaluator`]) emits the §5.2
 //! [`SidParameters`] codewords and the receive side
 //! ([`ComfortNoiseGenerator`]) consumes them — the full §5.1 → §5.2 →
-//! §6.1 parameter loop — leaving the §5.2 SID *bit*-packing, the VAD
-//! mark, and the DTX scheduling for a follow-up round once GSM 05.03 /
-//! 06.31 / 06.32 are staged.
+//! §6.1 parameter loop; the SID *bit*-packing, the VAD mark, and the
+//! DTX scheduling are composed on top by the `vad` and `dtx` modules.
 
 use crate::bitstream::{SubFrame, UnpackedFrame, SUBFRAMES};
 use crate::decoder::DecoderState;
@@ -433,10 +425,10 @@ fn lerp_round(a: i32, b: i32, n: i32, f: i32) -> i32 {
 /// (*"a few frames"*); [`Self::set_interpolation_frames`] overrides it,
 /// and a length of `0` reproduces the plain immediate replacement.
 ///
-/// (The §6 *scheduling* of when a valid SID frame arrives is a GSM 06.31
-/// concern, not staged; this generator implements the §6.1 generation
-/// and the §6.1 update-smoothing, and leaves the schedule to the
-/// caller's `update_sid` cadence.)
+/// (The §6 *scheduling* of when a valid SID frame arrives is a GSM
+/// 06.31 concern — [`crate::TxDtxHandler`] on the transmit side; this
+/// generator implements the §6.1 generation and update-smoothing, and
+/// leaves the schedule to the caller's `update_sid` cadence.)
 #[derive(Debug)]
 pub struct ComfortNoiseGenerator {
     decoder: DecoderState,
@@ -543,14 +535,13 @@ impl ComfortNoiseGenerator {
 /// *classified* into one of three kinds. The classification itself is a
 /// **documented spec gap**: telling a valid SID frame apart from a
 /// speech frame requires detecting the §5.2 "SID code word" — the 95
-/// all-zero bits at the GSM 05.03 table-2 class-I positions — and the
-/// *scheduling* of which radio frames carry SID / speech / nothing is
-/// **GSM 06.31**. Neither GSM 05.03 nor GSM 06.31 is staged under
-/// `docs/audio/gsm/`, so — exactly as [`NoiseEvaluator`] accepts the
-/// VAD = 0 mark from the caller rather than running the (unstaged) GSM
-/// 06.32 VAD itself — [`DtxReceiver`] accepts the *classified* frame
-/// from the caller and implements only the §6 dispatch the staged
-/// EN 300 963 PDF fully defines.
+/// all-zero bits at the GSM 05.03 table-2 class-I positions
+/// ([`crate::sid_flag`]) — and the *scheduling* of which radio frames
+/// carry SID / speech / nothing is **GSM 06.31**
+/// ([`crate::RxDtxHandler`], which performs that classification and
+/// drives this receiver). [`DtxReceiver`] itself accepts the
+/// *classified* frame and implements the §6 dispatch EN 300 963
+/// defines.
 #[derive(Debug, Clone)]
 pub enum RxFrame {
     /// A normal §1.7 speech frame: decode it through the standard §5.3
