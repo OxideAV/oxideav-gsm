@@ -9,6 +9,10 @@ description = "Pure-Rust GSM Full Rate (ETSI 06.10, RPE-LTP) speech codec — cl
 repository = "https://github.com/OxideAV/oxideav-gsm"
 homepage = "https://github.com/OxideAV/oxideav-gsm"
 readme = "README.md"
+# The ETSI conformance corpus (≈5 MB of reference vectors) stays in the
+# git repo for CI but out of the published package; the conformance
+# tests that read it skip gracefully when the directory is absent.
+exclude = ["tests/fixtures/etsi-fr"]
 keywords = ["multimedia", "audio", "gsm", "telephony", "codec"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 

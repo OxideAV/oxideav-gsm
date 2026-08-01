@@ -566,60 +566,62 @@ pub fn is_partial_decoder_homing_frame(frame: &UnpackedFrame) -> bool {
 impl DecoderState {
     /// Decode one frame applying the §4.4 decoder-homing protocol.
     ///
-    /// §4.4 Step 1 — when the input frame *is* a decoder-homing-frame
-    /// (and not flagged as a bad frame), the output is replaced
-    /// with the encoder-homing-frame (160 samples of `0x0008` per
-    /// §4.2). §4.4 Step 2 — after that frame is processed, the
-    /// decoder's state variables are reset to their §4.6 Table 4.3
-    /// home values so that the *next* frame starts from the home
-    /// state.
+    /// The protocol's two situations differ in what the homing frame
+    /// itself *outputs* — the distinction is pinned bit-exactly by the
+    /// §6.3.3.2 `HOMING01` reference sequence
+    /// (`tests/conformance_etsi_fr.rs`):
     ///
-    /// §4.4 NOTE 1 explains the consequence: a sequence of N
-    /// decoder-homing-frames will produce at least N-1
-    /// encoder-homing-frames at the output, because the very first
-    /// homing frame may arrive while the decoder is in an arbitrary
-    /// (non-home) state. With this method, the first homing frame
-    /// triggers the substitution; from the second onward the decoder
-    /// is already homed and the output is the spec-defined
-    /// `0x0008`-fill regardless.
+    /// * **Decoder not in its home state** (mid-speech): only a
+    ///   *complete* decoder-homing-frame ([`is_decoder_homing_frame`])
+    ///   is a homing event. §4.4 Step 1 — the frame is decoded
+    ///   **normally** (its output is the regular §5.3 decode with the
+    ///   carried-over state; `HOMING01` frames 50/60/70/80/90 expect
+    ///   real decoded samples here, not a substituted fill). §4.4
+    ///   Step 2 — *after* that, the state variables are reset to their
+    ///   §4.6 Table 4.3 home values, so the *next* frame starts from
+    ///   the home state. This decode-then-reset order is what gives
+    ///   §4.4 NOTE 1 its *"N homing frames in ⇒ at least N-1
+    ///   encoder-homing-frames out"* arithmetic: the first homing
+    ///   frame's own output is not a homing output, every subsequent
+    ///   one's is.
     ///
-    /// §4.4 NOTE 2 / §6.3.3.2 — *delay-optimised* detection. Once the
-    /// decoder is already in its §4.6 home state, a subsequent frame
-    /// only needs to carry the decoder-homing-frame's LARs and first
-    /// sub-frame (sub-frames 2..=4 may differ) to trigger the same
-    /// substitution + reset. The §6.3.3.2 `HOMING01` sequence
-    /// exercises exactly this: after two complete homing frames home
-    /// the decoder, it feeds a mixture of complete and *fractional*
-    /// homing frames, each of which must still home the decoder. A
-    /// non-home decoder, by contrast, must receive a *complete*
-    /// homing frame ([`is_decoder_homing_frame`]) before it resets,
-    /// because §4.4 NOTE 2's soundness argument only holds from the
-    /// home state.
+    /// * **Decoder already in its home state**: the delay-optimised
+    ///   §4.4 NOTE 2 criterion applies — a frame carrying just the
+    ///   homing LARs and first sub-frame ([`is_partial_decoder_homing_frame`];
+    ///   sub-frames 2..=4 may hold arbitrary data) is a homing event,
+    ///   and the output **is** the substituted §4.2
+    ///   encoder-homing-frame (160 × `0x0008`), with the state left at
+    ///   home. `HOMING01` frames 71/81 (fractional homing frames right
+    ///   after a reset) expect exactly the `0x0008` fill — decoding
+    ///   their arbitrary sub-frames 2..=4 would produce something
+    ///   else, which is the observable difference that fixes this
+    ///   branch's substitution semantics. A complete homing frame from
+    ///   the home state (frames 0/1/91) takes the same path; for it the
+    ///   substitution coincides with the normal decode (the
+    ///   decoder-homing-frame decodes from home to the
+    ///   encoder-homing-frame, the §4.1 loop-back pair).
     ///
-    /// For raw §5.3 decoding without the §4.4 substitution, use
+    /// A *fractional* homing frame reaching a **non-homed** decoder is
+    /// not a homing event at all — it decodes as ordinary speech
+    /// (`HOMING01` frames 30/40): §4.4 NOTE 2's soundness argument only
+    /// holds from the home state.
+    ///
+    /// For raw §5.3 decoding without the §4.4 protocol, use
     /// [`Self::decode_frame`] directly.
     pub fn decode_frame_with_homing(&mut self, frame: &UnpackedFrame) -> [i16; FRAME_SAMPLES] {
-        // A homed decoder accepts the cheaper LARs-plus-first-sub-frame
-        // criterion (§4.4 NOTE 2); a non-homed decoder demands the
-        // complete homing frame.
-        let is_homing = if self.is_home_state() {
-            is_partial_decoder_homing_frame(frame)
-        } else {
-            is_decoder_homing_frame(frame)
-        };
-
-        if is_homing {
-            // §4.4 Step 1 — run the normal decode (so internal
-            // state is consistent with having processed the input)
-            // but discard the output and emit the encoder-homing-
-            // frame instead.
-            let _ = self.decode_frame(frame);
-            // §4.4 Step 2 — reset all state variables to home.
+        if self.is_home_state() {
+            if is_partial_decoder_homing_frame(frame) {
+                // §4.4 NOTE 2 — substituted output, state stays home.
+                self.reset();
+                return encoder_homing_frame_pcm();
+            }
+        } else if is_decoder_homing_frame(frame) {
+            // §4.4 Step 1: normal decode; Step 2: reset afterwards.
+            let out = self.decode_frame(frame);
             self.reset();
-            encoder_homing_frame_pcm()
-        } else {
-            self.decode_frame(frame)
+            return out;
         }
+        self.decode_frame(frame)
     }
 }
 
@@ -1190,10 +1192,18 @@ mod tests {
             "dirty decoder must NOT home on a fractional frame"
         );
 
-        // A *complete* homing frame, by contrast, does home it.
+        // A *complete* homing frame, by contrast, does home it — §4.4
+        // Step 1 decodes it normally (with the carried non-home state;
+        // HOMING01 frames 50/60/70/80/90 pin this against the reference
+        // bytes), and §4.4 Step 2 resets afterwards.
+        let mut twin2 = dec.clone();
+        let raw2 = twin2.decode_frame(&h);
         let out2 = dec.decode_frame_with_homing(&h);
-        assert_eq!(out2, encoder_homing_frame_pcm());
-        assert!(dec.is_home_state());
+        assert_eq!(
+            out2, raw2,
+            "the first homing frame's own output is its normal decode"
+        );
+        assert!(dec.is_home_state(), "…and the reset follows it");
     }
 
     /// A non-homing input bypasses the §4.4 substitution — the

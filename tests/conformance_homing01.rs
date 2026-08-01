@@ -14,19 +14,15 @@
 //! > mixture of complete and fractional (incomplete)
 //! > decoder-homing-frames."* (§6.3.3.2)
 //!
-//! The reference `HOMING01.COD` / `HOMING01.OUT` *binary* files ship in
-//! the ETSI conformance archive, which is **not** staged under
-//! `docs/audio/gsm/`. But the sequence's *defining behaviour* — and the
-//! exact §4.4 / §4.4-NOTE-2 state-machine transitions it checks — are
-//! fully specified in the staged PDF. This harness reconstructs a
-//! `HOMING01`-shaped coded stream from the spec (two leading complete
-//! decoder-homing-frames, then a mixture of complete + fractional homing
-//! frames interleaved with ordinary speech) and drives it through the
-//! **public registry decoder adapter** (`make_decoder` + `Packet`),
-//! asserting the §6.3.3.2 reset behaviour frame-by-frame at the byte
-//! level.
+//! The reference `HOMING01.COD` / `HOMING01.OUT` *binary* files are now
+//! staged (`tests/fixtures/etsi-fr/`) and run bit-exactly in
+//! `tests/conformance_etsi_fr.rs`. This harness complements that with a
+//! `HOMING01`-shaped stream driven through the **public registry
+//! decoder adapter** (`make_decoder` + `Packet`), asserting the
+//! §6.3.3.2 state machine frame-by-frame at the byte level.
 //!
-//! The state-machine rules pinned here (all in-PDF):
+//! The state-machine rules pinned here (in-PDF, and fixed bit-exactly
+//! by the reference `HOMING01` vectors):
 //!
 //! 1. §4.4 step 1 — a **non-home** decoder homes only on a **complete**
 //!    decoder-homing-frame; a fractional one is decoded as ordinary
@@ -34,9 +30,14 @@
 //!    state).
 //! 2. §4.4 NOTE 2 / §6.3.3.2 — a **homed** decoder homes on a
 //!    **fractional** homing frame (LARs + first sub-frame of the homing
-//!    frame, sub-frames 2..=4 arbitrary).
-//! 3. §4.4 step 2 — every homing event emits the encoder-homing-frame
-//!    (160 × `0x0008`) and resets all state to §4.6 home.
+//!    frame, sub-frames 2..=4 arbitrary), and that homing's output is
+//!    the substituted encoder-homing-frame (160 × `0x0008`).
+//! 3. §4.4 step order — on a **non-home** decoder the complete homing
+//!    frame is decoded *normally* first (its own output reflects the
+//!    carried state; the reference `HOMING01.OUT` frames 50/60/70/80/90
+//!    hold rich decoded samples there) and the reset to §4.6 home
+//!    follows it — which is what makes §4.4 NOTE 1's *"N in ⇒ N-1
+//!    out"* arithmetic come out.
 //! 4. §6.2.2 history-independence — the post-homing output is fully
 //!    defined regardless of the divergent history that preceded it.
 
@@ -126,13 +127,20 @@ fn is_reset_output(out: &[u8]) -> bool {
 fn homing01_full_sequence_resets_on_every_homing_event() {
     let mut dec = make_decoder(&params()).unwrap();
 
-    // Each step: (label, coded frame, expect_reset_output).
-    // The "expect" column encodes the §4.4 state machine: a homing
-    // event only happens when the *current* decoder state admits the
-    // frame as homing (complete always; fractional only when homed).
+    // Each step: (label, coded frame, expectation). A homing event
+    // happens when the *current* decoder state admits the frame as
+    // homing (complete always; fractional only when homed). The
+    // *output* expectation differs by entry state (§4.4 step order,
+    // fixed by the reference HOMING01 vectors):
     //
-    // State trace (H = homed at frame entry):
-    //   start: H
+    //   * homing event entered from **home** — substituted
+    //     encoder-homing-frame output (all-`0x0008`);
+    //   * homing event entered from **non-home** — the frame's own
+    //     NORMAL decode (must equal a twin raw §5.3 decode), reset
+    //     afterwards;
+    //   * speech — normal decode, never the substituted fill.
+    //
+    // State trace (H = homed at frame entry): start: H
     enum Step {
         Complete,
         Fractional(u8),
@@ -142,50 +150,73 @@ fn homing01_full_sequence_resets_on_every_homing_event() {
 
     // HOMING01 shape: 2 complete leaders, then the mixture.
     let seq = [
-        Complete,      // 1: H  -> reset, stays H
-        Complete,      // 2: H  -> reset, stays H   (2 complete leaders)
-        Fractional(1), // 3: H  -> reset (NOTE 2),   stays H
+        Complete,      // 1: H  -> substituted reset, stays H
+        Complete,      // 2: H  -> substituted reset, stays H (2 leaders)
+        Fractional(1), // 3: H  -> substituted reset (NOTE 2), stays H
         Speech(7),     // 4: H  -> speech, leaves H
-        Complete,      // 5: !H -> reset (complete),  back to H
-        Fractional(2), // 6: H  -> reset (NOTE 2),    stays H
-        Fractional(3), // 7: H  -> reset (NOTE 2),    stays H
+        Complete,      // 5: !H -> normal decode + reset, back to H
+        Fractional(2), // 6: H  -> substituted reset (NOTE 2), stays H
+        Fractional(3), // 7: H  -> substituted reset (NOTE 2), stays H
         Speech(9),     // 8: H  -> speech, leaves H
         Fractional(4), // 9: !H -> NOT homing -> speech, stays !H
         Speech(11),    // 10:!H -> speech, stays !H
-        Complete,      // 11:!H -> reset (complete),  back to H
+        Complete,      // 11:!H -> normal decode + reset, back to H
         Speech(13),    // 12:H  -> speech, leaves H
-        Complete,      // 13:!H -> reset (complete),  back to H
+        Complete,      // 13:!H -> normal decode + reset, back to H
     ];
+
+    // A twin raw §5.3 decoder (no homing protocol) predicts the
+    // "normal decode" outputs; it is manually reset where the homing
+    // protocol resets the decoder under test.
+    let mut twin = oxideav_gsm::DecoderState::new();
 
     // Track homed-state expectation alongside the decoder.
     let mut homed = true; // make_decoder starts in §4.6 home state.
     for (i, step) in seq.iter().enumerate() {
-        let (cod, expect_reset): ([u8; 33], bool) = match step {
-            Complete => {
-                // Complete homing frame always homes, from any state.
-                (complete_homing_cod(), true)
-            }
-            Fractional(s) => {
-                // Fractional homes ONLY a homed decoder (§4.4 NOTE 2).
-                (fractional_homing_cod(*s), homed)
-            }
+        let (cod, is_homing_event): ([u8; 33], bool) = match step {
+            Complete => (complete_homing_cod(), true),
+            Fractional(s) => (fractional_homing_cod(*s), homed),
             Speech(s) => (speech_cod(*s), false),
         };
+        let label = match step {
+            Complete => "complete-homing".to_string(),
+            Fractional(s) => format!("fractional-homing[{s}]"),
+            Speech(s) => format!("speech[{s}]"),
+        };
+        let frame = UnpackedFrame::from_bit_stream_msb_first(&cod).unwrap();
+        let raw = twin.decode_frame(&frame);
+        let raw_bytes: Vec<u8> = raw.iter().flat_map(|s| s.to_le_bytes()).collect();
         let out = decode_one(&mut dec, &cod);
-        assert_eq!(
-            is_reset_output(&out),
-            expect_reset,
-            "frame {} ({}): reset expectation",
-            i + 1,
-            match step {
-                Complete => "complete-homing".to_string(),
-                Fractional(s) => format!("fractional-homing[{s}]"),
-                Speech(s) => format!("speech[{s}]"),
+
+        if is_homing_event && homed {
+            assert!(
+                is_reset_output(&out),
+                "frame {} ({label}): homed homing event must substitute the fill",
+                i + 1
+            );
+        } else {
+            // Non-home homing events and speech both output the
+            // frame's normal §5.3 decode.
+            assert_eq!(
+                out,
+                raw_bytes,
+                "frame {} ({label}): output must be the normal decode",
+                i + 1
+            );
+            if !is_homing_event {
+                assert!(
+                    !is_reset_output(&out),
+                    "frame {} ({label}): speech must not look like a reset",
+                    i + 1
+                );
             }
-        );
-        // Update the homed expectation: a reset event ⇒ homed; a
-        // decoded speech frame ⇒ not homed.
-        homed = expect_reset;
+        }
+        // A homing event leaves both the decoder under test and the
+        // twin at the §4.6 home state.
+        if is_homing_event {
+            twin.reset();
+        }
+        homed = is_homing_event;
     }
 }
 
@@ -205,11 +236,15 @@ fn fractional_does_not_home_a_nonhome_decoder() {
         !is_reset_output(&frac),
         "§4.4 NOTE 2: a non-home decoder must not home on a fractional frame"
     );
-    // A *complete* homing frame, by contrast, homes it.
-    let comp = decode_one(&mut dec, &complete_homing_cod());
+    // A *complete* homing frame, by contrast, homes it — its own
+    // output is the normal decode (§4.4 step order), and the *next*
+    // fractional homing frame proves the decoder is now homed by
+    // substituting the fill (§4.4 NOTE 2).
+    let _ = decode_one(&mut dec, &complete_homing_cod());
+    let next = decode_one(&mut dec, &fractional_homing_cod(2));
     assert!(
-        is_reset_output(&comp),
-        "§4.4 step 1: a complete homing frame homes a non-home decoder"
+        is_reset_output(&next),
+        "§4.4 step 1/2: the complete homing frame must have homed the decoder"
     );
 }
 
@@ -250,9 +285,10 @@ fn homing01_output_is_history_independent_after_reset() {
     }
 }
 
-/// §4.4 step 2 — every reset output is exactly 160 × `0x0008`
-/// (the encoder-homing-frame), regardless of which homing form
-/// triggered it.
+/// §4.4 NOTE 2 — every homing event entered from the **home** state
+/// outputs exactly 160 × `0x0008` (the substituted
+/// encoder-homing-frame), whether the trigger was a complete or a
+/// fractional homing frame.
 #[test]
 fn every_reset_output_is_the_encoder_homing_frame() {
     let mut dec = make_decoder(&params()).unwrap();

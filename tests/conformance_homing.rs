@@ -266,11 +266,22 @@ fn config2_two_leading_homing_frames_define_subsequent_output() {
         f.to_bit_stream_msb_first()
     };
     let _ = decode_one(&mut b, &noisy);
-    assert_eq!(
-        decode_one(&mut b, &seq06h_cod()),
-        ehf,
-        "homing frame 1 (dirty)"
-    );
+    // §4.4 Step 1/Step 2 order: the first homing frame on a *dirty*
+    // decoder decodes normally (its output depends on the divergent
+    // history — §6.2 "the first output frame is undefined"; the real
+    // HOMING01 vectors pin rich decoded samples here) and the reset
+    // follows it. Only §5.3.7 shaping is guaranteed for it.
+    let first_dirty = decode_one(&mut b, &seq06h_cod());
+    for pair in first_dirty.chunks_exact(2) {
+        let s = i16::from_le_bytes([pair[0], pair[1]]);
+        assert_eq!(
+            s & 0b111,
+            0,
+            "§5.3.7 shaping on the first (dirty) homing output"
+        );
+    }
+    // The second homing frame arrives at a homed decoder: its output
+    // IS the substituted encoder-homing-frame.
     assert_eq!(
         decode_one(&mut b, &seq06h_cod()),
         ehf,

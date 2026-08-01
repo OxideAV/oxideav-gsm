@@ -4,7 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Official ETSI §6 conformance corpus, run bit-exactly in CI
+  (2026-08-01).** The EN 300 961 digital test sequences are now staged
+  under `tests/fixtures/etsi-fr/` (from the deliverable's electronic
+  attachment via the workspace docs staging; SHA-256 manifest
+  included) and driven by `tests/conformance_etsi_fr.rs`: `Seq01..04`
+  encoder legs byte-exact, `Seq01..05` (+ all `*h` homing variants)
+  decoder legs sample-exact, `Seq06h` equal to the crate's
+  spec-reconstructed homing frames, `Homing01` frame-by-frame, the
+  §6.3.3.3 `Seqsync`/`Sync000..149` frame-synchronization sweep
+  bit-exact (the staged `Sync150..159` files duplicate `Sync050..059`
+  — a staged-corpus defect pinned as a tripwire), and the
+  `Bitsync.inp` 13-trial bit-synchronization sweep.
+
 ### Fixed
+
+- **§4.4 decoder-homing output semantics (2026-08-01), found by the
+  `Homing01` reference vectors.** A complete decoder-homing-frame
+  arriving at a **non-homed** decoder is decoded *normally* — its own
+  output is the regular §5.3 decode with the carried state — and the
+  reset to the §4.6 home state happens *after* it (`HOMING01.OUT`
+  frames 50/60/70/80/90 hold rich decoded samples there). Previously
+  the crate substituted the 160 × `0x0008` encoder-homing-frame for
+  every detected homing frame; that substitution is correct only for
+  homing events entered **from** the home state (the §4.4 NOTE 2
+  delay-optimised path, `HOMING01.OUT` frames 0/1/71/81/91). The
+  decode-then-reset order is also what makes §4.4 NOTE 1's *"N homing
+  frames in ⇒ at least N-1 encoder-homing-frames out"* arithmetic
+  come out. State-machine *reset timing* is unchanged — only the
+  homing frame's own output on a non-homed decoder differs.
 
 - **§5.2.4 "Rescaling of the array s[0..159]" conformance fix
   (2026-07-11).** The clause's closing step — `s[k] = s[k] <<
