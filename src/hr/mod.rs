@@ -447,13 +447,11 @@ mod tests {
         p.r0 = 0b10110;
         let bytes = p.to_bits();
         assert_eq!(bytes[0] >> 3, 0b10110, "R0 occupies b1..b5");
-        // MODE = 2 at b35..b36: bit 34 (0-based) and bit 35.
-        let mode_bits = ((bytes[4] >> 5) & 0b11) as u8; // b33..b40 live in byte 4
-                                                        // b35,b36 are bits 34,35 → byte 4 bits offsets 2..3 from MSB.
+        // MODE = 2 at b35..b36 — bits 34..35 (0-based), i.e. byte 4
+        // offsets 2..3 from the MSB.
         let b35 = (bytes[4] >> (7 - 2)) & 1;
         let b36 = (bytes[4] >> (7 - 3)) & 1;
         assert_eq!((b35 << 1) | b36, 2, "MODE code at b35..b36");
-        let _ = mode_bits;
     }
 
     /// Word-layout round-trip for both layouts.
