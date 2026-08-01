@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.9...v0.0.10) - 2026-08-01
+
+### Other
+
+- doc-hygiene sweep — retire stale 'unstaged / not implemented' claims
+- fix clippy unnecessary-cast in the annex-B bit-position test
+- GSM 06.20 half-rate foundation — frame layer + complete ROM data
+- GSM 06.31 §6.1.2 RX DTX handler — classification-driven receive bridge
+- GSM 06.31 TX DTX handler + 06.12 SID encoding — 20/20 corpus .COD streams bit-exact
+- GSM 06.32 Voice Activity Detector — all 20 ETSI test cases bit-exact
+- run the official ETSI §6 conformance corpus bit-exactly in CI
+- gsm README: black-box conformance status + carriage formats + §5.2.4 rescale notes
+- robustness sweeps over the .gsm byte-frame and MS-GSM packet surfaces
+- extradata-selected frame packing on the codec adapters
+- MS-GSM 65-byte block pack/unpack + black-box fixture coverage
+- black-box conformance fixture corpus — encoder byte-exact, decoder sample-exact
+- de-facto .gsm 33-byte byte-frame pack/unpack (empirical, black-box derived)
+- §5.2.4 rescaling conformance fix — feed the round-tripped s[] to §5.2.10
+- gsm README: document the robustness + round-trip quality-gate suites
+- encoder input-surface robustness sweeps (§5.2 / adapter)
+- DTX receiver + comfort-noise robustness sweeps (GSM 06.12 §6)
+- whole-codec round-trip quality gates on synthetic signals
+- decode robustness sweep over §1.7 + §6.1 byte surfaces
+
 ### Added
 
 - **GSM 06.20 half-rate foundation (2026-08-01).** New `hr` module
