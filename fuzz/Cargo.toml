@@ -1,0 +1,81 @@
+[package]
+name = "oxideav-gsm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Risk shapes covered (spec-side invariants asserted, not just
+# absence of panics):
+#
+# - **`fr_decode_stream`**: arbitrary byte streams through the GSM
+#   06.10 full-rate decoder under all three frame packings (in-band
+#   b1..b260, de-facto .gsm byte-frame, MS-GSM two-frame block) with
+#   the decoder-homing protocol live; asserts the 160-samples-per-
+#   frame accounting.
+# - **`hr_decode_frame`**: arbitrary 14-byte annex-B half-rate
+#   frames and 18-word conformance frames through the GSM 06.20
+#   decoder; asserts totality over the full parameter space, the
+#   13-bit left-justified output convention, and the annex-B
+#   pack/parse round trip.
+# - **`packing_walkers`**: the three packing parsers as hostile-
+#   input walkers — parse, and where a frame parses, assert the
+#   re-pack round trip is byte-identical (the parsers are lossless
+#   on their accepted domain).
+# - **`rx_dtx_stream`**: fuzz-driven frame/BFI/TAF sequences through
+#   the GSM 06.31 RX DTX handler with the GSM 06.11 substitution-
+#   and-muting legs; asserts classification/state consistency and
+#   output accounting.
+# - **`encode_decode_roundtrip`**: arbitrary bytes as PCM through
+#   encode → pack → parse → decode; asserts packer/parser closure on
+#   real encoder output and output accounting.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-gsm]
+path = ".."
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+[[bin]]
+name = "fr_decode_stream"
+path = "fuzz_targets/fr_decode_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hr_decode_frame"
+path = "fuzz_targets/hr_decode_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "packing_walkers"
+path = "fuzz_targets/packing_walkers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rx_dtx_stream"
+path = "fuzz_targets/rx_dtx_stream.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_decode_roundtrip"
+path = "fuzz_targets/encode_decode_roundtrip.rs"
+test = false
+doc = false

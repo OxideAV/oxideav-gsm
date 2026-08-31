@@ -1,0 +1,11 @@
+target
+artifacts
+coverage
+corpus
+
+# Cargo.lock at this depth is the fuzz package's lockfile. The
+# parent crate gitignores its own `/Cargo.lock` (library
+# convention) but a fuzz package is a binary by cargo-fuzz design
+# and should pin its own dependency versions for reproducible
+# crash reproduction.
+!Cargo.lock
