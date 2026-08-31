@@ -22,7 +22,7 @@
 //!   silence frame that follows them sample-exactly;
 //! * decoded-vs-reference **per-frame waveform correlation**,
 //!   averaged over every frame of SEQ01–SEQ04 — the measured value
-//!   (≈ 0.43 at the time of pinning) asserts the decoder tracks
+//!   (≈ 0.42 at the time of pinning) asserts the decoder tracks
 //!   the reference waveform, and the floor guards against
 //!   regressions in any dequantisation leg;
 //! * per-sequence decoded/reference **energy** agreement — the
@@ -103,7 +103,7 @@ fn leading_homing_frames_are_sample_exact() {
 
 /// Measured waveform agreement, pinned as a regression floor: the
 /// mean per-frame correlation between decoded and reference frames
-/// across SEQ01–SEQ04 (leading homing frames excluded) was ≈ 0.43
+/// across SEQ01–SEQ04 (leading homing frames excluded) was ≈ 0.42
 /// when this decoder landed. The floor 0.40 guards every
 /// dequantisation leg; whole-stream SNR is chaotic under the LTP
 /// feedback (see the module docs) and is only reported.

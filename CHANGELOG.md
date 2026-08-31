@@ -6,6 +6,50 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.20 half-rate encoder groundwork — the clause 4.1.1-4.1.6
+  frame-parameter analysis chain (2026-09-01).** New `hr::encode`
+  module (`HrAnalyzer`): the 120 Hz input high-pass (clause 4.1.1,
+  staged Q15 biquads), segmentation buffer (4.1.2), the FLAT
+  covariance-lattice reflection derivation (4.1.3, eqs. (5)-(13),
+  table-1 window from the staged Q31 words), the three-segment
+  reflection-coefficient VQ search via the AFLAT recursion with
+  prequantizer + four-subset evaluation (4.1.4/4.1.4.1,
+  eqs. (14)-(26)), R0 frame-energy coding (4.1.5), and the INT_LPC
+  soft-interpolation decision (4.1.6). Measured agreement against
+  the staged SEQ01..03 encoder references, pinned as floors in
+  `tests/conformance_hr_encode_params.rs`: R0 95.6% exact and
+  100.0% within one 2 dB code, LPC1 76.4% / LPC2 80.8% /
+  LPC3 80.5% exact, INT_LPC 55.0% (a boundary-heavy binary
+  decision). Empirically pinned readings: the staged Q15 high-pass
+  recursion coefficients are stored halved (the doubled values give
+  the printed 120 Hz double real poles), and R(0) is referred to
+  Rmax = 4096^2 while samples are carried left-justified in words
+  (the +18,06 dB the corpus pins).
+
+### Fixed
+
+- **AFLAT initial condition (2026-09-01).** The eq. (16)/(160)
+  initial condition is `V0(i) = R(i+1)`, not `R(|i|)`; the decoder's
+  postfilter-numerator AFLAT shared the wrong init. With the
+  recursion corrected (verified analytically: the residual reaches
+  its Π(1-r²) minimum exactly at the source coefficients), the
+  postfilter-numerator readings were re-measured and the decoder's
+  clause 4.2.4 postfilter re-pinned as A(z)/A(z·0,75) + brightness
+  + AGC (mean per-frame correlation 0.42, vs 0.30-0.32 for the
+  SST-smoothed numerator derivations under the only staged SST
+  window).
+
+- **Fuzz standup (2026-09-01).** New `fuzz/` sub-crate with five
+  libFuzzer targets mirroring the fleet convention, plus the bounded
+  Fuzz CI workflow: `fr_decode_stream` (all three FR packings with
+  the homing protocol live), `hr_decode_frame` (GSM 06.20 decoder
+  totality over the whole annex-A parameter space + annex-B round
+  trip + 13-bit output convention), `packing_walkers` (lossless
+  repack on the accepted domain of every packing), `rx_dtx_stream`
+  (RX DTX + GSM 06.11 loss bursts with classification/flag
+  consistency), and `encode_decode_roundtrip` (packer/parser closure
+  on genuine encoder output).
+
 - **GSM 06.11 lost-frame substitution and muting (2026-09-01).** The
   RX DTX handler now implements EN 300 962 (staged) clauses 5-6 for
   the full-rate speech path: the first lost speech frame is
@@ -39,17 +83,17 @@ All notable changes to this project will be documented in this file.
   eq. (100); gains via eqs. (131)/(132)/(145)/(146) over the GSP0
   {P0,GS} codebooks), the adaptive pitch prefilter with energy
   renormalisation (clause 4.2.2), the direct-form synthesis filter
-  (clause 4.2.3), the adaptive spectral postfilter with SST-derived
-  numerator, 0,75-weighted denominator, brightness and AGC
-  (clause 4.2.4), the clause 4.2.5 long-term state update, and the
+  (clause 4.2.3), the adaptive spectral postfilter (realised as
+  A(z)/A(z*0,75) with brightness and AGC - see the module notes on
+  the numerator reading; clause 4.2.4), the clause 4.2.5 long-term state update, and the
   clause 5 decoder-homing protocol (`SEQ05.DEC` homing frame,
   home-state substitution, full reset). Validation
   (`tests/conformance_hr_decode.rs`, staged GSM 06.07 corpus):
   the homing legs are sample-exact (leading homing frames + the
   SEQ05 sequence + mid-stream reset), and the waveform agreement
   against `SEQ01..04.OUT` is pinned as a regression floor (mean
-  per-frame correlation 0.43, per-sequence energy ratios
-  0.75-0.99). Byte-exactness is *not* claimed: EN 300 969 is a
+  per-frame correlation 0.42, per-sequence energy ratios
+  0.66-1.0). Byte-exactness is *not* claimed: EN 300 969 is a
   functional description whose bit-exact arithmetic lives in the
   GSM 06.06 ANSI-C deliverable (not staged, clean-room), and the
   clause 4.2.5 excitation feedback compounds any sub-LSB

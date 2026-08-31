@@ -41,11 +41,11 @@
 //! * clause 4.1.10 codeword bit `m` (θ_im, basis vector `v_m`) is
 //!   the codeword's bit `m − 1` counted from the **LSB**;
 //! * annex A.1.4 delta-lag codes are excess-8 (`code − 8` levels);
-//! * the clause 4.2.4 numerator is the SST-smoothed version of the
-//!   **unweighted** coefficient set `α_i` (measured marginally
-//!   above the alternative literal reading, the SST of the
-//!   0,75-weighted denominator set — the two differ only through
-//!   the near-unity SST window);
+//! * the clause 4.2.4 postfilter is realised as
+//!   `A(z)/A(z·0,75)` (numerator = the unsmoothed coefficient set)
+//!   plus brightness and AGC — the SST-smoothed numerator
+//!   derivations of eqs. (158)-(164) with the only staged SST
+//!   window measured clearly worse;
 //! * eq. (131a) is applied literally: subframe 1 draws `R'q(0)`
 //!   (and the eq. (132) reflection product) from the previous
 //!   frame.
@@ -95,7 +95,7 @@ pub fn hr_decoder_homing_frame() -> HrParameters {
 /// packed reflection-coefficient VQ tables (two indices per 16-bit
 /// word, high byte first, C storage order).
 #[inline]
-fn vq_index(table: &[i16], flat: usize) -> usize {
+pub(super) fn vq_index(table: &[i16], flat: usize) -> usize {
     let w = table[flat / 2] as u16;
     if flat % 2 == 0 {
         (w >> 8) as usize
@@ -107,7 +107,7 @@ fn vq_index(table: &[i16], flat: usize) -> usize {
 /// Clause 4.1.4: decode the three LPC vector-quantiser codes into
 /// the ten reflection coefficients, via the 256-entry scalar
 /// dequantiser (Q15 → f64).
-fn dequant_reflection(lpc1: u16, lpc2: u16, lpc3: u8) -> [f64; NP] {
+pub(super) fn dequant_reflection(lpc1: u16, lpc2: u16, lpc3: u8) -> [f64; NP] {
     let mut r = [0f64; NP];
     let scalar = |idx: usize| RC_SCALAR_DEQUANT[idx] as f64 / 32768.0;
     for (c, slot) in r[..3].iter_mut().enumerate() {
@@ -130,7 +130,7 @@ fn dequant_reflection(lpc1: u16, lpc2: u16, lpc3: u8) -> [f64; NP] {
 /// the sign pairing here is the one validated by the >14 dB
 /// prediction gain the dequantised sets achieve on the staged
 /// GSM 06.07 encoder-input speech.
-fn step_up(r: &[f64; NP]) -> [f64; NP] {
+pub(super) fn step_up(r: &[f64; NP]) -> [f64; NP] {
     let mut a = [0f64; NP];
     for j in 0..NP {
         let mut next = a;
@@ -152,7 +152,7 @@ fn step_up(r: &[f64; NP]) -> [f64; NP] {
 /// Direct-form → reflection coefficients (step-down), used for the
 /// clause 4.1.6 stability check of interpolated coefficient sets.
 /// Returns `None` when any |r_j| ≥ 1 (unstable filter).
-fn step_down(alpha: &[f64; NP]) -> Option<[f64; NP]> {
+pub(super) fn step_down(alpha: &[f64; NP]) -> Option<[f64; NP]> {
     let mut a = [0f64; NP];
     for i in 0..NP {
         a[i] = -alpha[i];
@@ -235,71 +235,6 @@ fn codevector(basis: &[[i16; 40]], codeword: u16) -> [f64; NS] {
         }
     }
     u
-}
-
-// ─── SST numerator for the adaptive spectral postfilter (4.2.4) ───
-
-/// Derive the spectrally-smoothed numerator coefficients from the
-/// (uninterpolated) direct-form set: take the autocorrelation of
-/// the coefficient sequence of `1 − Σ α_i z^-i`, apply the SST
-/// window ([`FLAT_SST_COEFFS`], Q31), and run the clause 4.2.4
-/// AFLAT recursion (eqs. (159)–(164)) back to reflection
-/// coefficients, then step up.
-fn sst_numerator(alpha: &[f64; NP]) -> [f64; NP] {
-    // Coefficient sequence a_0..a_10 of the polynomial.
-    let mut c = [0f64; NP + 1];
-    c[0] = 1.0;
-    for i in 0..NP {
-        c[i + 1] = -alpha[i];
-    }
-    // Autocorrelation of the coefficient sequence.
-    let mut rr = [0f64; NP + 1];
-    for lag in 0..=NP {
-        let mut acc = 0.0;
-        for k in 0..=(NP - lag) {
-            acc += c[k] * c[k + lag];
-        }
-        rr[lag] = acc;
-    }
-    // SST bandwidth expansion (eq. (158)); W(0) = 1.
-    for lag in 1..=NP {
-        rr[lag] *= FLAT_SST_COEFFS[lag - 1] as f64 / 2147483648.0;
-    }
-    // AFLAT recursion (eqs. (159)-(164)): P over 0..=Np,
-    // V over 1-Np..=Np-1 (stored offset by Np-1).
-    let mut p = rr;
-    let mut v = [0f64; 2 * NP - 1];
-    for i in (1 - (NP as isize))..(NP as isize) {
-        v[(i + NP as isize - 1) as usize] = rr[i.unsigned_abs()];
-    }
-    let vat = |v: &[f64; 2 * NP - 1], i: isize| v[(i + NP as isize - 1) as usize];
-    let mut refl = [0f64; NP];
-    for (j, slot) in refl.iter_mut().enumerate() {
-        let rj = if p[0].abs() > 1e-30 {
-            (-vat(&v, 0) / p[0]).clamp(-0.999_99, 0.999_99)
-        } else {
-            0.0
-        };
-        *slot = rj;
-        if j == NP - 1 {
-            break;
-        }
-        let bound = NP - j - 1;
-        let mut np2 = [0f64; NP + 1];
-        for (i, slot) in np2.iter_mut().take(bound).enumerate() {
-            *slot = (1.0 + rj * rj) * p[i] + rj * (vat(&v, i as isize) + vat(&v, -(i as isize)));
-        }
-        let mut nv = [0f64; 2 * NP - 1];
-        for i in (1 - bound as isize)..(bound as isize) {
-            let val = vat(&v, i + 1)
-                + rj * rj * vat(&v, -i - 1)
-                + 2.0 * rj * p[(i + 1).unsigned_abs().min(NP)];
-            nv[(i + NP as isize - 1) as usize] = val;
-        }
-        p = np2;
-        v = nv;
-    }
-    step_up(&refl)
 }
 
 // ─── Decoder state ───
@@ -395,7 +330,18 @@ impl HrDecoder {
         let refl = dequant_reflection(p.lpc1, p.lpc2, p.lpc3);
         let alpha_cur = step_up(&refl);
         let r0q_cur = decode_r0(p.r0);
-        let num_cur = sst_numerator(&alpha_cur);
+        // Clause 4.2.4: the postfilter numerator. The resultant
+        // filter is implemented as A(z)/A(z·0,75) (numerator = the
+        // unsmoothed coefficient set) plus brightness and AGC: of
+        // the defensible readings of eqs. (155)/(158)/(165) this
+        // measured clearly best against the staged references
+        // (mean per-frame correlation 0.42 vs 0.30-0.32 for the
+        // SST-smoothed numerator derivations - the only staged SST
+        // window, the near-unity FLAT window of table 1, makes
+        // those nearly transparent). The exact numerator the
+        // bit-exact GSM 06.06 C derives remains the largest
+        // residual uncertainty of this decoder.
+        let num_cur = alpha_cur;
 
         // Clause 4.1.6: per-subframe coefficient sets (soft
         // interpolation with the stability fallback), mirrored onto
@@ -556,7 +502,7 @@ impl HrDecoder {
             }
 
             // Adaptive spectral postfilter (clause 4.2.4):
-            // numerator FIR with the SST-smoothed set (eq. (165)),
+            // numerator FIR with the unsmoothed set (eq. (165)),
             // denominator IIR with the 0,75^i weighting
             // (eq. (166)), brightness (eq. (167)), AGC (eq. (168)).
             let num = &sub_num[sf];
