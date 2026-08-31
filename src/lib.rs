@@ -141,8 +141,8 @@ pub use decoder::{
 };
 pub use dtx::{
     classify_rx_frame, make_sid_frame, sid_field_deviation, sid_flag, sid_frame_parameters,
-    RxClassification, RxDtxHandler, SidFlag, TxDtxHandler, TxFrame, SHORT_BURST_ELAPSED_LIMIT,
-    SID_AVERAGING_FRAMES, SID_CODE_WORD_BITS,
+    silence_frame, RxClassification, RxDtxHandler, SidFlag, TxDtxHandler, TxFrame,
+    MUTING_XMAXC_DECREMENT, SHORT_BURST_ELAPSED_LIMIT, SID_AVERAGING_FRAMES, SID_CODE_WORD_BITS,
 };
 pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
 pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor, VadTap};

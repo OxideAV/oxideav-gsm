@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.11 lost-frame substitution and muting (2026-09-01).** The
+  RX DTX handler now implements EN 300 962 (staged) clauses 5-6 for
+  the full-rate speech path: the first lost speech frame is
+  substituted by a repetition of the previous good speech frame at
+  the decoder input (Sec. 5.1); subsequent lost speech frames apply
+  the clause 6 muting - every subframe block amplitude `Xmaxcr`
+  decreased by 4 per frame down to 0 (output silenced within
+  320 ms) with the grid positions drawn randomly from [0, 3], then
+  the clause 6 table-1 silence frame (`silence_frame()`, pinned by
+  test) once the lowest value is reached (Sec. 5.2); a single lost
+  SID frame is substituted by the last valid SID frame with the
+  valid-SID procedure applied (Sec. 5.3); and from the second lost
+  SID frame the comfort noise is muted the same way and the muting
+  maintained (Sec. 5.4). This retires the previous "GSM 06.11 is a
+  separate, unstaged specification" hand-off note - the spec is
+  staged and the legs are implemented in `RxDtxHandler` itself
+  (`tests/lost_frame_06_11.rs`: repetition equivalence, 320 ms
+  muting bounds on both paths, burst-reset semantics, table-1
+  shape).
+
 - **GSM 06.20 half-rate decoder — the clause 4.2 decode chain
   (2026-09-01).** New `hr::decode` module: `HrDecoder` runs the
   full figure-5 pipeline from an annex-A parameter frame — LPC

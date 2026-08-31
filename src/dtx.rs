@@ -68,8 +68,40 @@
 //! action the RX DTX handler takes ([`RxClassification`]); it is the
 //! bridge to the crate's existing [`crate::DtxReceiver`].
 
-use crate::bitstream::{SubFrame, UnpackedFrame, PULSES};
-use crate::comfort_noise::{NoiseEvaluator, NoiseFrameParameters, SidParameters};
+use crate::bitstream::{SubFrame, UnpackedFrame, PULSES, SUBFRAMES};
+use crate::comfort_noise::{NoiseEvaluator, NoiseFrameParameters, NoiseRng, SidParameters};
+
+/// GSM 06.11 clause 6 — the per-frame block-amplitude decrement of
+/// the muting procedure: *"The pseudo-logarithmic encoded block
+/// amplitude Xmaxcr …, coded on the interval from 0 to 63, is
+/// decreased with a constant value d=4 in each frame, down to the
+/// lowest possible value."*
+pub const MUTING_XMAXC_DECREMENT: u8 = 4;
+
+/// GSM 06.11 clause 6, table 1 — the encoded parameters of the
+/// silence frame the RX DTX handler passes to the speech decoder
+/// once `Xmaxcr` has reached its lowest possible value.
+pub fn silence_frame() -> UnpackedFrame {
+    let mut f = UnpackedFrame {
+        // Table 1: LAR 1..8 = 42, 39, 21, 10, 9, 4, 3, 2.
+        lar_c: [0, 42, 39, 21, 10, 9, 4, 3, 2],
+        ..UnpackedFrame::default()
+    };
+    for sub in f.sub.iter_mut() {
+        *sub = SubFrame {
+            // Table 1: LTP gain = 0, LTP lag = 40, grid position =
+            // 1, block amplitude = 0.
+            n_c: 40,
+            b_c: 0,
+            m_c: 1,
+            xmax_c: 0,
+            // Table 1: RPE pulses 1..13 = 3 4 3 4 4 3 3 3 3 4 4 3 3,
+            // repeated for each subsegment.
+            x_mc: [3, 4, 3, 4, 4, 3, 3, 3, 3, 4, 4, 3, 3],
+        };
+    }
+    f
+}
 
 /// Number of bits in the SID code word (GSM 06.12 §5.2: *"The SID
 /// code word consists of 95 bits which are all zero."*).
@@ -363,13 +395,25 @@ pub fn classify_rx_frame(
 ///   fallback;
 /// * **unusable frames** during comfort noise are ignored when no SID
 ///   is expected (noise generation continues); a **lost SID** frame
-///   (`TAF=1`) and a **lost speech** frame call for the GSM 06.11
-///   substitution-and-muting procedure. GSM 06.11 is a separate,
-///   unstaged specification, so this handler *continues its current
-///   mode* for those frames (comfort noise keeps running; on the
-///   speech path the last decoder state simply carries) and surfaces
-///   the classification so a caller with a GSM 06.11 implementation
-///   can take over.
+///   (`TAF=1`) and a **lost speech** frame invoke the GSM 06.11
+///   (EN 300 962) substitution-and-muting procedure, implemented here
+///   per its clauses 5 and 6:
+///
+///   - §5.1 — the **first lost speech frame** is substituted by a
+///     repetition of the previous good speech frame at the decoder
+///     input (clause 6 example solution); it is neither delivered as
+///     received nor muted directly;
+///   - §5.2 — **subsequent lost speech frames** apply the clause 6
+///     muting: each subframe's `Xmaxcr` decreases by
+///     [`MUTING_XMAXC_DECREMENT`] per frame down to 0 (silencing the
+///     output within 320 ms) with the grid positions drawn randomly
+///     from `[0, 3]`, and once the lowest value has been reached the
+///     table-1 [`silence_frame`] is passed to the speech decoder;
+///   - §5.3 — a **first lost SID frame** is substituted by the last
+///     valid SID frame and the valid-SID procedure applied;
+///   - §5.4 — the **second lost SID frame** starts the same muting on
+///     the comfort noise (`Xmaxcr` −4 per frame down to 0, silencing
+///     within 320 ms), and further lost SID frames maintain it.
 #[derive(Debug)]
 pub struct RxDtxHandler {
     rx: crate::comfort_noise::DtxReceiver,
@@ -377,6 +421,24 @@ pub struct RxDtxHandler {
     /// Noise parameters harvested from the most recent good speech
     /// frame (the §6.1.2 NOTE fallback source).
     last_speech_params: Option<SidParameters>,
+    /// GSM 06.11: the last good speech frame (the §5.1 substitution
+    /// source) and the working copy being muted across a loss burst.
+    last_speech_frame: Option<UnpackedFrame>,
+    subst_frame: Option<UnpackedFrame>,
+    /// Consecutive lost-speech-frame count in the current burst.
+    speech_loss_run: u32,
+    /// Consecutive lost-SID-frame count in the current comfort-noise
+    /// loss burst.
+    sid_loss_run: u32,
+    /// The comfort-noise parameters under §5.4 muting.
+    muted_sid: Option<SidParameters>,
+    /// The caller's §6.1 interpolation setting, saved while the
+    /// §5.4 muting temporarily snaps updates (the −4-per-frame
+    /// decrement IS the mandated ramp; smoothing it again would
+    /// stretch the silencing past the 320 ms bound).
+    saved_interp: Option<u8>,
+    /// Random source for the clause 6 grid positions.
+    rng: NoiseRng,
 }
 
 impl RxDtxHandler {
@@ -387,6 +449,13 @@ impl RxDtxHandler {
             rx: crate::comfort_noise::DtxReceiver::new(seed),
             last_valid_sid: None,
             last_speech_params: None,
+            last_speech_frame: None,
+            subst_frame: None,
+            speech_loss_run: 0,
+            sid_loss_run: 0,
+            muted_sid: None,
+            saved_interp: None,
+            rng: NoiseRng::new(seed ^ 0x0611_0611),
         }
     }
 
@@ -405,11 +474,77 @@ impl RxDtxHandler {
         self.rx.reset();
         self.last_valid_sid = None;
         self.last_speech_params = None;
+        self.last_speech_frame = None;
+        self.clear_loss_state();
+    }
+
+    /// End any GSM 06.11 loss burst (a good frame arrived).
+    fn clear_loss_state(&mut self) {
+        self.subst_frame = None;
+        self.speech_loss_run = 0;
+        self.sid_loss_run = 0;
+        self.muted_sid = None;
+        if let Some(frames) = self.saved_interp.take() {
+            self.rx.set_interpolation_frames(frames);
+        }
+    }
+
+    /// GSM 06.11 §5.1/§5.2: produce the substitution frame for one
+    /// lost speech frame — the previous good speech frame verbatim
+    /// first, then the clause 6 muting (per-subframe `Xmaxcr` − 4
+    /// down to 0, random grid positions), then the table-1 silence
+    /// frame once the lowest value has been reached.
+    fn lost_speech_substitution(&mut self) -> UnpackedFrame {
+        self.speech_loss_run += 1;
+        if self.speech_loss_run == 1 {
+            // §5.1 + clause 6: repeat the previous good speech
+            // frame. With no speech frame on record (a loss burst
+            // right after reset) there is nothing to repeat or
+            // extrapolate; the table-1 silence frame is the defined
+            // low-level output.
+            let f = self.last_speech_frame.unwrap_or_else(silence_frame);
+            self.subst_frame = Some(f);
+            return f;
+        }
+        let mut f = self.subst_frame.unwrap_or_else(silence_frame);
+        if f.sub.iter().all(|s| s.xmax_c == 0) {
+            // Clause 6: after the frame where Xmaxcr reached the
+            // lowest possible value, silence frames are passed.
+            return silence_frame();
+        }
+        for sub in f.sub.iter_mut() {
+            sub.xmax_c = sub.xmax_c.saturating_sub(MUTING_XMAXC_DECREMENT);
+            // Clause 6: "The grid position parameters are chosen
+            // randomly between 0 and 3 during this time."
+            sub.m_c = self.rng.grid_position();
+        }
+        self.subst_frame = Some(f);
+        f
+    }
+
+    /// GSM 06.11 §5.4: advance the comfort-noise muting by one frame
+    /// (each block amplitude − 4 down to 0) and return the muted
+    /// parameters.
+    fn muted_sid_step(&mut self) -> SidParameters {
+        let base = self
+            .muted_sid
+            .or(self.last_valid_sid)
+            .or(self.last_speech_params)
+            .unwrap_or_default();
+        let mut xmax = [0u8; SUBFRAMES];
+        for (slot, x) in xmax.iter_mut().zip(base.xmax_cr.iter()) {
+            *slot = x.saturating_sub(MUTING_XMAXC_DECREMENT);
+        }
+        let muted = SidParameters::new(base.lar_cr, xmax);
+        self.muted_sid = Some(muted);
+        muted
     }
 
     /// Process one received traffic frame with its radio-subsystem
     /// flags, returning the §6.1 table-1 classification applied and
-    /// the 160 output samples.
+    /// the 160 output samples. Lost speech and lost SID frames run
+    /// the GSM 06.11 substitution-and-muting procedure (see the
+    /// struct docs).
     pub fn receive_traffic_frame(
         &mut self,
         frame: &UnpackedFrame,
@@ -420,15 +555,19 @@ impl RxDtxHandler {
         let class = classify_rx_frame(frame, bfi, taf, self.rx.is_generating_comfort_noise());
         let out = match class {
             RxClassification::GoodSpeechFrame => {
+                self.clear_loss_state();
                 self.last_speech_params = Some(sid_frame_parameters(frame));
+                self.last_speech_frame = Some(*frame);
                 self.rx.receive(RxFrame::Speech(Box::new(*frame)))
             }
             RxClassification::ValidSidFrame => {
+                self.clear_loss_state();
                 let sid = sid_frame_parameters(frame);
                 self.last_valid_sid = Some(sid);
                 self.rx.receive(RxFrame::Sid(sid))
             }
             RxClassification::InvalidSidFrame => {
+                self.clear_loss_state();
                 // §6.1.2: substitute the last valid SID; NOTE fallback
                 // to the last good speech frame's parameters.
                 let sid = self
@@ -437,9 +576,41 @@ impl RxDtxHandler {
                     .unwrap_or_default();
                 self.rx.receive(RxFrame::Sid(sid))
             }
-            RxClassification::LostSidFrame
-            | RxClassification::LostSpeechFrame
-            | RxClassification::IgnoredUnusableFrame => self.rx.receive(RxFrame::NoData),
+            RxClassification::LostSpeechFrame => {
+                // GSM 06.11 §5.1/§5.2: substitution then muting at
+                // the speech-decoder input.
+                let subst = self.lost_speech_substitution();
+                self.rx.receive(RxFrame::Speech(Box::new(subst)))
+            }
+            RxClassification::LostSidFrame => {
+                self.sid_loss_run += 1;
+                if self.sid_loss_run == 1 {
+                    // GSM 06.11 §5.3: a single lost SID frame is
+                    // substituted by the last valid SID frame and
+                    // the valid-SID procedure applied (§6.1.2 NOTE
+                    // fallback as for an invalid SID).
+                    let sid = self
+                        .last_valid_sid
+                        .or(self.last_speech_params)
+                        .unwrap_or_default();
+                    self.rx.receive(RxFrame::Sid(sid))
+                } else {
+                    // GSM 06.11 §5.4: from the second lost SID frame
+                    // on, mute the comfort noise (Xmaxcr − 4 per
+                    // frame down to 0) and maintain the muting. The
+                    // −4-per-frame decrement is itself the mandated
+                    // ramp, so the §6.1 update smoothing is snapped
+                    // for the duration of the burst (restored by the
+                    // next good frame).
+                    if self.saved_interp.is_none() {
+                        self.saved_interp = Some(self.rx.interpolation_frames());
+                        self.rx.set_interpolation_frames(1);
+                    }
+                    let muted = self.muted_sid_step();
+                    self.rx.receive(RxFrame::Sid(muted))
+                }
+            }
+            RxClassification::IgnoredUnusableFrame => self.rx.receive(RxFrame::NoData),
         };
         (class, out)
     }
@@ -658,7 +829,8 @@ mod tests {
         let (c, _) = rx.receive_traffic_frame(&speechy, true, false);
         assert_eq!(c, RxClassification::IgnoredUnusableFrame);
         assert!(rx.is_generating_comfort_noise());
-        // Lost SID (TAF=1) -> noise continues (GSM 06.11 hook).
+        // Lost SID (TAF=1) -> GSM 06.11 §5.3: the last valid SID is
+        // substituted; noise continues.
         let (c, _) = rx.receive_traffic_frame(&speechy, true, true);
         assert_eq!(c, RxClassification::LostSidFrame);
         assert!(rx.is_generating_comfort_noise());
