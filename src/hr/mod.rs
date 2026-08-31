@@ -33,7 +33,13 @@
 //! short-term predictor order `Np` = 10, data rate 5,6 kbit/s =
 //! [`HR_FRAME_BITS`] bits per frame.
 
+pub mod decode;
 pub mod tables;
+
+pub use decode::{
+    hr_decoder_homing_frame, is_hr_decoder_homing_frame, HrDecoder, HR_DECODER_HOMING_WORDS,
+    HR_ENCODER_HOMING_SAMPLE,
+};
 
 use crate::error::Error;
 

@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **GSM 06.20 half-rate decoder — the clause 4.2 decode chain
+  (2026-09-01).** New `hr::decode` module: `HrDecoder` runs the
+  full figure-5 pipeline from an annex-A parameter frame — LPC
+  dequantisation (clause 4.1.4 three-segment VQ through the
+  256-entry scalar dequantiser), R0 frame-energy decode (eq. (30)),
+  soft interpolation with the stability fallback (clause 4.1.6),
+  combined excitation generation (clause 4.2.1: VSELP codevectors
+  per eq. (108) for both the voiced M=9 codebook and the two
+  unvoiced M=7 codebooks; the adaptive codebook with 1/6-sample
+  fractional lags via the 10th-order 6-phase interpolating FIR of
+  eq. (100); gains via eqs. (131)/(132)/(145)/(146) over the GSP0
+  {P0,GS} codebooks), the adaptive pitch prefilter with energy
+  renormalisation (clause 4.2.2), the direct-form synthesis filter
+  (clause 4.2.3), the adaptive spectral postfilter with SST-derived
+  numerator, 0,75-weighted denominator, brightness and AGC
+  (clause 4.2.4), the clause 4.2.5 long-term state update, and the
+  clause 5 decoder-homing protocol (`SEQ05.DEC` homing frame,
+  home-state substitution, full reset). Validation
+  (`tests/conformance_hr_decode.rs`, staged GSM 06.07 corpus):
+  the homing legs are sample-exact (leading homing frames + the
+  SEQ05 sequence + mid-stream reset), and the waveform agreement
+  against `SEQ01..04.OUT` is pinned as a regression floor (mean
+  per-frame correlation 0.43, per-sequence energy ratios
+  0.75-0.99). Byte-exactness is *not* claimed: EN 300 969 is a
+  functional description whose bit-exact arithmetic lives in the
+  GSM 06.06 ANSI-C deliverable (not staged, clean-room), and the
+  clause 4.2.5 excitation feedback compounds any sub-LSB
+  difference; the empirically-resolved coding ambiguities (VQ byte
+  order, codeword bit order, delta-lag excess-8, postfilter
+  numerator source) are documented in the module.
+
 - **GSM 06.20 half-rate foundation (2026-08-01).** New `hr` module
   family beginning the half-rate (VSELP) arc: the annex A table A.1
   parameter set (`HrParameters` with the MODE-dependent subframe
