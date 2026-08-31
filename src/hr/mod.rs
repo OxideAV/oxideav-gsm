@@ -1,7 +1,7 @@
 //! GSM 06.20 half-rate speech codec (VSELP) — ETSI EN 300 969.
 //!
-//! **Status: foundation.** This module family begins the half-rate
-//! arc with the normative frame layer and the codec's ROM data:
+//! **Status: decoder chain complete (functional) + encoder
+//! frame-parameter analysis.** The module family:
 //!
 //! * [`tables`] — the bit-exact ROM tables (reflection-coefficient
 //!   VQ/prequantizer/scalar-dequantizer, R0 decode, allowable lags,
@@ -22,11 +22,16 @@
 //!   16-bit word, in table A.1 order), as carried inside the `*.COD`
 //!   (18 + 2 flag words) and `*.DEC` (18 + 4 flag words) frames.
 //!
-//! The decode chain (excitation generation, adaptive pitch prefilter,
-//! synthesis filter, adaptive spectral postfilter — clauses 4.2.x)
-//! and the encoder are follow-up work; the GSM 06.07 corpus staged
-//! under `tests/fixtures/etsi-hr/` provides the bit-exact references
-//! for both directions.
+//! * [`decode`] — the clause 4.2 decoder ([`HrDecoder`]): the full
+//!   figure-5 pipeline plus the clause 5 homing protocol (see the
+//!   module docs for the conformance posture);
+//! * [`encode`] — the clause 4.1.1–4.1.6 encoder frame-parameter
+//!   analysis ([`HrAnalyzer`]): high-pass, FLAT, the AFLAT VQ
+//!   search, R0 coding and the INT_LPC decision. The per-subframe
+//!   excitation analysis (clauses 4.1.7–4.1.11) is the next arc.
+//!
+//! The GSM 06.07 corpus staged under `tests/fixtures/etsi-hr/`
+//! provides the references for both directions.
 //!
 //! Basic coder parameters (annex A.2): 8 kHz sampling, `NF` = 160
 //! samples (20 ms) per frame, `Ns` = 40 samples (5 ms) per subframe,
