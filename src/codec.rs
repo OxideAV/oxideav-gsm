@@ -85,6 +85,31 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
+/// Canonical codec id for the GSM 06.20 half-rate (VSELP) codec.
+pub const HR_CODEC_ID: &str = "gsm-hr";
+
+/// Build a boxed [`Decoder`] for GSM 06.20 half-rate speech. The
+/// packet payload is a sequence of 14-byte annex-B `b1..b112`
+/// frames ([`crate::HrParameters::from_bits`]); each frame decodes
+/// to 160 mono S16 samples at 8 kHz through [`crate::hr::HrDecoder`]
+/// (clause 5 homing protocol applied). Registered under
+/// [`HR_CODEC_ID`] by [`register_codecs`] per the workspace dual-API
+/// convention; see `hr::decode` for the conformance posture.
+pub fn make_hr_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let channels = params.channels.unwrap_or(1);
+    if channels != 1 {
+        return Err(CoreError::unsupported(
+            "GSM 06.20 half-rate decoder: only mono is defined (annex A.2)",
+        ));
+    }
+    Ok(Box::new(HrGsmDecoder {
+        codec_id: params.codec_id.clone(),
+        state: crate::hr::HrDecoder::new(),
+        pending: VecDeque::new(),
+        eof: false,
+    }))
+}
+
 /// Build a boxed [`Encoder`] for GSM 06.10 RPE-LTP with the given
 /// codec parameters. Direct-factory entry point — the
 /// [`register_codecs`] path installs this same function into the
@@ -155,6 +180,17 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .decoder(make_decoder)
             .encoder(make_encoder),
+    );
+
+    let mut hr_caps = CodecCapabilities::audio("oxideav-gsm");
+    hr_caps.decode = true;
+    hr_caps.lossy = true;
+    hr_caps.max_sample_rate = Some(8000);
+    hr_caps.max_channels = Some(1);
+    reg.register(
+        CodecInfo::new(CodecId::new(HR_CODEC_ID))
+            .capabilities(hr_caps)
+            .decoder(make_hr_decoder),
     );
 }
 
@@ -239,6 +275,71 @@ impl Decoder for GsmDecoder {
         }
         Ok(Frame::Audio(AudioFrame {
             samples: (FRAME_SAMPLES * frames.len()) as u32,
+            pts: pkt.pts,
+            data: vec![pcm],
+        }))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.state.reset();
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
+    }
+}
+
+/// Adapter between the `oxideav_core::Decoder` trait and the GSM
+/// 06.20 half-rate decoder (14-byte annex-B frames in, 160 mono S16
+/// samples out per frame).
+struct HrGsmDecoder {
+    codec_id: CodecId,
+    state: crate::hr::HrDecoder,
+    pending: VecDeque<Packet>,
+    eof: bool,
+}
+
+impl Decoder for HrGsmDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.pending.push_back(packet.clone());
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        use crate::hr::{HR_FRAME_BYTES, HR_FRAME_SAMPLES};
+        let Some(pkt) = self.pending.pop_front() else {
+            return if self.eof {
+                Err(CoreError::Eof)
+            } else {
+                Err(CoreError::NeedMore)
+            };
+        };
+        if pkt.data.len() < HR_FRAME_BYTES {
+            return Err(CoreError::invalid(format!(
+                "oxideav-gsm: half-rate packet shorter than the {HR_FRAME_BYTES}-byte frame (got {})",
+                pkt.data.len()
+            )));
+        }
+        let n_frames = pkt.data.len() / HR_FRAME_BYTES;
+        let mut pcm = Vec::with_capacity(HR_FRAME_SAMPLES * n_frames * 2);
+        for u in 0..n_frames {
+            let bytes = &pkt.data[u * HR_FRAME_BYTES..(u + 1) * HR_FRAME_BYTES];
+            let p = crate::HrParameters::from_bits(bytes)
+                .map_err(|e| CoreError::invalid(e.to_string()))?;
+            for s in self.state.decode_frame(&p) {
+                pcm.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        Ok(Frame::Audio(AudioFrame {
+            samples: (HR_FRAME_SAMPLES * n_frames) as u32,
             pts: pkt.pts,
             data: vec![pcm],
         }))
@@ -633,6 +734,34 @@ mod tests {
         let id = CodecId::new(CODEC_ID);
         assert!(reg.has_decoder(&id));
         assert!(reg.has_encoder(&id));
+    }
+
+    /// Registry exposes the half-rate decoder under "gsm-hr".
+    #[test]
+    fn registry_has_hr_decoder() {
+        let mut reg = CodecRegistry::new();
+        register_codecs(&mut reg);
+        let id = CodecId::new(HR_CODEC_ID);
+        assert!(reg.has_decoder(&id));
+        assert!(!reg.has_encoder(&id));
+    }
+
+    /// The half-rate adapter pumps 160 samples per 14-byte frame
+    /// and rejects short packets.
+    #[test]
+    fn hr_decoder_adapter_pumps_frames() {
+        let p = CodecParameters::audio(CodecId::new(HR_CODEC_ID));
+        let mut dec = make_hr_decoder(&p).unwrap();
+        dec.send_packet(&empty_packet(vec![0u8; 28])).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Audio(a) => {
+                assert_eq!(a.samples, 320);
+                assert_eq!(a.data[0].len(), 640);
+            }
+            _ => panic!("expected audio frame"),
+        }
+        dec.send_packet(&empty_packet(vec![0u8; 13])).unwrap();
+        assert!(dec.receive_frame().is_err());
     }
 
     // ─── extradata-selected frame packing ───
