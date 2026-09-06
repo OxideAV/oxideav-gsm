@@ -41,6 +41,7 @@
 pub mod decode;
 pub mod encode;
 mod lag;
+mod search;
 pub mod tables;
 
 pub use decode::{
