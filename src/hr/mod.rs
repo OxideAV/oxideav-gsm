@@ -40,6 +40,7 @@
 
 pub mod decode;
 pub mod encode;
+mod lag;
 pub mod tables;
 
 pub use decode::{
