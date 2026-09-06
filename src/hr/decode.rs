@@ -26,32 +26,52 @@
 //! references is not an achievable bar for a non-bit-exact
 //! implementation; `tests/conformance_hr_decode.rs` instead pins
 //! the clause 5 homing behaviour exactly and the measured
-//! per-frame waveform agreement as a regression floor.
+//! per-frame waveform agreement (mean correlation ≈ 0,76 over
+//! SEQ01–SEQ04) as a regression floor.
 //!
 //! ## Empirically resolved readings
 //!
 //! The printed description leaves several codings ambiguous
 //! (byte/bit orders inside the ROM extracts, the postfilter
-//! numerator source). Each was resolved against the staged GSM
-//! 06.07 corpus (decoded-vs-reference per-frame correlation over
-//! SEQ01–SEQ04; details in the harness):
+//! numerator source, fixed-point formats). Each was resolved
+//! against the staged GSM 06.07 corpus — decoded-vs-reference
+//! per-frame correlation over SEQ01–SEQ04, and, for the encoder-
+//! shared legs, per-parameter agreement of `hr::encode` with the
+//! reference `.COD` parameters:
 //!
 //! * packed reflection-VQ words hold the earlier scalar-quantiser
 //!   index in the **high** byte;
 //! * clause 4.1.10 codeword bit `m` (θ_im, basis vector `v_m`) is
-//!   the codeword's bit `m − 1` counted from the **LSB**;
+//!   the codeword's bit `m − 1` counted from the **LSB** (the
+//!   encoder's code searches reproduce the reference codes with
+//!   this pairing);
 //! * annex A.1.4 delta-lag codes are excess-8 (`code − 8` levels);
+//! * the codebook reflection coefficients follow the FLAT/AFLAT
+//!   lattice convention (`step_up` is the plain Levinson step-up;
+//!   the opposite pairing mirrors the spectrum and collapses every
+//!   voiced frame);
+//! * the `{P0,GS}` codebook's `√(GS·P0)`, `√(GS·(1−P0))` components
+//!   are Q14 with the clause 4.1.5 `Rmax = 4096²` on the coded
+//!   signal at unity passband gain (see `hr::encode`);
 //! * the clause 4.2.4 postfilter is realised as
 //!   `A(z)/A(z·0,75)` (numerator = the unsmoothed coefficient set)
 //!   plus brightness and AGC — the SST-smoothed numerator
 //!   derivations of eqs. (158)-(164) with the only staged SST
-//!   window measured clearly worse;
+//!   window measured worse when this decoder landed (measured
+//!   before the lattice-convention fix above; a candidate for
+//!   re-measurement);
 //! * eq. (131a) is applied literally: subframe 1 draws `R'q(0)`
 //!   (and the eq. (132) reflection product) from the previous
-//!   frame.
+//!   frame;
+//! * clause 4.1.8.5 eq. (100) is applied literally for lags shorter
+//!   than the subframe (periodic extension by the multiple of `L`),
+//!   and the clause 4.2.2 prefilter interpolates with the 6th-order
+//!   open-loop-search filter as the clause says.
 
 use super::tables::*;
-use super::{HrParameters, SubframeParams, HR_FRAME_SAMPLES, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES};
+use super::{
+    HrParameters, SubframeParams, HR_FRAME_SAMPLES, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES, R0_RMAX,
+};
 
 /// Short-term predictor order (annex A.2 `Np`).
 const NP: usize = 10;
@@ -125,18 +145,22 @@ pub(super) fn dequant_reflection(lpc1: u16, lpc2: u16, lpc3: u8) -> [f64; NP] {
 /// Reflection coefficients → direct-form LPC coefficients `α_i` for
 /// the clause 4.2.3 synthesis form `s(n) = ex_ps(n) + Σ α_i s(n-i)`
 /// (eq. (154) adds the prediction, so `α` is the plus convention).
-/// The step-up recursion inverts the FLAT/AFLAT lattice whose stage
-/// equations (10)/(162) define `r_j` with the leading minus sign;
-/// the sign pairing here is the one validated by the >14 dB
-/// prediction gain the dequantised sets achieve on the staged
-/// GSM 06.07 encoder-input speech.
+/// The staged codebooks hold the reflection coefficients in the
+/// convention of the FLAT/AFLAT lattices of clauses 4.1.3/4.1.4
+/// (the `j`-th stage of `A(z) = 1 + Σ a_i z⁻ⁱ` has `a_j = r_j`):
+/// the step-up here is the plain Levinson recursion. The opposite
+/// pairing mirrors the spectrum (`A(−z)`) — nearly harmless on
+/// flat unvoiced frames, but it turns every voiced set into a
+/// non-predicting filter (measured −1 dB "prediction gain" against
+/// the +10 dB the coefficient sets carry on the staged GSM 06.07
+/// encoder-input speech, versus +10 dB with this pairing).
 pub(super) fn step_up(r: &[f64; NP]) -> [f64; NP] {
     let mut a = [0f64; NP];
     for j in 0..NP {
         let mut next = a;
-        next[j] = -r[j];
+        next[j] = r[j];
         for i in 0..j {
-            next[i] = a[i] - r[j] * a[j - 1 - i];
+            next[i] = a[i] + r[j] * a[j - 1 - i];
         }
         a = next;
     }
@@ -165,7 +189,7 @@ pub(super) fn step_down(alpha: &[f64; NP]) -> Option<[f64; NP]> {
         if !k.is_finite() || k.abs() >= 0.999_999 {
             return None;
         }
-        r[j] = -k;
+        r[j] = k;
         let denom = 1.0 - k * k;
         let prev = a;
         for i in 0..j {
@@ -176,30 +200,79 @@ pub(super) fn step_down(alpha: &[f64; NP]) -> Option<[f64; NP]> {
 }
 
 /// Clause 4.1.5 eq. (30): decode the 5-bit R0 code into the average
-/// signal power `R(0)_q` relative to full scale (`Rmax = 1` in the
-/// normalised sample domain used internally). Code 0 is the −66 dB
-/// floor; the home state treats it as silence.
+/// signal power `R(0)_q = Rmax · 10^((2·R0 − 66)/10)` with `Rmax`
+/// the square of the high-pass filtered signal's maximum amplitude
+/// ([`R0_RMAX`] in the normalised sample domain). Code 0 is the
+/// −66 dB floor; the home state treats it as silence.
 #[inline]
-fn decode_r0(r0: u8) -> f64 {
+pub(super) fn decode_r0(r0: u8) -> f64 {
     if r0 == 0 {
         return 0.0;
     }
-    10f64.powf((2.0 * r0 as f64 - 66.0) / 10.0)
+    R0_RMAX * 10f64.powf((2.0 * r0 as f64 - 66.0) / 10.0)
 }
 
-// ─── Fractional-lag interpolation (clause 4.1.8.5 eq. (100)) ───
+// ─── Fractional-lag interpolation ───
 
-/// Evaluate the sequence (history `hist` for n < 0, `cur` for
-/// n ≥ 0) delayed by `lag_sixths` 1/6-sample units at position `n`:
-/// the single-tap integer case, or the 10th-order 6-phase
-/// interpolating FIR `f̃_j(i)` ([`INTERP_FILTER_10`], Q15) centred
-/// per its phase-`j` tap centroid (`n - I - 5 + i`, `L = I + j/6`).
-fn interp_delayed(hist: &[f64; HIST], cur: &[f64], n: isize, lag_sixths: i32) -> f64 {
+/// Clause 4.1.8.5 eqs. (100)/(101): the adaptive-codebook output
+/// `b_L(n)` for a (possibly fractional) lag `L` in 1/6-sample units,
+/// generated in order from `n = 0` so that in-subframe references
+/// resolve to already-generated samples. The delay actually applied
+/// at sample `n` is `q = ⌊(n + L + 5/6) / L⌋ · L` — the smallest
+/// multiple of `L` that keeps every tap of the 10th-order
+/// interpolator `f̃_j(i)` ([`INTERP_FILTER_10`], taps at
+/// `n − Λ − 5 + i`, `Λ = ⌊q⌋`, `j = 6(q − Λ)`) on samples that
+/// already exist, so a lag shorter than the subframe repeats the
+/// history periodically instead of re-interpolating its own
+/// interpolated output. Phase 0 is the single-tap special case.
+pub(super) fn adaptive_codebook(hist: &[f64; HIST], lag_sixths: i32) -> [f64; NS] {
+    let mut b = [0f64; NS];
+    let lag = lag_sixths.max(1);
+    for n in 0..NS {
+        // q in sixths: ⌊(6n + L6 + 5) / L6⌋ · L6.
+        let q6 = ((6 * n as i32 + lag + 5) / lag) * lag;
+        let lambda = (q6 / 6) as isize;
+        let phase = (q6 % 6) as usize;
+        let fetch = |m: isize| -> f64 {
+            if m < 0 {
+                let idx = m + HIST as isize;
+                if idx < 0 {
+                    0.0
+                } else {
+                    hist[idx as usize]
+                }
+            } else {
+                b[m as usize]
+            }
+        };
+        let n = n as isize;
+        b[n as usize] = if phase == 0 {
+            fetch(n - lambda)
+        } else {
+            let mut acc = 0.0;
+            for (i, row) in INTERP_FILTER_10.iter().enumerate() {
+                acc += row[phase] as f64 / 32768.0 * fetch(n - lambda - 5 + i as isize);
+            }
+            acc
+        };
+    }
+    b
+}
+
+/// Clause 4.1.9 eq. (107): a sequence delayed by a fractional lag
+/// `L` (1/6-sample units) through the 6th-order interpolator
+/// `g_j(i)` ([`INTERP_FILTER_6`]) — the filter the open-loop lag
+/// search interpolates with, which clause 4.2.2 also assigns to the
+/// adaptive pitch prefilter. Taps sit at `n − ⌊L⌋ − 3 + i`,
+/// `j = 6(L − ⌊L⌋)`; `hist` supplies `n < 0` (oldest first, `cur`
+/// the samples at `n ≥ 0`, which must already be generated — every
+/// tap is at least 19 samples in the past for `L ≥ 21`).
+pub(super) fn frac_delay_6(hist: &[f64], cur: &[f64], n: isize, lag_sixths: i32) -> f64 {
     let i_part = (lag_sixths / 6) as isize;
     let phase = (lag_sixths % 6) as usize;
     let fetch = |m: isize| -> f64 {
         if m < 0 {
-            let idx = m + HIST as isize;
+            let idx = m + hist.len() as isize;
             if idx < 0 {
                 0.0
             } else {
@@ -209,13 +282,9 @@ fn interp_delayed(hist: &[f64; HIST], cur: &[f64], n: isize, lag_sixths: i32) ->
             cur[m as usize]
         }
     };
-    if phase == 0 {
-        // Clause 4.1.8.5: the 0th phase has a single non-zero tap.
-        return fetch(n - i_part);
-    }
     let mut acc = 0.0;
-    for (i, row) in INTERP_FILTER_10.iter().enumerate() {
-        acc += row[phase] as f64 / 32768.0 * fetch(n - i_part - 5 + i as isize);
+    for (i, row) in INTERP_FILTER_6.iter().enumerate() {
+        acc += row[phase] as f64 / 32768.0 * fetch(n - i_part - 3 + i as isize);
     }
     acc
 }
@@ -334,11 +403,10 @@ impl HrDecoder {
         // filter is implemented as A(z)/A(z·0,75) (numerator = the
         // unsmoothed coefficient set) plus brightness and AGC: of
         // the defensible readings of eqs. (155)/(158)/(165) this
-        // measured clearly best against the staged references
-        // (mean per-frame correlation 0.42 vs 0.30-0.32 for the
-        // SST-smoothed numerator derivations - the only staged SST
-        // window, the near-unity FLAT window of table 1, makes
-        // those nearly transparent). The exact numerator the
+        // measured best against the staged references when the
+        // decoder landed (the only staged SST window, the
+        // near-unity FLAT window of table 1, makes the smoothed
+        // derivations nearly transparent). The exact numerator the
         // bit-exact GSM 06.06 C derives remains the largest
         // residual uncertainty of this decoder.
         let num_cur = alpha_cur;
@@ -410,7 +478,7 @@ impl HrDecoder {
                         lag_idx = (lag_idx as i32 + d).clamp(0, 255) as usize;
                     }
                     let lag = LAG_TABLE[lag_idx] as i32;
-                    let b_l = self.adaptive_codevector(lag);
+                    let b_l = adaptive_codebook(&self.ltp_hist, lag);
                     let u = codevector(&BASIS_VECTORS_MODE123, code[sf]);
                     (b_l, u, gsp0[sf], Some(lag))
                 }
@@ -423,7 +491,12 @@ impl HrDecoder {
             //   βq = √(RS·GS·P0     / Rx(0)),
             //   γq = √(RS·GS·(1-P0) / Rx(1)),
             // where √(GS·P0) and √(GS·(1-P0)) are the first two
-            // GSP0 codebook components (Q13 — see `tables`).
+            // GSP0 codebook components, stored in Q14 (the staged
+            // extract notes the words are "scaled by 4" over their
+            // Q12 base) — pinned jointly with Rmax by the corpus:
+            // the encoder's {P0,GS} search reproduces the reference
+            // codes and the decoder's output level matches the
+            // references only with this scaling.
             let (r0q_eff, refl_eff) = if sf == 0 {
                 (self.prev_r0q, &self.prev_refl)
             } else {
@@ -436,8 +509,8 @@ impl HrDecoder {
             let rx0: f64 = c0.iter().map(|x| x * x).sum();
             let rx1: f64 = c1.iter().map(|x| x * x).sum();
             let gs = &GSP0_VQ[mode as usize][gsp0 as usize];
-            let sq_gs_p0 = gs[0] as f64 / 8192.0;
-            let sq_gs_1mp0 = gs[1] as f64 / 8192.0;
+            let sq_gs_p0 = gs[0] as f64 / 16384.0;
+            let sq_gs_1mp0 = gs[1] as f64 / 16384.0;
             // Eqs. (147)-(149): an all-zero long-term state (rx0 =
             // 0 for a voiced subframe) disables the first vector.
             let beta = if rx0 > 1e-30 {
@@ -459,16 +532,17 @@ impl HrDecoder {
 
             // Adaptive pitch prefilter (clause 4.2.2, MODE ≠ 0):
             // ex_p(n) = ex(n) + ζ·ex_p(n-L) with
-            // ζ = 0,3·min(β,1)·√P0 (eq. (151), √P0 from the staged
-            // per-mode lookup), then the eq. (152) energy
+            // ζ = 0,3·min(β,√P0) (eq. (151), √P0 from the staged
+            // per-mode lookup), the fractional delay through the
+            // open-loop search's 6th-order interpolator as the
+            // clause prescribes, then the eq. (152) energy
             // renormalisation.
             let mut exp = [0f64; NS];
             if let Some(lag) = lag_sixths {
-                let zeta = 0.3
-                    * beta.min(1.0)
-                    * (SQRT_P0[(mode - 1) as usize][gsp0 as usize] as f64 / 32768.0);
+                let sqrt_p0 = SQRT_P0[(mode - 1) as usize][gsp0 as usize] as f64 / 32768.0;
+                let zeta = 0.3 * beta.min(sqrt_p0);
                 for n in 0..NS {
-                    let delayed = interp_delayed(&self.pre_hist, &exp, n as isize, lag);
+                    let delayed = frac_delay_6(&self.pre_hist, &exp, n as isize, lag);
                     exp[n] = ex[n] + zeta * delayed;
                 }
             } else {
@@ -570,18 +644,6 @@ impl HrDecoder {
         self.prev_refl = refl;
         out
     }
-
-    /// Clause 4.1.8.5 eqs. (100)/(101): the adaptive-codebook
-    /// output `b_L(n)` for a (possibly fractional) lag in
-    /// 1/6-sample units, computed in order from 0 so that
-    /// in-subframe references resolve to already-generated samples.
-    fn adaptive_codevector(&self, lag_sixths: i32) -> [f64; NS] {
-        let mut b = [0f64; NS];
-        for n in 0..NS {
-            b[n] = interp_delayed(&self.ltp_hist, &b, n as isize, lag_sixths);
-        }
-        b
-    }
 }
 
 /// Shift a history buffer left by one subframe and append the new
@@ -663,8 +725,8 @@ mod tests {
     /// is the silence floor.
     #[test]
     fn r0_decode_matches_printed_equation() {
-        assert!((decode_r0(31) - 10f64.powf(-0.4)).abs() < 1e-12);
-        assert!((decode_r0(1) - 10f64.powf(-6.4)).abs() < 1e-15);
+        assert!((decode_r0(31) - R0_RMAX * 10f64.powf(-0.4)).abs() < 1e-12);
+        assert!((decode_r0(1) - R0_RMAX * 10f64.powf(-6.4)).abs() < 1e-15);
         assert_eq!(decode_r0(0), 0.0);
     }
 }

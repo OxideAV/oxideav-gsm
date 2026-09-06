@@ -66,6 +66,12 @@ pub const HR_SUBFRAME_SAMPLES: usize = 40;
 /// Subframes per frame.
 pub const HR_SUBFRAMES: usize = 4;
 
+/// Clause 4.1.5 `Rmax` in the normalised sample domain (13-bit full
+/// scale = 1,0): the square of the maximum sample amplitude, with
+/// the coded signal carried at unity passband gain (see
+/// `encode::HighPass`).
+pub(crate) const R0_RMAX: f64 = 1.0;
+
 /// Number of coded parameters per frame (annex A.1: *"the encoder
 /// derives 18 parameters"* — 6 frame parameters + 12 subframe
 /// parameters in either MODE split).
