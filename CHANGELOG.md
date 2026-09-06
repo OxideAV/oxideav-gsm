@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- GSM 06.20 half-rate **encoder**: the complete clause 4.1 excitation
+  analysis on top of the frame-parameter chain — spectral noise
+  weighting (4.1.7), open-loop lag search / frame lag trajectory /
+  voicing mode (4.1.8.1–4.1.8.4), closed-loop lag search (4.1.8.5),
+  harmonic noise weighting (4.1.9), the VSELP code searches (4.1.10),
+  the multimode `{P0,GS}` gain quantisation (4.1.11) and clause 5.3
+  encoder homing (`hr::HrEncoder`), registered as the `gsm-hr`
+  encoder (`make_hr_encoder`). Per-parameter agreement against the
+  staged GSM 06.07 `.COD` references pinned in CI, end to end and
+  stage-isolated; homing sample-exact both ways.
+- `hr_encode_frame` fuzz target.
+
+### Fixed
+
+- GSM 06.20 decoder: the codebook reflection coefficients follow the
+  lattice (Levinson) convention — the previous pairing mirrored the
+  spectrum and collapsed every voiced frame; eq. (100) periodic
+  extension for lags shorter than the subframe; the clause 4.2.2
+  prefilter interpolates with the 6th-order filter; eq. (151)
+  `ξ = 0,3·min(β, √P0)`; `{P0,GS}` components read as Q14 with
+  `Rmax = 4096²`. Mean per-frame correlation vs `SEQ01..04.OUT`
+  0.42 → 0.76.
+- GSM 06.20 encoder frame analysis: the coded frame is the oldest 160
+  samples of the clause 4.1.2 buffer (35-sample look-ahead), so the
+  INT_LPC decision runs over the right frame (55% → 91.5% agreement);
+  the printed high-pass coefficients are read as Q14 (the coded
+  signal at unity passband gain replaces the former ×64 R0 fudge).
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.9...v0.0.10) - 2026-08-31
 
 ### Other

@@ -1,7 +1,7 @@
 //! GSM 06.20 half-rate speech codec (VSELP) — ETSI EN 300 969.
 //!
-//! **Status: decoder chain complete (functional) + encoder
-//! frame-parameter analysis.** The module family:
+//! **Status: complete codec (functional) — clause 4.2 decoder and
+//! clause 4.1 encoder.** The module family:
 //!
 //! * [`tables`] — the bit-exact ROM tables (reflection-coefficient
 //!   VQ/prequantizer/scalar-dequantizer, R0 decode, allowable lags,
@@ -25,13 +25,19 @@
 //! * [`decode`] — the clause 4.2 decoder ([`HrDecoder`]): the full
 //!   figure-5 pipeline plus the clause 5 homing protocol (see the
 //!   module docs for the conformance posture);
-//! * [`encode`] — the clause 4.1.1–4.1.6 encoder frame-parameter
-//!   analysis ([`HrAnalyzer`]): high-pass, FLAT, the AFLAT VQ
-//!   search, R0 coding and the INT_LPC decision. The per-subframe
-//!   excitation analysis (clauses 4.1.7–4.1.11) is the next arc.
+//! * [`encode`] — the clause 4.1 encoder: the frame-parameter
+//!   analysis ([`HrAnalyzer`]: high-pass, FLAT, the AFLAT VQ
+//!   search, R0 coding and the INT_LPC decision) and the complete
+//!   per-subframe excitation analysis ([`HrEncoder`]: spectral noise
+//!   weighting, open-/closed-loop lag search with the frame lag
+//!   trajectory and voicing mode, harmonic noise weighting, the
+//!   VSELP code searches, the multimode `{P0,GS}` gain quantisation
+//!   and encoder homing).
 //!
 //! The GSM 06.07 corpus staged under `tests/fixtures/etsi-hr/`
-//! provides the references for both directions.
+//! provides the references for both directions
+//! (`tests/conformance_hr_decode.rs`,
+//! `tests/conformance_hr_encode_params.rs`, `tests/hr_roundtrip.rs`).
 //!
 //! Basic coder parameters (annex A.2): 8 kHz sampling, `NF` = 160
 //! samples (20 ms) per frame, `Ns` = 40 samples (5 ms) per subframe,
