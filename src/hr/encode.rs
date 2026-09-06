@@ -1,27 +1,68 @@
-//! GSM 06.20 half-rate encoder — the frame-parameter analysis
-//! chain of clauses 4.1.1–4.1.6 (ETSI EN 300 969, staged): input
-//! high-pass filtering, segmentation, the FLAT covariance-lattice
-//! reflection-coefficient derivation, the three-segment
-//! reflection-coefficient vector quantization via the AFLAT
-//! recursion, frame-energy (R0) coding, and the soft-interpolation
-//! (INT_LPC) decision.
+//! GSM 06.20 half-rate encoder — clause 4.1 of ETSI EN 300 969
+//! (staged): the frame-parameter analysis chain of clauses
+//! 4.1.1–4.1.6 ([`HrAnalyzer`]: input high-pass filtering,
+//! segmentation, the FLAT covariance-lattice reflection-coefficient
+//! derivation, the three-segment AFLAT vector quantization,
+//! frame-energy coding and the soft-interpolation decision) and,
+//! on top of it, the complete per-subframe excitation analysis
+//! ([`HrEncoder`]): the spectral noise weighting filter (4.1.7),
+//! the open-loop lag search / trajectory / voicing mode
+//! ([`super::lag`], 4.1.8.1–4.1.8.4), the closed-loop lag search
+//! (4.1.8.5), harmonic noise weighting (4.1.9), the VSELP code
+//! searches (4.1.10, [`super::search`]) and the multimode `{P0,GS}`
+//! gain quantization (4.1.11), plus the clause 5.3 encoder homing.
 //!
-//! **Scope.** This is the encoder's *groundwork* arc: the per-frame
-//! parameters `R0`, `LPC1..LPC3` and `INT_LPC`. The per-subframe
-//! excitation analysis (open/closed-loop lag search, voicing mode
-//! selection, VSELP code search, gain quantization — clauses
-//! 4.1.7–4.1.11) is the follow-up arc.
+//! ## Segmentation (clause 4.1.2)
+//!
+//! The analysis buffer holds 195 high-pass filtered samples; *"the
+//! oldest 160 samples in the buffer correspond to the next frame of
+//! samples to be encoded"* while *"the analysis interval comprises
+//! the most recent 170 samples"*. The encoder therefore codes each
+//! input frame with a 35-sample look-ahead: parameter frame `f`
+//! carries input samples `160·f − 35 .. 160·f + 125`, and a decoder
+//! reproduces the input delayed by 35 samples — exactly the offset
+//! the staged GSM 06.07 references show between `SEQxx.INP` and
+//! `SEQxx.OUT`.
+//!
+//! ## Conformance posture
 //!
 //! Like the decoder (see `hr::decode`), the chain implements the
 //! printed floating-point equations over the staged ROM tables in
 //! double precision; the bit-exact arithmetic lives in the unstaged
 //! GSM 06.06 ANSI-C, so the achievable validation bar is measured
-//! parameter agreement against the staged GSM 06.07 encoder
-//! references, pinned in `tests/conformance_hr_encode_params.rs`.
+//! per-parameter agreement against the staged GSM 06.07 encoder
+//! references (`tests/conformance_hr_encode_params.rs`) plus the
+//! sample-exact self round trip through [`super::HrDecoder`] on the
+//! homing protocol.
+//!
+//! ## Readings pinned from the printed clause
+//!
+//! * clause 4.1.1 prints the high-pass coefficients halved: taken
+//!   literally, eq. (3)/(4) with the printed values is not a
+//!   120 Hz high-pass at all (a resonator with −38 dB at 500 Hz);
+//!   doubling every coefficient (the words are Q14) gives the
+//!   stated fourth-order 120 Hz high-pass with the *"incorporated
+//!   gain of 0,5"* — a −6 dB passband — exactly. The coded signal
+//!   itself is carried at unity passband gain (the 0,5 undone) with
+//!   the clause 4.1.5 `Rmax = 4096²` ([`super::R0_RMAX`]): the R0
+//!   codes agree with the corpus either way, but the eq. (132)
+//!   energy estimate behind the `{P0,GS}` search and the decoder's
+//!   excitation level pin this scaling (see `HighPass`);
+//! * the clause 4.1.6 residual comparison and every subframe
+//!   operation run over the coded frame `s(0..160)` of the buffer,
+//!   with the ten samples that precede it kept for the inverse
+//!   filters.
 
-use super::decode::{step_down, step_up, vq_index};
+use super::decode::{
+    adaptive_codebook, decode_r0, dequant_reflection, frac_delay_6, hr_decoder_homing_frame,
+    step_down, step_up, vq_index, HR_ENCODER_HOMING_SAMPLE,
+};
+use super::lag::{open_loop_search, OpenLoop, Y_HIST};
+use super::search::{code_search, decorrelate, gain_search, GainInputs};
 use super::tables::*;
-use super::HR_FRAME_SAMPLES;
+use super::{
+    HrParameters, SubframeParams, HR_FRAME_SAMPLES, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES, R0_RMAX,
+};
 
 /// Short-term predictor order (annex A.2 `Np`).
 const NP: usize = 10;
@@ -48,10 +89,14 @@ pub struct FrameAnalysis {
 }
 
 /// Clause 4.1.1: fourth-order pole-zero high-pass filter (120 Hz),
-/// two cascaded biquads with an incorporated gain of 0,5. The Q15
-/// coefficients are the staged ROM words ([`HIGHPASS_COEFFS`],
-/// storage order per section `(b0, b1, b2, a2, a1)`), which match
-/// the printed equations (3)/(4) exactly.
+/// two cascaded biquads with an incorporated gain of 0,5. The ROM
+/// words ([`HIGHPASS_COEFFS`], storage order per section
+/// `(b0, b1, b2, a2, a1)`) equal the printed eq. (3)/(4) values in
+/// Q15 — and both are **halved**: used as printed the cascade is a
+/// resonator (−38 dB at 500 Hz, −12 dB at 1 kHz), while doubling
+/// every coefficient (reading the words as Q14) yields a real
+/// fourth-order 120 Hz high-pass whose passband sits at exactly the
+/// stated −6 dB (double real poles at 0,926 and 0,965).
 #[derive(Debug, Clone, Default)]
 struct HighPass {
     x1: [f64; 2],
@@ -62,39 +107,76 @@ struct HighPass {
 
 impl HighPass {
     fn process(&mut self, x: f64) -> f64 {
-        let c = |i: usize| HIGHPASS_COEFFS[i] as f64 / 32768.0;
-        // Section 1 (eq. (3)): y1 = b10 x + b11 x' + b12 x'' +
-        // 2 a11 y1' + 2 a12 y1''. The Q15 ROM words store the
-        // recursive coefficients HALVED so |a| < 1 fits Q15; the
-        // doubled values give the double real pole at 0,926 (and
-        // 0,965 for section 2) that realises the printed 120 Hz
-        // high-pass — as stored they would describe a 1 kHz
-        // resonator, not a high-pass.
+        // Q14: every word doubled relative to its Q15 reading.
+        let c = |i: usize| HIGHPASS_COEFFS[i] as f64 / 16384.0;
+        // Section 1 (eq. (3)).
         let y1 = c(0) * x
             + c(1) * self.x1[0]
             + c(2) * self.x1[1]
-            + 2.0 * c(4) * self.y1[0]
-            + 2.0 * c(3) * self.y1[1];
+            + c(4) * self.y1[0]
+            + c(3) * self.y1[1];
         self.x1 = [x, self.x1[0]];
         self.y1 = [y1, self.y1[0]];
         // Section 2 (eq. (4)).
         let y2 = c(5) * y1
             + c(6) * self.x2in[0]
             + c(7) * self.x2in[1]
-            + 2.0 * c(9) * self.y2[0]
-            + 2.0 * c(8) * self.y2[1];
+            + c(9) * self.y2[0]
+            + c(8) * self.y2[1];
         self.x2in = [y1, self.x2in[0]];
         self.y2 = [y2, self.y2[0]];
-        y2
+        // The coded-signal domain is the filtered input at unity
+        // passband gain: the printed 0,5 gain is undone here. Pinned
+        // by the staged references — the R0 codes agree either way
+        // (R0 is relative to Rmax), but the eq. (132) energy
+        // estimate feeding the {P0,GS} search and the decoder's
+        // excitation level only match the corpus with the coded
+        // signal at the input level (GSP0 agreement with every other
+        // parameter forced: 7% at −6 dB versus 77% here; decoder
+        // output level ≈ the reference's, which sits at the input
+        // level).
+        2.0 * y2
     }
+}
+
+/// Where a subframe's direct-form coefficient set comes from
+/// (clause 4.1.6): the previous frame's set, the current frame's,
+/// or the table-2 interpolation of the two. The spectral noise
+/// weighting filter mirrors the same choice (clause 4.1.7).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoefSource {
+    Previous,
+    Current,
+    Interpolated,
+}
+
+/// Everything the frame analysis derives that the excitation
+/// analysis consumes.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct FrameSets {
+    pub codes: FrameAnalysis,
+    /// The current frame's quantized reflection coefficients and
+    /// direct-form set.
+    pub refl_q: [f64; NP],
+    pub alpha_cur: [f64; NP],
+    /// The per-subframe direct-form sets and their provenance.
+    pub sub_alpha: [[f64; NP]; HR_SUBFRAMES],
+    #[doc(hidden)]
+    pub sub_src: [CoefSource; HR_SUBFRAMES],
 }
 
 /// The clause 4.1.1–4.1.6 frame analyzer.
 #[derive(Debug, Clone)]
 pub struct HrAnalyzer {
     hp: HighPass,
-    /// Clause 4.1.2 sample buffer `s(0..=194)`, `s(0)` oldest.
+    /// Clause 4.1.2 sample buffer `s(0..=194)`, `s(0)` oldest; the
+    /// coded frame is `s(0..160)`.
     buf: [f64; BUF],
+    /// The ten samples preceding `s(0)` (inverse-filter memory for
+    /// the clause 4.1.6 comparison and the weighting stage).
+    pre: [f64; NP],
     /// Previous frame's quantized direct-form set + INT_LPC state
     /// (clause 4.1.6).
     prev_alpha: [f64; NP],
@@ -112,6 +194,7 @@ impl HrAnalyzer {
         Self {
             hp: HighPass::default(),
             buf: [0.0; BUF],
+            pre: [0.0; NP],
             prev_alpha: [0.0; NP],
         }
     }
@@ -121,17 +204,56 @@ impl HrAnalyzer {
         *self = Self::new();
     }
 
-    /// Analyze one 160-sample frame (13-bit left-justified i16, the
-    /// GSM 06.07 input convention) into the frame-level parameter
-    /// codes.
+    /// Analyze one 160-sample input frame (13-bit left-justified
+    /// i16, the GSM 06.07 input convention) into the frame-level
+    /// parameter codes of the frame the buffer now codes (clause
+    /// 4.1.2: the input's last 35 samples are look-ahead).
+    pub fn analyze_frame(&mut self, samples: &[i16; HR_FRAME_SAMPLES]) -> FrameAnalysis {
+        self.analyze_frame_sets(samples).codes
+    }
+
+    /// The high-pass filtered coded frame `s(0..160)` in the
+    /// normalised sample domain (13-bit full scale = 1,0), with the
+    /// ten preceding samples.
+    pub(super) fn coded_frame(&self) -> (&[f64; NP], &[f64]) {
+        (&self.pre, &self.buf[..HR_FRAME_SAMPLES])
+    }
+
+    /// Sample `s(m)` of the coded frame for `m ≥ -10`.
+    #[inline]
+    fn sample(&self, m: isize) -> f64 {
+        if m >= 0 {
+            self.buf[m as usize]
+        } else {
+            self.pre[(NP as isize + m) as usize]
+        }
+    }
+
+    pub(super) fn analyze_frame_sets(&mut self, samples: &[i16; HR_FRAME_SAMPLES]) -> FrameSets {
+        self.analyze_frame_sets_forced(samples, None)
+    }
+
+    /// Diagnostics: analyze, then substitute the given frame codes
+    /// (and everything derived from them, including the
+    /// soft-interpolation choice) for the ones found.
     // The covariance/window/interpolation loops index multiple
     // arrays by the same symmetric (i, k) pair; iterator forms
     // obscure the spec equations.
     #[allow(clippy::needless_range_loop)]
-    pub fn analyze_frame(&mut self, samples: &[i16; HR_FRAME_SAMPLES]) -> FrameAnalysis {
-        // Clauses 4.1.1/4.1.2: high-pass + buffer shift.
+    #[doc(hidden)]
+    pub fn analyze_frame_sets_forced(
+        &mut self,
+        samples: &[i16; HR_FRAME_SAMPLES],
+        forced: Option<FrameAnalysis>,
+    ) -> FrameSets {
+        // Clauses 4.1.1/4.1.2: high-pass + buffer shift. The frame
+        // being shifted out (s(0..160)) leaves its last ten samples
+        // as the inverse-filter memory of the next coded frame.
+        self.pre
+            .copy_from_slice(&self.buf[HR_FRAME_SAMPLES - NP..HR_FRAME_SAMPLES]);
         self.buf.copy_within(HR_FRAME_SAMPLES.., 0);
         for (i, &s) in samples.iter().enumerate() {
+            // 13-bit left-justified in 16 bits: s/32768 = s13/4096.
             self.buf[BUF - HR_FRAME_SAMPLES + i] = self.hp.process(s as f64 / 32768.0);
         }
 
@@ -148,14 +270,12 @@ impl HrAnalyzer {
             }
         }
 
-        // Clause 4.1.5 eqs. (27)-(29): frame-energy code. Rmax is
-        // the square of the maximum 13-bit sample amplitude (4096)
-        // while the samples are carried left-justified in 16-bit
-        // words, so the normalised-domain energy scales by
-        // (32768/4096)^2 = 64 — pinned by the staged references
-        // (without it every R0 code sits exactly 9 below the
-        // corpus, i.e. -18,06 dB).
-        let r0_energy = 64.0 * (phi[0][0] + phi[NP][NP]) / 320.0;
+        // Clause 4.1.5 eqs. (27)-(29): frame-energy code, relative
+        // to Rmax = the square of the filtered signal's maximum
+        // amplitude (the −6 dB high-pass halves the 13-bit full
+        // scale). Pinned by the staged references: every R0 code
+        // lands within one 2 dB step of the corpus.
+        let r0_energy = (phi[0][0] + phi[NP][NP]) / 320.0 / R0_RMAX;
         let r0 = if r0_energy <= 0.0 {
             0
         } else {
@@ -217,19 +337,31 @@ impl HrAnalyzer {
         // optimal reflection coefficients (unit-energy model), then
         // the three-segment AFLAT VQ search.
         let rr = rc_to_autocorr(&r_opt);
-        let (lpc1, lpc2, lpc3, rq) = vq_search(&rr);
+        let (mut lpc1, mut lpc2, mut lpc3, mut rq) = vq_search(&rr);
+        let mut r0 = r0;
+        if let Some(f) = forced {
+            r0 = f.r0;
+            lpc1 = f.lpc1;
+            lpc2 = f.lpc2;
+            lpc3 = f.lpc3;
+            rq = dequant_reflection(lpc1, lpc2, lpc3);
+        }
 
         // Clause 4.1.6: the soft-interpolation decision. Build the
         // interpolated and uninterpolated per-subframe sets from the
         // previous and current quantized coefficients, inverse
-        // filter the frame, and pick the lower residual energy
-        // (ties go to uninterpolated).
+        // filter the coded frame s(0..160), and pick the lower
+        // residual energy (ties go to uninterpolated).
         let alpha_cur = step_up(&rq);
+        let mut int_sets = [[0f64; NP]; HR_SUBFRAMES];
+        let mut int_src = [CoefSource::Current; HR_SUBFRAMES];
+        let mut flat_sets = [[0f64; NP]; HR_SUBFRAMES];
+        let mut flat_src = [CoefSource::Current; HR_SUBFRAMES];
         let mut e_interp = 0.0;
         let mut e_flat = 0.0;
-        for sf in 0..4 {
-            let a_int = if sf == 3 {
-                alpha_cur
+        for sf in 0..HR_SUBFRAMES {
+            let (a_int, src) = if sf == HR_SUBFRAMES - 1 {
+                (alpha_cur, CoefSource::Current)
             } else {
                 let del = SOFT_INTERP_CURRENT[sf] as f64 / 32768.0;
                 let mut a = [0f64; NP];
@@ -237,40 +369,59 @@ impl HrAnalyzer {
                     a[i] = self.prev_alpha[i] + del * (alpha_cur[i] - self.prev_alpha[i]);
                 }
                 if step_down(&a).is_some() {
-                    a
+                    (a, CoefSource::Interpolated)
                 } else if sf == 0 {
-                    self.prev_alpha
+                    (self.prev_alpha, CoefSource::Previous)
                 } else {
-                    alpha_cur
+                    (alpha_cur, CoefSource::Current)
                 }
             };
-            let a_unint = if sf == 0 { self.prev_alpha } else { alpha_cur };
-            // Inverse filter the frame's samples (the newest 160 in
-            // the buffer) over this subframe.
-            let base = BUF - HR_FRAME_SAMPLES + sf * 40;
-            for n in 0..40 {
-                let idx = base + n;
+            let (a_unint, usrc) = if sf == 0 {
+                (self.prev_alpha, CoefSource::Previous)
+            } else {
+                (alpha_cur, CoefSource::Current)
+            };
+            int_sets[sf] = a_int;
+            int_src[sf] = src;
+            flat_sets[sf] = a_unint;
+            flat_src[sf] = usrc;
+            for n in 0..HR_SUBFRAME_SAMPLES {
+                let idx = (sf * HR_SUBFRAME_SAMPLES + n) as isize;
                 let mut p_int = 0.0;
                 let mut p_flat = 0.0;
                 for i in 0..NP {
-                    let past = self.buf[idx - 1 - i];
+                    let past = self.sample(idx - 1 - i as isize);
                     p_int += a_int[i] * past;
                     p_flat += a_unint[i] * past;
                 }
-                let s = self.buf[idx];
+                let s = self.buf[idx as usize];
                 e_interp += (s - p_int) * (s - p_int);
                 e_flat += (s - p_flat) * (s - p_flat);
             }
         }
-        let int_lpc = e_interp < e_flat;
+        let mut int_lpc = e_interp < e_flat;
+        if let Some(f) = forced {
+            int_lpc = f.int_lpc;
+        }
+        let (sub_alpha, sub_src) = if int_lpc {
+            (int_sets, int_src)
+        } else {
+            (flat_sets, flat_src)
+        };
 
         self.prev_alpha = alpha_cur;
-        FrameAnalysis {
-            r0,
-            lpc1,
-            lpc2,
-            lpc3,
-            int_lpc,
+        FrameSets {
+            codes: FrameAnalysis {
+                r0,
+                lpc1,
+                lpc2,
+                lpc3,
+                int_lpc,
+            },
+            refl_q: rq,
+            alpha_cur,
+            sub_alpha,
+            sub_src,
         }
     }
 }
@@ -421,10 +572,593 @@ fn vq_search(rr: &[f64; NP + 1]) -> (u16, u16, u8, [f64; NP]) {
     (codes[0], codes[1], codes[2] as u8, rq)
 }
 
+// ─── Clause 4.1.7–4.1.11: the excitation analysis ───
+
+/// Samples per subframe (annex A.2 `Ns`).
+const NS: usize = HR_SUBFRAME_SAMPLES;
+
+/// Long-term filter history length (clause 4.1.8.5: the deepest
+/// interpolator tap for `Lmax` reaches 147 samples back).
+const HIST: usize = 147;
+
+/// Clause 4.1.7: the spectral noise weighting coefficients `α̃_i`
+/// for one direct-form set `α`: the zero-state response `h3(n)` of
+/// the cascade 1/A(z) · A(z/0,93) · 1/A(z/0,7) over `Ns` samples
+/// (eqs. (32)–(35)), its autocorrelation (eq. (36)) and the AFLAT
+/// recursion (eqs. (37)–(41)) back to reflection coefficients,
+/// converted to direct form (step 7). The 0,93ⁱ / 0,7ⁱ
+/// bandwidth-expansion weights are the staged ROM words
+/// ([`SNW_COEFFS`], Q15).
+fn weighting_coefficients(alpha: &[f64; NP]) -> [f64; NP] {
+    let w93 = |i: usize| SNW_COEFFS[i] as f64 / 32768.0;
+    let w70 = |i: usize| SNW_COEFFS[NP + i] as f64 / 32768.0;
+    let mut h1 = [0f64; NS];
+    let mut h2 = [0f64; NS];
+    let mut h3 = [0f64; NS];
+    for n in 0..NS {
+        let mut acc = if n == 0 { 1.0 } else { 0.0 };
+        for i in 0..NP.min(n) {
+            acc += alpha[i] * h1[n - 1 - i];
+        }
+        h1[n] = acc;
+        let mut acc2 = h1[n];
+        for i in 0..NP.min(n) {
+            acc2 -= w93(i) * alpha[i] * h1[n - 1 - i];
+        }
+        h2[n] = acc2;
+        let mut acc3 = h2[n];
+        for i in 0..NP.min(n) {
+            acc3 += w70(i) * alpha[i] * h3[n - 1 - i];
+        }
+        h3[n] = acc3;
+    }
+    let mut rh = [0f64; NP + 1];
+    for (i, r) in rh.iter_mut().enumerate() {
+        *r = (i..NS).map(|n| h3[n] * h3[n - i]).sum();
+    }
+    if rh[0] <= 0.0 {
+        return [0.0; NP];
+    }
+    // AFLAT over the autocorrelation (eqs. (37)-(41)).
+    let mut p = rh;
+    let mut v = [0f64; 2 * NP - 1];
+    for i in (1 - (NP as isize))..(NP as isize) {
+        v[(i + NP as isize - 1) as usize] = rh[(i + 1).unsigned_abs()];
+    }
+    let mut r = [0f64; NP];
+    for rj in r.iter_mut() {
+        let p0 = p[0];
+        let v0 = v[NP - 1];
+        *rj = if p0.abs() > 1e-300 {
+            (-v0 / p0).clamp(-0.999_999, 0.999_999)
+        } else {
+            0.0
+        };
+        aflat_stage(&mut p, &mut v, *rj);
+    }
+    step_up(&r)
+}
+
+/// Zero-state response of the all-pole filter `1/(1 − Σ a_i z⁻ⁱ)`
+/// to `x` over one subframe.
+fn zsr_allpole(a: &[f64; NP], x: &[f64; NS]) -> [f64; NS] {
+    let mut y = [0f64; NS];
+    for n in 0..NS {
+        let mut acc = x[n];
+        for i in 0..NP.min(n) {
+            acc += a[i] * y[n - 1 - i];
+        }
+        y[n] = acc;
+    }
+    y
+}
+
+/// Zero-input response of the same filter from its memory
+/// (`mem[i]` = output at `n − 1 − i`).
+fn zir_allpole(a: &[f64; NP], mem: &[f64; NP]) -> [f64; NS] {
+    let mut y = [0f64; NS];
+    for n in 0..NS {
+        let mut acc = 0.0;
+        for i in 0..NP {
+            let past = if n > i { y[n - 1 - i] } else { mem[i - n] };
+            acc += a[i] * past;
+        }
+        y[n] = acc;
+    }
+    y
+}
+
+/// Clause 4.1.9 eqs. (106)/(107): apply `C(z) = 1 − λ z^{−L_pitch}`
+/// to `cur` (history `hist` for `n < 0`; zero history for a
+/// zero-state response).
+fn harmonic_weight(hist: &[f64], cur: &[f64; NS], lambda: f64, lpitch: i32) -> [f64; NS] {
+    if lambda == 0.0 {
+        return *cur;
+    }
+    let mut out = [0f64; NS];
+    for n in 0..NS {
+        out[n] = cur[n] - lambda * frac_delay_6(hist, cur, n as isize, lpitch);
+    }
+    out
+}
+
+/// Clause 4.1.10 eq. (108): the (unweighted) VSELP codevector for
+/// a codeword, in the codebook's raw ROM units.
+fn codevector(basis: &[[i16; 40]], codeword: u16) -> [f64; NS] {
+    let mut u = [0f64; NS];
+    for (m, v) in basis.iter().enumerate() {
+        let sign = if (codeword >> m) & 1 == 1 { 1.0 } else { -1.0 };
+        for (n, &s) in v.iter().enumerate() {
+            u[n] += sign * s as f64;
+        }
+    }
+    u
+}
+
+/// Shift a history buffer left by one subframe and append `new`.
+fn shift_append(hist: &mut [f64; HIST], new: &[f64; NS]) {
+    hist.copy_within(NS.., 0);
+    hist[HIST - NS..].copy_from_slice(new);
+}
+
+/// Diagnostics: reference values to substitute at each stage of
+/// the encoder (teacher forcing against a conformance corpus).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HrForce {
+    pub frame: Option<FrameAnalysis>,
+    /// (mode, absolute lag levels per subframe).
+    pub lags: Option<(u8, [usize; HR_SUBFRAMES])>,
+    /// Voiced 9-bit codes, or unvoiced (code1, code2) pairs.
+    pub codes: Option<[u16; HR_SUBFRAMES]>,
+    pub codes2: Option<[u16; HR_SUBFRAMES]>,
+    pub gsp0: Option<[u8; HR_SUBFRAMES]>,
+}
+
+/// GSM 06.20 half-rate speech encoder (clause 4.1): frame analysis
+/// through [`HrAnalyzer`] followed by the per-subframe excitation
+/// analysis, producing one annex-A parameter frame per 160-sample
+/// input frame (clause 5.3 encoder homing applied).
+#[derive(Debug, Clone)]
+pub struct HrEncoder {
+    an: HrAnalyzer,
+    /// Previous frame's spectral-noise-weighting set `α̃` (clause
+    /// 4.1.7 interpolation mirror).
+    prev_wa: [f64; NP],
+    /// Previous frame's decoded energy and quantized reflection set
+    /// (eqs. (131a)/(132)).
+    prev_r0q: f64,
+    prev_refl: [f64; NP],
+    /// Weighting filter `W(z)` all-pole memory (past `y`) and the
+    /// weighted-speech history in front of the frame.
+    w_mem: [f64; NP],
+    y_hist: [f64; Y_HIST],
+    /// `H(z)` memory (past weighted synthetic excitation) and its
+    /// history for the harmonic-weighting zero-input response.
+    h_mem: [f64; NP],
+    h_hist: [f64; HIST],
+    /// Long-term filter state `r(n)` (clause 4.2.5 mirror).
+    ltp_hist: [f64; HIST],
+}
+
+impl Default for HrEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HrEncoder {
+    /// Fresh encoder in the clause 5.5 home state.
+    pub fn new() -> Self {
+        Self {
+            an: HrAnalyzer::new(),
+            prev_wa: [0.0; NP],
+            prev_r0q: 0.0,
+            prev_refl: [0.0; NP],
+            w_mem: [0.0; NP],
+            y_hist: [0.0; Y_HIST],
+            h_mem: [0.0; NP],
+            h_hist: [0.0; HIST],
+            ltp_hist: [0.0; HIST],
+        }
+    }
+
+    /// Reset to the home state (clause 5.3 step 2).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Encode one 160-sample input frame (13-bit left-justified
+    /// i16) into the annex-A parameter frame. An encoder homing
+    /// frame (every sample `0008` hex, clause 5.2) yields the
+    /// decoder homing frame and resets the encoder (clause 5.3).
+    pub fn encode_frame(&mut self, samples: &[i16; HR_FRAME_SAMPLES]) -> HrParameters {
+        if samples.iter().all(|&s| s == HR_ENCODER_HOMING_SAMPLE) {
+            self.reset();
+            return hr_decoder_homing_frame();
+        }
+        self.encode_frame_no_homing(samples)
+    }
+
+    /// Encode one frame without the homing check.
+    pub fn encode_frame_no_homing(&mut self, samples: &[i16; HR_FRAME_SAMPLES]) -> HrParameters {
+        self.encode_frame_forced(samples, &HrForce::default())
+    }
+
+    /// Diagnostics: encode with reference values substituted per
+    /// [`HrForce`].
+    // The filter loops index coefficient and sample arrays by the
+    // same lag offsets; iterator forms obscure the spec equations.
+    #[allow(clippy::needless_range_loop)]
+    #[doc(hidden)]
+    pub fn encode_frame_forced(
+        &mut self,
+        samples: &[i16; HR_FRAME_SAMPLES],
+        force: &HrForce,
+    ) -> HrParameters {
+        let sets = self.an.analyze_frame_sets_forced(samples, force.frame);
+        let codes = sets.codes;
+
+        // Clause 4.1.7: weighting coefficients once per frame, then
+        // per subframe mirroring the clause 4.1.6 choice.
+        let wa_cur = weighting_coefficients(&sets.alpha_cur);
+        let mut sub_wa = [[0f64; NP]; HR_SUBFRAMES];
+        for sf in 0..HR_SUBFRAMES {
+            sub_wa[sf] = match sets.sub_src[sf] {
+                CoefSource::Previous => self.prev_wa,
+                CoefSource::Current => wa_cur,
+                CoefSource::Interpolated => {
+                    let del = SOFT_INTERP_CURRENT[sf] as f64 / 32768.0;
+                    let mut a = [0f64; NP];
+                    for i in 0..NP {
+                        a[i] = self.prev_wa[i] + del * (wa_cur[i] - self.prev_wa[i]);
+                    }
+                    a
+                }
+            };
+        }
+
+        // Weighted speech y(n) = W(z) s(n) = H(z)[A(z) s(n)] over the
+        // coded frame, with continuous filter memories.
+        let (pre, frame) = self.an.coded_frame();
+        let sample = |m: isize| -> f64 {
+            if m >= 0 {
+                frame[m as usize]
+            } else {
+                pre[(NP as isize + m) as usize]
+            }
+        };
+        let mut y_all = [0f64; Y_HIST + HR_FRAME_SAMPLES];
+        y_all[..Y_HIST].copy_from_slice(&self.y_hist);
+        for sf in 0..HR_SUBFRAMES {
+            let a = &sets.sub_alpha[sf];
+            let wa = &sub_wa[sf];
+            for n in 0..NS {
+                let idx = (sf * NS + n) as isize;
+                let mut res = sample(idx);
+                for i in 0..NP {
+                    res -= a[i] * sample(idx - 1 - i as isize);
+                }
+                let mut y = res;
+                for i in 0..NP {
+                    y += wa[i] * self.w_mem[i];
+                }
+                self.w_mem.copy_within(..NP - 1, 1);
+                self.w_mem[0] = y;
+                y_all[Y_HIST + sf * NS + n] = y;
+            }
+        }
+
+        // Clauses 4.1.8.1-4.1.8.4.
+        let mut ol: OpenLoop = open_loop_search(&y_all);
+        let forced_lags = force.lags.is_some();
+        if let Some((m, lv)) = force.lags {
+            ol.mode = m;
+            ol.levels = lv;
+        }
+        let mode = ol.mode;
+
+        // Eq. (132) energy estimate inputs.
+        let r0q_cur = decode_r0(codes.r0);
+
+        let mut lag_levels = [0usize; HR_SUBFRAMES];
+        let mut code1 = [0u8; HR_SUBFRAMES];
+        let mut code2 = [0u8; HR_SUBFRAMES];
+        let mut vcode = [0u16; HR_SUBFRAMES];
+        let mut gsp0 = [0u8; HR_SUBFRAMES];
+
+        for sf in 0..HR_SUBFRAMES {
+            let wa = &sub_wa[sf];
+            let mut y_sf = [0f64; NS];
+            y_sf.copy_from_slice(&y_all[Y_HIST + sf * NS..Y_HIST + (sf + 1) * NS]);
+            let y_before = &y_all[..Y_HIST + sf * NS];
+            let zir = zir_allpole(wa, &self.h_mem);
+
+            let (r0q_eff, refl_eff) = if sf == 0 {
+                (self.prev_r0q, &self.prev_refl)
+            } else {
+                (r0q_cur, &sets.refl_q)
+            };
+            let mut rs = NS as f64 * r0q_eff;
+            for r in refl_eff.iter() {
+                rs *= 1.0 - r * r;
+            }
+
+            let (c0, c1, w0, w1, target);
+            if mode == 0 {
+                // Target p(n) = W(z)s − ZIR of H(z).
+                let mut p = [0f64; NS];
+                for n in 0..NS {
+                    p[n] = y_sf[n] - zir[n];
+                }
+                // First VSELP codebook.
+                let mut q1: Vec<[f64; NS]> = BASIS_VECTORS_MODE0[0]
+                    .iter()
+                    .map(|v| {
+                        let mut x = [0f64; NS];
+                        for (n, &s) in v.iter().enumerate() {
+                            x[n] = s as f64;
+                        }
+                        zsr_allpole(wa, &x)
+                    })
+                    .collect();
+                let mut i_code = code_search(&q1, &p);
+                if let Some(c) = force.codes {
+                    i_code = c[sf];
+                }
+                let f_i = {
+                    let mut f = [0f64; NS];
+                    for (m, qm) in q1.iter().enumerate() {
+                        let sg = if (i_code >> m) & 1 == 1 { 1.0 } else { -1.0 };
+                        for n in 0..NS {
+                            f[n] += sg * qm[n];
+                        }
+                    }
+                    f
+                };
+                // Second codebook, decorrelated against f_I.
+                let mut q2: Vec<[f64; NS]> = BASIS_VECTORS_MODE0[1]
+                    .iter()
+                    .map(|v| {
+                        let mut x = [0f64; NS];
+                        for (n, &s) in v.iter().enumerate() {
+                            x[n] = s as f64;
+                        }
+                        zsr_allpole(wa, &x)
+                    })
+                    .collect();
+                let q2_raw = q2.clone();
+                decorrelate(&mut q2, &f_i);
+                let mut h_code = code_search(&q2, &p);
+                if let Some(c) = force.codes2 {
+                    h_code = c[sf];
+                }
+                let f_h = {
+                    let mut f = [0f64; NS];
+                    for (m, qm) in q2_raw.iter().enumerate() {
+                        let sg = if (h_code >> m) & 1 == 1 { 1.0 } else { -1.0 };
+                        for n in 0..NS {
+                            f[n] += sg * qm[n];
+                        }
+                    }
+                    f
+                };
+                q1.clear();
+                code1[sf] = i_code as u8;
+                code2[sf] = h_code as u8;
+                c0 = codevector(&BASIS_VECTORS_MODE0[0], i_code);
+                c1 = codevector(&BASIS_VECTORS_MODE0[1], h_code);
+                w0 = f_i;
+                w1 = f_h;
+                target = p;
+            } else {
+                // Clause 4.1.8.5: closed-loop lag search over the
+                // three levels around the trajectory lag (two at the
+                // table ends), restricted to what the annex A.1.4
+                // delta code can carry.
+                let mut p = [0f64; NS];
+                for n in 0..NS {
+                    p[n] = y_sf[n] - zir[n];
+                }
+                let centre = ol.levels[sf] as i32;
+                let mut best: Option<(f64, usize, [f64; NS], [f64; NS])> = None;
+                for cand in centre - 1..=centre + 1 {
+                    if !(0..LAG_TABLE.len() as i32).contains(&cand) {
+                        continue;
+                    }
+                    if forced_lags && cand != centre {
+                        continue;
+                    }
+                    if sf > 0 && !forced_lags {
+                        let d = cand - lag_levels[sf - 1] as i32;
+                        if !(-8..=7).contains(&d) {
+                            continue;
+                        }
+                    }
+                    let b_l = adaptive_codebook(&self.ltp_hist, LAG_TABLE[cand as usize] as i32);
+                    let b_w = zsr_allpole(wa, &b_l);
+                    let c: f64 = b_w.iter().zip(p.iter()).map(|(a, b)| a * b).sum();
+                    let g: f64 = b_w.iter().map(|v| v * v).sum();
+                    let score = if g > 0.0 {
+                        c / g.sqrt()
+                    } else {
+                        f64::NEG_INFINITY
+                    };
+                    if best.as_ref().map_or(true, |(b, ..)| score > *b) {
+                        best = Some((score, cand as usize, b_l, b_w));
+                    }
+                }
+                let (_, level, b_l, b_w) =
+                    best.expect("at least the trajectory lag is a candidate");
+                lag_levels[sf] = level;
+
+                // Clause 4.1.9: harmonic noise weighting on the
+                // target, the ZIR and every filtered vector.
+                let lambda = ol.lambda[sf];
+                let lpitch = ol.lpitch[sf];
+                let yc = harmonic_weight(y_before, &y_sf, lambda, lpitch);
+                let zir_c = harmonic_weight(&self.h_hist, &zir, lambda, lpitch);
+                let mut pc = [0f64; NS];
+                for n in 0..NS {
+                    pc[n] = yc[n] - zir_c[n];
+                }
+                let zero_hist = [0f64; NS];
+                let b_wc = harmonic_weight(&zero_hist, &b_w, lambda, lpitch);
+                let q_raw: Vec<[f64; NS]> = BASIS_VECTORS_MODE123
+                    .iter()
+                    .map(|v| {
+                        let mut x = [0f64; NS];
+                        for (n, &s) in v.iter().enumerate() {
+                            x[n] = s as f64;
+                        }
+                        harmonic_weight(&zero_hist, &zsr_allpole(wa, &x), lambda, lpitch)
+                    })
+                    .collect();
+                let mut q = q_raw.clone();
+                decorrelate(&mut q, &b_wc);
+                let mut code = code_search(&q, &pc);
+                if let Some(c) = force.codes {
+                    code = c[sf];
+                }
+                let f_i = {
+                    let mut f = [0f64; NS];
+                    for (m, qm) in q_raw.iter().enumerate() {
+                        let sg = if (code >> m) & 1 == 1 { 1.0 } else { -1.0 };
+                        for n in 0..NS {
+                            f[n] += sg * qm[n];
+                        }
+                    }
+                    f
+                };
+                vcode[sf] = code;
+                c0 = b_l;
+                c1 = codevector(&BASIS_VECTORS_MODE123, code);
+                w0 = b_wc;
+                w1 = f_i;
+                target = pc;
+            }
+
+            // Clause 4.1.11: joint gain quantization.
+            let mut gc = gain_search(
+                mode,
+                &GainInputs {
+                    p: &target,
+                    c0: &c0,
+                    c1: &c1,
+                    w0: &w0,
+                    w1: &w1,
+                    rs,
+                },
+            );
+            if let Some(g) = force.gsp0 {
+                gc = super::search::gain_from_code(mode, g[sf], &c0, &c1, rs);
+            }
+            gsp0[sf] = gc.code;
+
+            // Reconstruct the excitation exactly as the decoder does
+            // (eq. (127)) and advance the states: long-term filter
+            // (clause 4.2.5) and the weighted synthetic excitation
+            // through H(z) with its memory.
+            let mut ex = [0f64; NS];
+            for n in 0..NS {
+                ex[n] = gc.beta * c0[n] + gc.gamma * c1[n];
+            }
+            shift_append(&mut self.ltp_hist, &ex);
+            let hx = zsr_allpole(wa, &ex);
+            let mut h_out = [0f64; NS];
+            for n in 0..NS {
+                h_out[n] = zir[n] + hx[n];
+            }
+            for i in 0..NP {
+                self.h_mem[i] = h_out[NS - 1 - i];
+            }
+            shift_append(&mut self.h_hist, &h_out);
+        }
+
+        // Frame-level state.
+        self.y_hist
+            .copy_from_slice(&y_all[HR_FRAME_SAMPLES..HR_FRAME_SAMPLES + Y_HIST]);
+        self.prev_wa = wa_cur;
+        self.prev_r0q = r0q_cur;
+        self.prev_refl = sets.refl_q;
+
+        let sub = if mode == 0 {
+            SubframeParams::Unvoiced { code1, code2, gsp0 }
+        } else {
+            let mut lag_delta = [0u8; 3];
+            for sf in 1..HR_SUBFRAMES {
+                lag_delta[sf - 1] = (lag_levels[sf] as i32 - lag_levels[sf - 1] as i32 + 8) as u8;
+            }
+            SubframeParams::Voiced {
+                lag1: lag_levels[0] as u8,
+                lag_delta,
+                code: vcode,
+                gsp0,
+            }
+        };
+        HrParameters {
+            r0: codes.r0,
+            lpc1: codes.lpc1,
+            lpc2: codes.lpc2,
+            lpc3: codes.lpc3,
+            int_lpc: codes.int_lpc,
+            mode_code: mode,
+            sub,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::decode::dequant_reflection;
     use super::*;
+
+    /// Clause 4.1.7: the AFLAT-fitted all-pole H(z) reproduces the
+    /// impulse response of the three-filter cascade closely over
+    /// the subframe.
+    #[test]
+    fn weighting_filter_fits_cascade_impulse_response() {
+        let r = dequant_reflection(700, 300, 150);
+        let alpha = step_up(&r);
+        let wa = weighting_coefficients(&alpha);
+        // Cascade impulse response h3 (eqs. (33)-(35)).
+        let w93 = |i: usize| SNW_COEFFS[i] as f64 / 32768.0;
+        let w70 = |i: usize| SNW_COEFFS[NP + i] as f64 / 32768.0;
+        let (mut h1, mut h2, mut h3) = ([0f64; NS], [0f64; NS], [0f64; NS]);
+        for n in 0..NS {
+            let mut a = if n == 0 { 1.0 } else { 0.0 };
+            for i in 0..NP.min(n) {
+                a += alpha[i] * h1[n - 1 - i];
+            }
+            h1[n] = a;
+            let mut b = h1[n];
+            for i in 0..NP.min(n) {
+                b -= w93(i) * alpha[i] * h1[n - 1 - i];
+            }
+            h2[n] = b;
+            let mut c = h2[n];
+            for i in 0..NP.min(n) {
+                c += w70(i) * alpha[i] * h3[n - 1 - i];
+            }
+            h3[n] = c;
+        }
+        let mut imp = [0f64; NS];
+        imp[0] = 1.0;
+        let hf = zsr_allpole(&wa, &imp);
+        let e_h: f64 = h3.iter().map(|v| v * v).sum();
+        let e_d: f64 = h3
+            .iter()
+            .zip(hf.iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        eprintln!(
+            "h3 vs fitted: rel err {:.4}; h3[..6]={:?} fit[..6]={:?}",
+            e_d / e_h,
+            &h3[..6],
+            &hf[..6]
+        );
+        assert!(e_d / e_h < 0.05, "fit rel err {}", e_d / e_h);
+    }
 
     /// The VQ search is self-consistent: quantizing the exact
     /// dequantized value of a codebook row recovers reflection

@@ -48,7 +48,7 @@ pub use decode::{
     hr_decoder_homing_frame, is_hr_decoder_homing_frame, HrDecoder, HR_DECODER_HOMING_WORDS,
     HR_ENCODER_HOMING_SAMPLE,
 };
-pub use encode::{FrameAnalysis, HrAnalyzer};
+pub use encode::{FrameAnalysis, HrAnalyzer, HrEncoder, HrForce};
 
 use crate::error::Error;
 
