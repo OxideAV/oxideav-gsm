@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.10...v0.0.11) - 2026-09-06
+
+### Other
+
+- GSM 06.20 decoder — clause 4.2.4 SST-smoothed postfilter numerator (eqs. (158)–(164)): mean per-frame correlation 0.76 → 0.99
+- README + CHANGELOG + hr module docs — half-rate codec complete in both directions (functional), encoder conformance numbers
+- register the GSM 06.20 half-rate encoder under "gsm-hr" + hr_encode_frame fuzz target
+- GSM 06.20 half-rate encoder — full clause 4.1 excitation analysis (`HrEncoder`) + per-parameter corpus conformance
+- GSM 06.20 encoder — VSELP code search and multimode {P0,GS} gain quantization (clauses 4.1.10 / 4.1.11)
+- GSM 06.20 encoder — open-loop lag search, frame lag trajectory and voicing mode (clauses 4.1.8.1–4.1.8.4)
+- GSM 06.20 decoder — lattice sign convention, eq. (100) periodic extension, 6th-order prefilter interpolator, eq. (151), Q14 gain components
+
 ### Added
 
 - GSM 06.20 half-rate **encoder**: the complete clause 4.1 excitation
