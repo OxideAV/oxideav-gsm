@@ -430,7 +430,7 @@ impl HrAnalyzer {
 /// `R(0..=Np)` (`R(0) = 1`), the inverse Levinson recursion clause
 /// 4.1.4.1 presupposes (*"Compute the autocorrelation sequence
 /// R(i), from the optimal reflection coefficients"*).
-fn rc_to_autocorr(r: &[f64; NP]) -> [f64; NP + 1] {
+pub(super) fn rc_to_autocorr(r: &[f64; NP]) -> [f64; NP + 1] {
     // Build each order's direct-form coefficients A_n(z) = 1 + Σ a_k z^-k.
     // Sign pairing: the AFLAT stage recursion (eq. (21)) reduces
     // P(0) by (1 - r²) per stage exactly when R(1) = -r1·R(0), i.e.
@@ -458,7 +458,7 @@ fn rc_to_autocorr(r: &[f64; NP]) -> [f64; NP + 1] {
 
 /// One AFLAT stage update (eqs. (21)/(22)) over full-width arrays
 /// (`P` indexed `0..=Np`, `V` offset by `Np-1`).
-fn aflat_stage(p: &mut [f64; NP + 1], v: &mut [f64; 2 * NP - 1], rj: f64) {
+pub(super) fn aflat_stage(p: &mut [f64; NP + 1], v: &mut [f64; 2 * NP - 1], rj: f64) {
     let vat = |v: &[f64; 2 * NP - 1], i: isize| v[(i + NP as isize - 1) as usize];
     let pp = *p;
     let pv = *v;

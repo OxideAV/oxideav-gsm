@@ -22,7 +22,7 @@
 //!   silence frame that follows them sample-exactly;
 //! * decoded-vs-reference **per-frame waveform correlation**,
 //!   averaged over every frame of SEQ01–SEQ04 — the measured value
-//!   (≈ 0.76) asserts the decoder tracks the reference waveform,
+//!   (≈ 0.99) asserts the decoder tracks the reference waveform,
 //!   and the floor guards against regressions in any
 //!   dequantisation leg;
 //! * per-sequence decoded/reference **energy** agreement — the
@@ -103,14 +103,14 @@ fn leading_homing_frames_are_sample_exact() {
 
 /// Measured waveform agreement, pinned as a regression floor: the
 /// mean per-frame correlation between decoded and reference frames
-/// across SEQ01–SEQ04 (leading homing frames excluded) is ≈ 0.76
-/// (0.42 when the decoder first landed, before the lattice sign
+/// across SEQ01–SEQ04 (leading homing frames excluded) is ≈ 0.99
+/// (0.42 when the decoder first landed; 0.76 once the lattice sign
 /// convention, the eq. (100) periodic extension, the 6th-order
 /// prefilter interpolator, the eq. (151) reading and the Q14 gain
-/// components were pinned by the encoder-side conformance). The
-/// floor 0.70 guards every dequantisation leg; whole-stream SNR is
-/// chaotic under the LTP feedback (see the module docs) and is
-/// only reported.
+/// components were pinned by the encoder-side conformance; 0.99
+/// with the eqs. (158)-(164) SST-smoothed postfilter numerator).
+/// The floor 0.95 guards every dequantisation leg; whole-stream SNR
+/// is reported alongside.
 #[test]
 fn hr_decoder_vs_etsi_out_references() {
     if !corpus_present() {
@@ -166,8 +166,8 @@ fn hr_decoder_vs_etsi_out_references() {
     let mean_corr = corr_sum / n_frames as f64;
     eprintln!("overall mean per-frame correlation: {mean_corr:.4} over {n_frames} frames");
     assert!(
-        mean_corr >= 0.70,
-        "mean per-frame correlation {mean_corr:.4} fell below the pinned 0.70 floor"
+        mean_corr >= 0.95,
+        "mean per-frame correlation {mean_corr:.4} fell below the pinned 0.95 floor"
     );
 }
 

@@ -26,8 +26,9 @@ All notable changes to this project will be documented in this file.
   extension for lags shorter than the subframe; the clause 4.2.2
   prefilter interpolates with the 6th-order filter; eq. (151)
   `ξ = 0,3·min(β, √P0)`; `{P0,GS}` components read as Q14 with
-  `Rmax = 4096²`. Mean per-frame correlation vs `SEQ01..04.OUT`
-  0.42 → 0.76.
+  `Rmax = 4096²`; the clause 4.2.4 postfilter numerator is the
+  eqs. (158)–(164) SST-smoothed polynomial. Mean per-frame
+  correlation vs `SEQ01..04.OUT` 0.42 → 0.99.
 - GSM 06.20 encoder frame analysis: the coded frame is the oldest 160
   samples of the clause 4.1.2 buffer (35-sample look-ahead), so the
   INT_LPC decision runs over the right frame (55% → 91.5% agreement);

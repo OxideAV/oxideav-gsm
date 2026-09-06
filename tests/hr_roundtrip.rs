@@ -174,8 +174,9 @@ fn synthetic_round_trip_tracks_input() {
 /// Corpus speech: our decode of our encode vs the input (delayed
 /// 35 samples), next to the reference decoder's own agreement with
 /// the same input (`SEQxx.OUT`, ≈ 0,52–0,68 per sequence). Measured
-/// ≈ 0,36–0,52 per sequence (0,40 overall) when the chain landed;
-/// the floor guards the whole analysis-by-synthesis loop.
+/// ≈ 0,55 overall (0,40 before the SST-smoothed postfilter
+/// numerator landed); the floor guards the whole
+/// analysis-by-synthesis loop.
 #[test]
 fn corpus_round_trip_tracks_input() {
     let Some(_) = read_words("disk1/SEQ01.INP") else {
@@ -212,5 +213,5 @@ fn corpus_round_trip_tracks_input() {
     }
     let mean = total / n_all as f64;
     eprintln!("corpus round trip mean per-frame correlation {mean:.3}");
-    assert!(mean >= 0.34, "round trip correlation {mean:.3}");
+    assert!(mean >= 0.48, "round trip correlation {mean:.3}");
 }

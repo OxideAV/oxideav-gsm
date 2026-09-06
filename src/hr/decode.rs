@@ -26,7 +26,7 @@
 //! references is not an achievable bar for a non-bit-exact
 //! implementation; `tests/conformance_hr_decode.rs` instead pins
 //! the clause 5 homing behaviour exactly and the measured
-//! per-frame waveform agreement (mean correlation ≈ 0,76 over
+//! per-frame waveform agreement (mean correlation ≈ 0,99 over
 //! SEQ01–SEQ04) as a regression floor.
 //!
 //! ## Empirically resolved readings
@@ -53,13 +53,11 @@
 //! * the `{P0,GS}` codebook's `√(GS·P0)`, `√(GS·(1−P0))` components
 //!   are Q14 with the clause 4.1.5 `Rmax = 4096²` on the coded
 //!   signal at unity passband gain (see `hr::encode`);
-//! * the clause 4.2.4 postfilter is realised as
-//!   `A(z)/A(z·0,75)` (numerator = the unsmoothed coefficient set)
-//!   plus brightness and AGC — the SST-smoothed numerator
-//!   derivations of eqs. (158)-(164) with the only staged SST
-//!   window measured worse when this decoder landed (measured
-//!   before the lattice-convention fix above; a candidate for
-//!   re-measurement);
+//! * the clause 4.2.4 postfilter numerator is the eqs. (158)-(164)
+//!   spectrally smoothed polynomial: the 0,75-weighted denominator
+//!   set's model autocorrelation under the staged SST window,
+//!   re-solved by the AFLAT recursion (mean per-frame correlation
+//!   0,76 → 0,99 over the unsmoothed `A(z)/A(z·0,75)` reading);
 //! * eq. (131a) is applied literally: subframe 1 draws `R'q(0)`
 //!   (and the eq. (132) reflection product) from the previous
 //!   frame;
@@ -289,6 +287,52 @@ pub(super) fn frac_delay_6(hist: &[f64], cur: &[f64], n: isize, lag_sixths: i32)
     acc
 }
 
+/// Clause 4.2.4 eqs. (158)-(164): the spectrally smoothed numerator
+/// of the adaptive postfilter. The denominator polynomial (the
+/// 0,75-weighted direct-form set of eq. (156)) is converted to the
+/// autocorrelation sequence of its all-pole model (step-down to
+/// reflection coefficients, then the inverse Levinson recursion the
+/// AFLAT presupposes), the staged SST window is applied (eq. (158),
+/// [`FLAT_SST_COEFFS`]), and the AFLAT recursion (eqs. (159)-(164))
+/// yields the reflection coefficients of the smoothed polynomial,
+/// converted to direct form for eq. (165). Once per frame on the
+/// uninterpolated set; subframes 1-3 interpolate it like the LPC
+/// set. Measured against the staged references this is decisive:
+/// mean per-frame correlation 0,76 with the unsmoothed numerator
+/// → 0,99 with this one (the earlier "measured worse" verdict was
+/// taken under the mirrored lattice convention).
+fn sst_numerator(alpha: &[f64; NP]) -> [f64; NP] {
+    use super::encode::{aflat_stage, rc_to_autocorr};
+    let mut den = [0f64; NP];
+    let mut w = 1.0;
+    for i in 0..NP {
+        w *= 0.75;
+        den[i] = w * alpha[i];
+    }
+    let Some(r) = step_down(&den) else {
+        return *alpha;
+    };
+    let mut rr = rc_to_autocorr(&r);
+    for i in 1..=NP {
+        rr[i] *= FLAT_SST_COEFFS[i - 1] as f64 / 2147483648.0;
+    }
+    let mut p = rr;
+    let mut v = [0f64; 2 * NP - 1];
+    for i in (1 - (NP as isize))..(NP as isize) {
+        v[(i + NP as isize - 1) as usize] = rr[(i + 1).unsigned_abs()];
+    }
+    let mut rq = [0f64; NP];
+    for rj in rq.iter_mut() {
+        *rj = if p[0].abs() > 1e-300 {
+            (-v[NP - 1] / p[0]).clamp(-0.999_999, 0.999_999)
+        } else {
+            0.0
+        };
+        aflat_stage(&mut p, &mut v, *rj);
+    }
+    step_up(&rq)
+}
+
 // ─── Codevector construction (clause 4.1.10 eq. (108)) ───
 
 /// Build the VSELP codevector for `codeword` over `basis`: the sum
@@ -399,17 +443,9 @@ impl HrDecoder {
         let refl = dequant_reflection(p.lpc1, p.lpc2, p.lpc3);
         let alpha_cur = step_up(&refl);
         let r0q_cur = decode_r0(p.r0);
-        // Clause 4.2.4: the postfilter numerator. The resultant
-        // filter is implemented as A(z)/A(z·0,75) (numerator = the
-        // unsmoothed coefficient set) plus brightness and AGC: of
-        // the defensible readings of eqs. (155)/(158)/(165) this
-        // measured best against the staged references when the
-        // decoder landed (the only staged SST window, the
-        // near-unity FLAT window of table 1, makes the smoothed
-        // derivations nearly transparent). The exact numerator the
-        // bit-exact GSM 06.06 C derives remains the largest
-        // residual uncertainty of this decoder.
-        let num_cur = alpha_cur;
+        // Clause 4.2.4: the spectrally smoothed postfilter
+        // numerator (see `sst_numerator`).
+        let num_cur = sst_numerator(&alpha_cur);
 
         // Clause 4.1.6: per-subframe coefficient sets (soft
         // interpolation with the stability fallback), mirrored onto
