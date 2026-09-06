@@ -31,6 +31,12 @@ cargo-fuzz = true
 # - **`encode_decode_roundtrip`**: arbitrary bytes as PCM through
 #   encode → pack → parse → decode; asserts packer/parser closure on
 #   real encoder output and output accounting.
+# - **`hr_encode_frame`**: arbitrary bytes as PCM through the GSM
+#   06.20 half-rate encoder (clause 4.1 excitation analysis over
+#   saturated / silent / homing input), annex-B pack → parse →
+#   decode; asserts the encoder is total, its output packs and
+#   parses losslessly, and the decoder accounts 160 samples per
+#   frame.
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -77,5 +83,11 @@ doc = false
 [[bin]]
 name = "encode_decode_roundtrip"
 path = "fuzz_targets/encode_decode_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hr_encode_frame"
+path = "fuzz_targets/hr_encode_frame.rs"
 test = false
 doc = false
