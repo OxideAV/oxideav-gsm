@@ -711,6 +711,7 @@ The lower-level building blocks are public for callers who want to drive
 the pipeline directly:
 
 ```rust
+# let pcm_in_160 = [0i16; 160];
 use oxideav_gsm::{DecoderState, EncoderState, UnpackedFrame};
 
 let mut enc = EncoderState::new();
