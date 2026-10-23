@@ -68,7 +68,7 @@
 //! action the RX DTX handler takes ([`RxClassification`]); it is the
 //! bridge to the crate's existing [`crate::DtxReceiver`].
 
-use crate::bitstream::{SubFrame, UnpackedFrame, PULSES, SUBFRAMES};
+use crate::bitstream::{PULSES, SUBFRAMES, SubFrame, UnpackedFrame};
 use crate::comfort_noise::{NoiseEvaluator, NoiseFrameParameters, NoiseRng, SidParameters};
 
 /// GSM 06.11 clause 6 — the per-frame block-amplitude decrement of

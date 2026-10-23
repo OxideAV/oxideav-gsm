@@ -30,7 +30,7 @@
 //!   codes of annex A.1.4.
 
 use super::tables::{INTERP_FILTER_6, LAG_TABLE};
-use super::{HR_SUBFRAMES, HR_SUBFRAME_SAMPLES};
+use super::{HR_SUBFRAME_SAMPLES, HR_SUBFRAMES};
 
 /// Samples per subframe.
 const NS: usize = HR_SUBFRAME_SAMPLES;
@@ -168,10 +168,10 @@ pub(super) fn open_loop_search(y: &[f64]) -> OpenLoop {
     for (m, sc) in corr.iter().enumerate() {
         let mut best: Option<(f64, i32)> = None;
         for k in LMIN..=LMAX {
-            if let Some(v) = sc.ratio_pos(k) {
-                if best.map_or(true, |(b, _)| v > b) {
-                    best = Some((v, k));
-                }
+            if let Some(v) = sc.ratio_pos(k)
+                && best.is_none_or(|(b, _)| v > b)
+            {
+                best = Some((v, k));
             }
         }
         if let Some((_, k)) = best {
@@ -228,10 +228,10 @@ pub(super) fn open_loop_search(y: &[f64]) -> OpenLoop {
             if k1 < LMIN {
                 break;
             }
-            if let Some(p) = neighbourhood_peak(sc, k1) {
-                if accept(&p) {
-                    list.push(p);
-                }
+            if let Some(p) = neighbourhood_peak(sc, k1)
+                && accept(&p)
+            {
+                list.push(p);
             }
             j += 1;
         }
@@ -246,7 +246,7 @@ pub(super) fn open_loop_search(y: &[f64]) -> OpenLoop {
             let (ci, gi) = sc.interp(k6);
             if ci > 0.0 && gi > 0.0 {
                 let v = ci * ci / gi;
-                if best.map_or(true, |(b, ..)| v > b) {
+                if best.is_none_or(|(b, ..)| v > b) {
                     best = Some((v, k6, ci, gi));
                 }
             }
@@ -264,10 +264,10 @@ pub(super) fn open_loop_search(y: &[f64]) -> OpenLoop {
             if k1 > LMAX {
                 break;
             }
-            if let Some(p) = neighbourhood_peak(sc, k1) {
-                if accept(&p) {
-                    list.push(p);
-                }
+            if let Some(p) = neighbourhood_peak(sc, k1)
+                && accept(&p)
+            {
+                list.push(p);
             }
             j += 1;
         }
@@ -357,7 +357,7 @@ fn best_allowable(sc: &SubCorr, lo6: i32, hi6: i32) -> Option<Peak> {
         let (ci, gi) = sc.interp(k6);
         if ci > 0.0 && gi > 0.0 {
             let v = ci * ci / gi;
-            if best.map_or(true, |(b, _)| v > b) {
+            if best.is_none_or(|(b, _)| v > b) {
                 best = Some((
                     v,
                     Peak {
@@ -384,7 +384,7 @@ fn neighbourhood_peak(sc: &SubCorr, k1: i32) -> Option<Peak> {
         let (c, g) = sc.at(k);
         if g > 0.0 {
             let v = c * c / g;
-            if best.map_or(true, |(b, _)| v > b) {
+            if best.is_none_or(|(b, _)| v > b) {
                 best = Some((v, k));
             }
         }
@@ -397,11 +397,7 @@ fn neighbourhood_peak(sc: &SubCorr, k1: i32) -> Option<Peak> {
     // Eqs. (60)/(61): peak test against the neighbours.
     let side = |kk: i32| {
         let (c, g) = sc.at(kk);
-        if g > 0.0 {
-            c * c / g
-        } else {
-            0.0
-        }
+        if g > 0.0 { c * c / g } else { 0.0 }
     };
     if side(k - 1) > v || side(k + 1) > v {
         return None;
@@ -424,7 +420,7 @@ fn range_best(sc: &SubCorr, lo: i32, hi: i32) -> (usize, f64) {
         } else {
             (f64::NEG_INFINITY, sc.r)
         };
-        if best.map_or(true, |(b, ..)| score > b) {
+        if best.is_none_or(|(b, ..)| score > b) {
             best = Some((score, level, err));
         }
     }

@@ -43,7 +43,7 @@
 //! native byte order of the linear-PCM `.INP`/`.OUT` companions), and a
 //! big-endian variant is offered explicitly where a caller needs it.
 
-use crate::bitstream::{SubFrame, UnpackedFrame, FRAME_SAMPLES, PULSES, SUBFRAMES};
+use crate::bitstream::{FRAME_SAMPLES, PULSES, SUBFRAMES, SubFrame, UnpackedFrame};
 use crate::error::Error;
 
 /// Number of 16-bit words in one `*.COD` frame (§6.1 Table 6.1b):
@@ -151,8 +151,8 @@ pub fn cod_words_to_unpacked(words: &[u16; COD_WORDS_PER_FRAME]) -> UnpackedFram
 pub fn unpacked_to_cod_bytes_le(frame: &UnpackedFrame) -> [u8; COD_BYTES_PER_FRAME] {
     let words = unpacked_to_cod_words(frame);
     let mut bytes = [0u8; COD_BYTES_PER_FRAME];
-    for (w, chunk) in words.iter().zip(bytes.chunks_exact_mut(2)) {
-        chunk.copy_from_slice(&w.to_le_bytes());
+    for (w, chunk) in words.iter().zip(bytes.as_chunks_mut::<2>().0) {
+        *chunk = w.to_le_bytes();
     }
     bytes
 }
@@ -162,8 +162,8 @@ pub fn unpacked_to_cod_bytes_le(frame: &UnpackedFrame) -> [u8; COD_BYTES_PER_FRA
 pub fn unpacked_to_cod_bytes_be(frame: &UnpackedFrame) -> [u8; COD_BYTES_PER_FRAME] {
     let words = unpacked_to_cod_words(frame);
     let mut bytes = [0u8; COD_BYTES_PER_FRAME];
-    for (w, chunk) in words.iter().zip(bytes.chunks_exact_mut(2)) {
-        chunk.copy_from_slice(&w.to_be_bytes());
+    for (w, chunk) in words.iter().zip(bytes.as_chunks_mut::<2>().0) {
+        *chunk = w.to_be_bytes();
     }
     bytes
 }
@@ -176,8 +176,8 @@ pub fn cod_bytes_le_to_unpacked(bytes: &[u8]) -> Result<UnpackedFrame, Error> {
         return Err(Error::ShortFrame);
     }
     let mut words = [0u16; COD_WORDS_PER_FRAME];
-    for (w, chunk) in words.iter_mut().zip(bytes.chunks_exact(2)) {
-        *w = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for (w, chunk) in words.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *w = u16::from_le_bytes(*chunk);
     }
     Ok(cod_words_to_unpacked(&words))
 }
@@ -188,8 +188,8 @@ pub fn cod_bytes_be_to_unpacked(bytes: &[u8]) -> Result<UnpackedFrame, Error> {
         return Err(Error::ShortFrame);
     }
     let mut words = [0u16; COD_WORDS_PER_FRAME];
-    for (w, chunk) in words.iter_mut().zip(bytes.chunks_exact(2)) {
-        *w = u16::from_be_bytes([chunk[0], chunk[1]]);
+    for (w, chunk) in words.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *w = u16::from_be_bytes(*chunk);
     }
     Ok(cod_words_to_unpacked(&words))
 }
@@ -205,8 +205,8 @@ pub fn cod_bytes_be_to_unpacked(bytes: &[u8]) -> Result<UnpackedFrame, Error> {
 /// sample), so no extra shift is applied here.
 pub fn pcm_to_inp_bytes_le(pcm: &[i16; FRAME_SAMPLES]) -> [u8; PCM_BYTES_PER_FRAME] {
     let mut bytes = [0u8; PCM_BYTES_PER_FRAME];
-    for (s, chunk) in pcm.iter().zip(bytes.chunks_exact_mut(2)) {
-        chunk.copy_from_slice(&s.to_le_bytes());
+    for (s, chunk) in pcm.iter().zip(bytes.as_chunks_mut::<2>().0) {
+        *chunk = s.to_le_bytes();
     }
     bytes
 }
@@ -218,8 +218,8 @@ pub fn inp_bytes_le_to_pcm(bytes: &[u8]) -> Result<[i16; FRAME_SAMPLES], Error> 
         return Err(Error::ShortFrame);
     }
     let mut pcm = [0i16; FRAME_SAMPLES];
-    for (s, chunk) in pcm.iter_mut().zip(bytes.chunks_exact(2)) {
-        *s = i16::from_le_bytes([chunk[0], chunk[1]]);
+    for (s, chunk) in pcm.iter_mut().zip(bytes.as_chunks::<2>().0) {
+        *s = i16::from_le_bytes(*chunk);
     }
     Ok(pcm)
 }
@@ -349,7 +349,7 @@ mod tests {
         let mut dec = crate::DecoderState::new();
         let out = dec.decode_frame(&UnpackedFrame::default());
         let bytes = pcm_to_inp_bytes_le(&out);
-        for chunk in bytes.chunks_exact(2) {
+        for chunk in bytes.as_chunks::<2>().0 {
             let w = i16::from_le_bytes([chunk[0], chunk[1]]);
             assert_eq!(w & 0b111, 0, "§6.1 Table 6.1c: 3 LSBs zero");
         }
@@ -432,8 +432,8 @@ mod tests {
 
         // And the same through the byte path.
         let mut bytes = [0u8; COD_BYTES_PER_FRAME];
-        for (w, chunk) in dirty.iter().zip(bytes.chunks_exact_mut(2)) {
-            chunk.copy_from_slice(&w.to_le_bytes());
+        for (w, chunk) in dirty.iter().zip(bytes.as_chunks_mut::<2>().0) {
+            *chunk = w.to_le_bytes();
         }
         assert_eq!(cod_bytes_le_to_unpacked(&bytes).unwrap(), clean);
     }

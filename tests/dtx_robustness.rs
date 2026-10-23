@@ -20,7 +20,7 @@
 //!   independent home state (the §4.4 codec-homing behaviour).
 
 use oxideav_gsm::{
-    DecoderState, DtxReceiver, DtxState, RxFrame, SidParameters, UnpackedFrame, FRAME_SAMPLES,
+    DecoderState, DtxReceiver, DtxState, FRAME_SAMPLES, RxFrame, SidParameters, UnpackedFrame,
 };
 
 struct Lcg(u32);
@@ -35,11 +35,7 @@ impl Lcg {
 }
 
 fn iters(full: usize) -> usize {
-    if cfg!(miri) {
-        (full / 64).max(4)
-    } else {
-        full
-    }
+    if cfg!(miri) { (full / 64).max(4) } else { full }
 }
 
 fn assert_shaped(pcm: &[i16; FRAME_SAMPLES]) {

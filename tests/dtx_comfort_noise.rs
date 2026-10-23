@@ -12,8 +12,8 @@
 //! realistic DTX cycle.
 
 use oxideav_gsm::{
-    DecoderState, DtxReceiver, DtxState, NoiseEvaluator, NoiseFrameParameters, RxFrame, SubFrame,
-    UnpackedFrame, FRAME_SAMPLES, NOISE_EVAL_FRAMES, SUBFRAMES,
+    DecoderState, DtxReceiver, DtxState, FRAME_SAMPLES, NOISE_EVAL_FRAMES, NoiseEvaluator,
+    NoiseFrameParameters, RxFrame, SUBFRAMES, SubFrame, UnpackedFrame,
 };
 
 /// A non-homing, non-trivial speech frame whose §5.3 decode is

@@ -20,9 +20,9 @@
 //! the same converters consume it directly.
 
 use oxideav_gsm::{
-    cod_bytes_le_to_unpacked, encoder_homing_frame_pcm, inp_bytes_le_to_pcm, pcm_to_inp_bytes_le,
-    unpacked_to_cod_bytes_le, DecoderState, EncoderState, UnpackedFrame, COD_BYTES_PER_FRAME,
-    FRAME_SAMPLES, PCM_BYTES_PER_FRAME, PULSES, SUBFRAMES,
+    COD_BYTES_PER_FRAME, DecoderState, EncoderState, FRAME_SAMPLES, PCM_BYTES_PER_FRAME, PULSES,
+    SUBFRAMES, UnpackedFrame, cod_bytes_le_to_unpacked, encoder_homing_frame_pcm,
+    inp_bytes_le_to_pcm, pcm_to_inp_bytes_le, unpacked_to_cod_bytes_le,
 };
 
 /// §6.2.1 Configuration 1 over the §6.1 word formats: an `*.INP` PCM
@@ -46,7 +46,7 @@ fn config1_inp_stream_encodes_to_cod_stream() {
     // Encode frame-by-frame, emit the *.COD word stream.
     let mut enc = EncoderState::new();
     let mut cod_stream = Vec::new();
-    for chunk in inp_stream.chunks_exact(PCM_BYTES_PER_FRAME) {
+    for chunk in inp_stream.as_chunks::<PCM_BYTES_PER_FRAME>().0 {
         let pcm = inp_bytes_le_to_pcm(chunk).unwrap();
         let frame = enc.encode_frame_with_homing(&pcm);
         cod_stream.extend_from_slice(&unpacked_to_cod_bytes_le(&frame));
@@ -56,7 +56,12 @@ fn config1_inp_stream_encodes_to_cod_stream() {
     // Every *.COD frame must parse back to the same parameters the
     // encoder produced (the §6.1 reader is the inverse of the writer).
     let mut enc2 = EncoderState::new();
-    for (i, chunk) in cod_stream.chunks_exact(COD_BYTES_PER_FRAME).enumerate() {
+    for (i, chunk) in cod_stream
+        .as_chunks::<COD_BYTES_PER_FRAME>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let reparsed = cod_bytes_le_to_unpacked(chunk).unwrap();
         let direct = enc2.encode_frame_with_homing(&frames_in[i]);
         assert_eq!(
@@ -85,7 +90,7 @@ fn config2_cod_stream_decodes_to_out_stream() {
 
     let mut dec = DecoderState::new();
     let mut out_stream = Vec::new();
-    for chunk in cod_stream.chunks_exact(COD_BYTES_PER_FRAME) {
+    for chunk in cod_stream.as_chunks::<COD_BYTES_PER_FRAME>().0 {
         let frame = cod_bytes_le_to_unpacked(chunk).unwrap();
         let pcm = dec.decode_frame(&frame);
         out_stream.extend_from_slice(&pcm_to_inp_bytes_le(&pcm));
@@ -93,7 +98,7 @@ fn config2_cod_stream_decodes_to_out_stream() {
     assert_eq!(out_stream.len(), 4 * PCM_BYTES_PER_FRAME);
 
     // §6.1 Table 6.1c — every *.OUT word's three low bits are zero.
-    for chunk in out_stream.chunks_exact(2) {
+    for chunk in out_stream.as_chunks::<2>().0 {
         let w = i16::from_le_bytes([chunk[0], chunk[1]]);
         assert_eq!(w & 0b111, 0, "§6.1 Table 6.1c: *.OUT 3 LSBs zero");
     }

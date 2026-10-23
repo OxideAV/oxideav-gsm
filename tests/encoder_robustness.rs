@@ -22,7 +22,7 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error as CoreError, Frame, Packet, SampleFormat, TimeBase,
 };
 use oxideav_gsm::{
-    make_decoder, make_encoder, EncoderState, UnpackedFrame, CODEC_ID, FRAME_SAMPLES,
+    CODEC_ID, EncoderState, FRAME_SAMPLES, UnpackedFrame, make_decoder, make_encoder,
 };
 
 struct Lcg(u32);
@@ -40,11 +40,7 @@ impl Lcg {
 }
 
 fn iters(full: usize) -> usize {
-    if cfg!(miri) {
-        (full / 64).max(2)
-    } else {
-        full
-    }
+    if cfg!(miri) { (full / 64).max(2) } else { full }
 }
 
 fn params() -> CodecParameters {
@@ -69,7 +65,7 @@ fn audio_frame(samples: &[i16], pts: Option<i64>) -> Frame {
 
 fn assert_shaped_bytes(pcm_bytes: &[u8]) {
     assert_eq!(pcm_bytes.len(), FRAME_SAMPLES * 2);
-    for c in pcm_bytes.chunks_exact(2) {
+    for c in pcm_bytes.as_chunks::<2>().0 {
         let s = i16::from_le_bytes([c[0], c[1]]);
         assert_eq!(s & 0b111, 0, "§5.3.7 shaping: {s:#06x}");
     }

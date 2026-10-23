@@ -68,7 +68,7 @@
 
 use super::tables::*;
 use super::{
-    HrParameters, SubframeParams, HR_FRAME_SAMPLES, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES, R0_RMAX,
+    HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, R0_RMAX, SubframeParams,
 };
 
 /// Short-term predictor order (annex A.2 `Np`).
@@ -115,7 +115,7 @@ pub fn hr_decoder_homing_frame() -> HrParameters {
 #[inline]
 pub(super) fn vq_index(table: &[i16], flat: usize) -> usize {
     let w = table[flat / 2] as u16;
-    if flat % 2 == 0 {
+    if flat.is_multiple_of(2) {
         (w >> 8) as usize
     } else {
         (w & 0xFF) as usize
@@ -234,11 +234,7 @@ pub(super) fn adaptive_codebook(hist: &[f64; HIST], lag_sixths: i32) -> [f64; NS
         let fetch = |m: isize| -> f64 {
             if m < 0 {
                 let idx = m + HIST as isize;
-                if idx < 0 {
-                    0.0
-                } else {
-                    hist[idx as usize]
-                }
+                if idx < 0 { 0.0 } else { hist[idx as usize] }
             } else {
                 b[m as usize]
             }
@@ -271,11 +267,7 @@ pub(super) fn frac_delay_6(hist: &[f64], cur: &[f64], n: isize, lag_sixths: i32)
     let fetch = |m: isize| -> f64 {
         if m < 0 {
             let idx = m + hist.len() as isize;
-            if idx < 0 {
-                0.0
-            } else {
-                hist[idx as usize]
-            }
+            if idx < 0 { 0.0 } else { hist[idx as usize] }
         } else {
             cur[m as usize]
         }

@@ -18,7 +18,7 @@
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_gsm::{
-    make_decoder, make_encoder, DecoderState, EncoderState, UnpackedFrame, CODEC_ID, FRAME_SAMPLES,
+    CODEC_ID, DecoderState, EncoderState, FRAME_SAMPLES, UnpackedFrame, make_decoder, make_encoder,
 };
 
 const WARMUP_FRAMES: usize = 2;
@@ -38,7 +38,7 @@ fn roundtrip_direct(input: &[i16]) -> Vec<i16> {
     let mut enc = EncoderState::new();
     let mut dec = DecoderState::new();
     let mut out = Vec::with_capacity(input.len());
-    for chunk in input.chunks_exact(FRAME_SAMPLES) {
+    for chunk in input.as_chunks::<FRAME_SAMPLES>().0 {
         let mut sop = [0i16; FRAME_SAMPLES];
         sop.copy_from_slice(chunk);
         let coded = enc.encode_frame(&sop);
@@ -161,7 +161,7 @@ fn packed_path_matches_direct_path() {
         let mut enc = EncoderState::new();
         let mut dec_direct = DecoderState::new();
         let mut dec_packed = DecoderState::new();
-        for chunk in sig.chunks_exact(FRAME_SAMPLES) {
+        for chunk in sig.as_chunks::<FRAME_SAMPLES>().0 {
             let mut sop = [0i16; FRAME_SAMPLES];
             sop.copy_from_slice(chunk);
             let coded = enc.encode_frame(&sop);
@@ -186,7 +186,7 @@ fn registry_adapters_match_direct_path_and_meet_floor() {
     let mut enc = make_encoder(&params()).unwrap();
     let mut dec = make_decoder(&params()).unwrap();
     let mut adapter_out: Vec<i16> = Vec::with_capacity(sig.len());
-    for chunk in sig.chunks_exact(FRAME_SAMPLES) {
+    for chunk in sig.as_chunks::<FRAME_SAMPLES>().0 {
         let mut bytes = Vec::with_capacity(FRAME_SAMPLES * 2);
         for &s in chunk {
             bytes.extend_from_slice(&s.to_le_bytes());
@@ -202,7 +202,7 @@ fn registry_adapters_match_direct_path_and_meet_floor() {
             .unwrap();
         match dec.receive_frame().unwrap() {
             Frame::Audio(a) => {
-                for c in a.data[0].chunks_exact(2) {
+                for c in a.data[0].as_chunks::<2>().0 {
                     adapter_out.push(i16::from_le_bytes([c[0], c[1]]));
                 }
             }

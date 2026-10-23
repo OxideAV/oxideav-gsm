@@ -31,9 +31,9 @@
 
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_gsm::{
-    cod_bytes_be_to_unpacked, cod_bytes_le_to_unpacked, cod_words_to_unpacked, make_decoder,
-    unpacked_to_cod_bytes_be, unpacked_to_cod_bytes_le, unpacked_to_cod_words, DecoderState,
-    SubFrame, UnpackedFrame, CODEC_ID, FRAME_SAMPLES,
+    CODEC_ID, DecoderState, FRAME_SAMPLES, SubFrame, UnpackedFrame, cod_bytes_be_to_unpacked,
+    cod_bytes_le_to_unpacked, cod_words_to_unpacked, make_decoder, unpacked_to_cod_bytes_be,
+    unpacked_to_cod_bytes_le, unpacked_to_cod_words,
 };
 
 /// Deterministic Numerical-Recipes LCG — reproducible, no external
@@ -289,8 +289,8 @@ fn cod_byte_parsers_fuzz_and_short_reject() {
         // each word are zero after masking, matching a re-serialise).
         let masked_words = unpacked_to_cod_words(&le);
         let mut expected = [0u8; 152];
-        for (w, chunk) in masked_words.iter().zip(expected.chunks_exact_mut(2)) {
-            chunk.copy_from_slice(&w.to_le_bytes());
+        for (w, chunk) in masked_words.iter().zip(expected.as_chunks_mut::<2>().0) {
+            *chunk = w.to_le_bytes();
         }
         assert_eq!(unpacked_to_cod_bytes_le(&le), expected);
         let _ = unpacked_to_cod_bytes_be(&be);
@@ -324,7 +324,9 @@ fn registry_decoder_survives_hostile_packet_stream() {
                 assert_eq!(samples, FRAME_SAMPLES as u32);
                 assert_eq!(data.len(), 1);
                 let pcm: Vec<i16> = data[0]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 assert_output_shaped(&pcm);
@@ -411,7 +413,9 @@ fn registry_decoder_survives_hostile_packets_all_packings() {
                     decoded += 1;
                     assert_eq!(samples, samples_per_pkt);
                     let pcm: Vec<i16> = data[0]
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| i16::from_le_bytes([c[0], c[1]]))
                         .collect();
                     assert_eq!(pcm.len(), samples_per_pkt as usize);

@@ -17,8 +17,8 @@
 //!   noise; further lost SID frames maintain the muting.
 
 use oxideav_gsm::{
-    make_sid_frame, silence_frame, RxClassification, RxDtxHandler, SidParameters,
-    MUTING_XMAXC_DECREMENT,
+    MUTING_XMAXC_DECREMENT, RxClassification, RxDtxHandler, SidParameters, make_sid_frame,
+    silence_frame,
 };
 
 const SUBFRAMES: usize = 4;

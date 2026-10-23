@@ -51,11 +51,7 @@ pub fn mult_r(a: i16, b: i16) -> i16 {
 /// 32767`.
 #[inline]
 pub fn abs(a: i16) -> i16 {
-    if a == i16::MIN {
-        i16::MAX
-    } else {
-        a.abs()
-    }
+    if a == i16::MIN { i16::MAX } else { a.abs() }
 }
 
 /// §5.1 `L_mult(var1, var2)` — `(var1 * var2) << 1` in 32 bits.

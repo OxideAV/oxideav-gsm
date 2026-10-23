@@ -33,9 +33,9 @@
 //! paths.
 
 use oxideav_gsm::analysis::{
-    apcm_inverse_and_position, apcm_quantise_rpe, autocorrelation, long_term_analysis_filter,
-    ltp_parameters, quantise_lar, reflection_coefficients, weighting_filter, LtpAnalyzer,
-    LtpParameters,
+    LtpAnalyzer, LtpParameters, apcm_inverse_and_position, apcm_quantise_rpe, autocorrelation,
+    long_term_analysis_filter, ltp_parameters, quantise_lar, reflection_coefficients,
+    weighting_filter,
 };
 use oxideav_gsm::tables::{A, DLB, FAC, MAC, MIC};
 

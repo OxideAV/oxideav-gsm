@@ -46,8 +46,8 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error as CoreError, Frame, Packet, SampleFormat, TimeBase,
 };
 use oxideav_gsm::{
-    decoder_homing_frame, encoder_homing_frame_pcm, make_decoder, make_encoder, UnpackedFrame,
-    CODEC_ID, FRAME_SAMPLES,
+    CODEC_ID, FRAME_SAMPLES, UnpackedFrame, decoder_homing_frame, encoder_homing_frame_pcm,
+    make_decoder, make_encoder,
 };
 
 // ───────────────────────── spec vectors ─────────────────────────
@@ -131,7 +131,7 @@ fn encode_one(enc: &mut Box<dyn oxideav_core::Encoder>, pcm: &[i16; 160]) -> Vec
 fn seq06h_inp_is_160_words_of_0x0008() {
     let inp = seq06h_inp();
     assert_eq!(inp.len(), FRAME_SAMPLES * 2, "one 20 ms frame of S16 PCM");
-    for pair in inp.chunks_exact(2) {
+    for pair in inp.as_chunks::<2>().0 {
         assert_eq!(
             i16::from_le_bytes([pair[0], pair[1]]),
             0x0008,
@@ -272,7 +272,7 @@ fn config2_two_leading_homing_frames_define_subsequent_output() {
     // HOMING01 vectors pin rich decoded samples here) and the reset
     // follows it. Only §5.3.7 shaping is guaranteed for it.
     let first_dirty = decode_one(&mut b, &seq06h_cod());
-    for pair in first_dirty.chunks_exact(2) {
+    for pair in first_dirty.as_chunks::<2>().0 {
         let s = i16::from_le_bytes([pair[0], pair[1]]);
         assert_eq!(
             s & 0b111,
@@ -298,7 +298,7 @@ fn config2_two_leading_homing_frames_define_subsequent_output() {
     );
 
     // And the defined output is genuinely 13-bit shaped (§5.3.7).
-    for pair in a_speech.chunks_exact(2) {
+    for pair in a_speech.as_chunks::<2>().0 {
         let s = i16::from_le_bytes([pair[0], pair[1]]);
         assert_eq!(s & 0b111, 0, "§5.3.7 output low 3 bits must be zero");
     }
@@ -380,7 +380,7 @@ fn config2_multiframe_stream_decodes_to_shaped_output() {
     match frame {
         Frame::Audio(a) => {
             assert_eq!(a.samples, (FRAME_SAMPLES * 4) as u32);
-            for pair in a.data[0].chunks_exact(2) {
+            for pair in a.data[0].as_chunks::<2>().0 {
                 let s = i16::from_le_bytes([pair[0], pair[1]]);
                 assert_eq!(s & 0b111, 0, "§5.3.7 shaping");
             }

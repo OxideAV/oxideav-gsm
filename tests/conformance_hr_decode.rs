@@ -31,8 +31,8 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::hr::{HrDecoder, HR_PARAMS_PER_FRAME};
 use oxideav_gsm::HrParameters;
+use oxideav_gsm::hr::{HR_PARAMS_PER_FRAME, HrDecoder};
 use std::path::PathBuf;
 
 const DEC_STRIDE: usize = HR_PARAMS_PER_FRAME + 4;
@@ -56,7 +56,9 @@ fn read_words(rel: &str) -> Vec<u16> {
     let bytes =
         std::fs::read(fixture_dir().join(rel)).unwrap_or_else(|e| panic!("fixture {rel}: {e}"));
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -68,7 +70,7 @@ fn run_sequence(seq: &str) -> (Vec<i16>, Vec<i16>) {
     assert_eq!(dec_words.len() % DEC_STRIDE, 0);
     let mut dec = HrDecoder::new();
     let mut decoded = Vec::new();
-    for frame in dec_words.chunks_exact(DEC_STRIDE) {
+    for frame in dec_words.as_chunks::<DEC_STRIDE>().0 {
         let mut params = [0u16; HR_PARAMS_PER_FRAME];
         params.copy_from_slice(&frame[..HR_PARAMS_PER_FRAME]);
         // Error-free sequences: BFI = UFI = SID = 0 (frame[18..21]).

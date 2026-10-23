@@ -20,7 +20,7 @@
 //!    "S.v.v.v.v.v.v.v.v.v.v.v.v.0.0.0" format.
 
 use crate::arith::{abs, add, mult_r, shl_signed, shr_signed, sub};
-use crate::bitstream::{SubFrame, UnpackedFrame, FRAME_SAMPLES, PULSES, SUBFRAME_SAMPLES};
+use crate::bitstream::{FRAME_SAMPLES, PULSES, SUBFRAME_SAMPLES, SubFrame, UnpackedFrame};
 use crate::tables::{B, FAC, INVA, MIC, QLB};
 
 /// Persistent decoder state across frames per §4.6 Table 4.3.

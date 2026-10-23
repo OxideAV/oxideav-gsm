@@ -51,8 +51,8 @@ mod search;
 pub mod tables;
 
 pub use decode::{
-    hr_decoder_homing_frame, is_hr_decoder_homing_frame, HrDecoder, HR_DECODER_HOMING_WORDS,
-    HR_ENCODER_HOMING_SAMPLE,
+    HR_DECODER_HOMING_WORDS, HR_ENCODER_HOMING_SAMPLE, HrDecoder, hr_decoder_homing_frame,
+    is_hr_decoder_homing_frame,
 };
 pub use encode::{FrameAnalysis, HrAnalyzer, HrEncoder, HrForce};
 
@@ -536,7 +536,9 @@ mod tests {
     fn highpass_matches_printed_equations() {
         assert_eq!(
             HIGHPASS_COEFFS,
-            [10979, -21954, 10979, -14071, 30347, 10979, -21936, 10979, -15385, 31632]
+            [
+                10979, -21954, 10979, -14071, 30347, 10979, -21936, 10979, -15385, 31632
+            ]
         );
     }
 

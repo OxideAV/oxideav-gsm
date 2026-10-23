@@ -100,7 +100,7 @@
 //! encoder home state in one call.
 
 use crate::arith::{add, l_add, l_mult, l_sub, mult_r, sub};
-use crate::bitstream::{SubFrame, UnpackedFrame, FRAME_SAMPLES, SUBFRAMES};
+use crate::bitstream::{FRAME_SAMPLES, SUBFRAMES, SubFrame, UnpackedFrame};
 
 /// Persistent encoder pre-processing state across frames.
 ///
@@ -1306,11 +1306,7 @@ pub mod analysis {
             0
         } else {
             let t = norm((dmax as i32) << 16);
-            if t > 6 {
-                0
-            } else {
-                sub(6, t)
-            }
+            if t > 6 { 0 } else { sub(6, t) }
         };
 
         // §5.2.11 — wt[k] = d[k] >> scal (sign-extending right shift).
@@ -4865,13 +4861,13 @@ mod encoder_state_tests {
         ];
 
         const FRAMES: usize = 12;
-        for (g, gen) in generators.iter().enumerate() {
+        for (g, r#gen) in generators.iter().enumerate() {
             let mut enc = EncoderState::new();
             let mut dec = DecoderState::new();
             for f in 0..FRAMES {
                 let mut sop = [0i16; FRAME_SAMPLES];
                 for (k, slot) in sop.iter_mut().enumerate() {
-                    *slot = gen(f * FRAME_SAMPLES + k);
+                    *slot = r#gen(f * FRAME_SAMPLES + k);
                 }
 
                 let coded = enc.encode_frame(&sop);

@@ -24,7 +24,7 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::hr::{FrameAnalysis, HrEncoder, HrForce, HR_DECODER_HOMING_WORDS};
+use oxideav_gsm::hr::{FrameAnalysis, HR_DECODER_HOMING_WORDS, HrEncoder, HrForce};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -47,7 +47,9 @@ fn read_words(rel: &str) -> Vec<u16> {
     let bytes =
         std::fs::read(fixture_dir().join(rel)).unwrap_or_else(|e| panic!("fixture {rel}: {e}"));
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

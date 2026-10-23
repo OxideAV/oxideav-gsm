@@ -342,11 +342,7 @@ impl Vad {
         l_temp = l_sub(l_temp, 3277);
 
         // Evaluation of the stat flag.
-        if l_temp < 0 {
-            1
-        } else {
-            0
-        }
+        if l_temp < 0 { 1 } else { 0 }
     }
 
     /// Clause 3.6 — threshold adaptation, following the figure 2.2
@@ -766,11 +762,7 @@ fn tone_detection(sof: &[i16; FRAME_SAMPLES]) -> i16 {
         prederr = mult(prederr, temp);
     }
     let temp = sub(prederr, 1464);
-    if temp < 0 {
-        1
-    } else {
-        0
-    }
+    if temp < 0 { 1 } else { 0 }
 }
 
 #[cfg(test)]

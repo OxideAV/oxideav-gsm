@@ -102,7 +102,7 @@
 //! frames, so no decoder-homing-frame appears. That presence/absence
 //! is the bit-sync decision.
 
-use crate::bitstream::{UnpackedFrame, FRAME_SAMPLES};
+use crate::bitstream::{FRAME_SAMPLES, UnpackedFrame};
 use crate::decoder::is_decoder_homing_frame;
 use crate::encoder::EncoderState;
 

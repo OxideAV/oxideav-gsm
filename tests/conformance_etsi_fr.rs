@@ -35,9 +35,9 @@
 #![cfg(not(miri))]
 
 use oxideav_gsm::{
-    cod_bytes_le_to_unpacked, inp_bytes_le_to_pcm, is_decoder_homing_frame, run_bit_sync_trial,
-    DecoderState, EncoderState, FrameSyncTable, UnpackedFrame, COD_BYTES_PER_FRAME, FRAME_SAMPLES,
-    PCM_BYTES_PER_FRAME,
+    COD_BYTES_PER_FRAME, DecoderState, EncoderState, FRAME_SAMPLES, FrameSyncTable,
+    PCM_BYTES_PER_FRAME, UnpackedFrame, cod_bytes_le_to_unpacked, inp_bytes_le_to_pcm,
+    is_decoder_homing_frame, run_bit_sync_trial,
 };
 use std::path::PathBuf;
 
@@ -69,7 +69,9 @@ fn read_pcm_frames(name: &str) -> Vec<[i16; FRAME_SAMPLES]> {
         "{name}: partial frame"
     );
     bytes
-        .chunks_exact(PCM_BYTES_PER_FRAME)
+        .as_chunks::<PCM_BYTES_PER_FRAME>()
+        .0
+        .iter()
         .map(|c| inp_bytes_le_to_pcm(c).unwrap())
         .collect()
 }
@@ -83,7 +85,9 @@ fn read_cod_frames(name: &str) -> Vec<UnpackedFrame> {
         "{name}: partial frame"
     );
     bytes
-        .chunks_exact(COD_BYTES_PER_FRAME)
+        .as_chunks::<COD_BYTES_PER_FRAME>()
+        .0
+        .iter()
         .map(|c| cod_bytes_le_to_unpacked(c).unwrap())
         .collect()
 }

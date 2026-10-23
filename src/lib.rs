@@ -120,44 +120,44 @@ pub mod tables;
 pub mod vad;
 
 pub use bitstream::{
-    SubFrame, UnpackedFrame, FRAME_BITS, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, GSM_BYTE_FRAME_MAGIC,
-    MSGSM_BLOCK_LEN, MSGSM_BLOCK_SAMPLES, PULSES, SUBFRAMES,
+    FRAME_BITS, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, GSM_BYTE_FRAME_MAGIC, MSGSM_BLOCK_LEN,
+    MSGSM_BLOCK_SAMPLES, PULSES, SUBFRAMES, SubFrame, UnpackedFrame,
 };
 pub use codec::{
-    make_decoder, make_encoder, make_hr_decoder, make_hr_encoder, FramePacking, CODEC_ID,
-    HR_CODEC_ID,
+    CODEC_ID, FramePacking, HR_CODEC_ID, make_decoder, make_encoder, make_hr_decoder,
+    make_hr_encoder,
 };
 pub use comfort_noise::{
-    comfort_noise_frame, ComfortNoiseGenerator, DtxReceiver, DtxState, NoiseEvaluator,
-    NoiseFrameParameters, NoiseRng, RxFrame, SidInterpolator, SidParameters, COMFORT_NOISE_NCR,
-    DEFAULT_INTERPOLATION_FRAMES, NOISE_EVAL_FRAMES,
+    COMFORT_NOISE_NCR, ComfortNoiseGenerator, DEFAULT_INTERPOLATION_FRAMES, DtxReceiver, DtxState,
+    NOISE_EVAL_FRAMES, NoiseEvaluator, NoiseFrameParameters, NoiseRng, RxFrame, SidInterpolator,
+    SidParameters, comfort_noise_frame,
 };
 pub use confio::{
-    cod_bytes_be_to_unpacked, cod_bytes_le_to_unpacked, cod_words_to_unpacked, inp_bytes_le_to_pcm,
-    pcm_to_inp_bytes_le, unpacked_to_cod_bytes_be, unpacked_to_cod_bytes_le, unpacked_to_cod_words,
     COD_BYTES_PER_FRAME, COD_FIELD_WIDTHS, COD_WORDS_PER_FRAME, PCM_BYTES_PER_FRAME,
-    PCM_WORDS_PER_FRAME,
+    PCM_WORDS_PER_FRAME, cod_bytes_be_to_unpacked, cod_bytes_le_to_unpacked, cod_words_to_unpacked,
+    inp_bytes_le_to_pcm, pcm_to_inp_bytes_le, unpacked_to_cod_bytes_be, unpacked_to_cod_bytes_le,
+    unpacked_to_cod_words,
 };
 pub use decoder::{
-    decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
-    is_partial_decoder_homing_frame, DecoderState,
+    DecoderState, decoder_homing_frame, encoder_homing_frame_pcm, is_decoder_homing_frame,
+    is_partial_decoder_homing_frame,
 };
 pub use dtx::{
-    classify_rx_frame, make_sid_frame, sid_field_deviation, sid_flag, sid_frame_parameters,
-    silence_frame, RxClassification, RxDtxHandler, SidFlag, TxDtxHandler, TxFrame,
-    MUTING_XMAXC_DECREMENT, SHORT_BURST_ELAPSED_LIMIT, SID_AVERAGING_FRAMES, SID_CODE_WORD_BITS,
+    MUTING_XMAXC_DECREMENT, RxClassification, RxDtxHandler, SHORT_BURST_ELAPSED_LIMIT,
+    SID_AVERAGING_FRAMES, SID_CODE_WORD_BITS, SidFlag, TxDtxHandler, TxFrame, classify_rx_frame,
+    make_sid_frame, sid_field_deviation, sid_flag, sid_frame_parameters, silence_frame,
 };
-pub use encoder::analysis::{code_xmax, ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid};
-pub use encoder::{analysis, is_encoder_homing_frame, EncoderState, PreProcessor, VadTap};
+pub use encoder::analysis::{ApcmQuantised, LtpAnalyzer, LtpParameters, RpeGrid, code_xmax};
+pub use encoder::{EncoderState, PreProcessor, VadTap, analysis, is_encoder_homing_frame};
 pub use error::Error;
 pub use hr::{
-    HrParameters, SubframeParams, VoicingMode, HR_FRAME_BITS, HR_FRAME_BYTES, HR_FRAME_SAMPLES,
-    HR_PARAMS_PER_FRAME, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES,
+    HR_FRAME_BITS, HR_FRAME_BYTES, HR_FRAME_SAMPLES, HR_PARAMS_PER_FRAME, HR_SUBFRAME_SAMPLES,
+    HR_SUBFRAMES, HrParameters, SubframeParams, VoicingMode,
 };
 pub use sync::{
-    find_bit_sync, find_frame_sync, retard_special_frame, run_bit_sync_trial, BitSyncTrial,
-    FrameSyncTable, SyncFormats, BIT_SYNC_TRIALS, HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
-    SYNC_LEADING_FILL,
+    BIT_SYNC_TRIALS, BitSyncTrial, FrameSyncTable, HOMING_FRAMES_PER_TRIAL, PCM_WORD_BITS,
+    SYNC_LEADING_FILL, SyncFormats, find_bit_sync, find_frame_sync, retard_special_frame,
+    run_bit_sync_trial,
 };
 pub use vad::{Vad, VadMode};
 

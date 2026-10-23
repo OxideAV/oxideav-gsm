@@ -67,10 +67,10 @@
 //! §6.1 parameter loop; the SID *bit*-packing, the VAD mark, and the
 //! DTX scheduling are composed on top by the `vad` and `dtx` modules.
 
-use crate::bitstream::{SubFrame, UnpackedFrame, SUBFRAMES};
+use crate::FRAME_SAMPLES;
+use crate::bitstream::{SUBFRAMES, SubFrame, UnpackedFrame};
 use crate::decoder::DecoderState;
 use crate::encoder::analysis::{code_xmax, quantise_lar};
-use crate::FRAME_SAMPLES;
 
 /// The four §6.1 LTP lag values `Ncr` for sub-segments 1..4:
 /// *"The LTP lag values (Ncr) of the 4 sub-segments are set to 40,

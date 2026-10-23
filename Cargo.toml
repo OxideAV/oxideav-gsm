@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-gsm"
 version = "0.0.10"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust GSM Full Rate (ETSI 06.10, RPE-LTP) speech codec — clean-room rebuild in progress"

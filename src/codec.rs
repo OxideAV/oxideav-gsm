@@ -11,7 +11,7 @@ use oxideav_core::{
     Encoder, Error as CoreError, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bitstream::{UnpackedFrame, FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, MSGSM_BLOCK_LEN};
+use crate::bitstream::{FRAME_SAMPLES, GSM_BYTE_FRAME_LEN, MSGSM_BLOCK_LEN, UnpackedFrame};
 use crate::decoder::DecoderState;
 use crate::encoder::EncoderState;
 
@@ -133,12 +133,12 @@ pub fn make_hr_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "GSM 06.20 half-rate encoder: annex A.2 defines an 8 kHz sampling rate only",
         ));
     }
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(CoreError::unsupported(
-                "GSM 06.20 half-rate encoder: input must be S16 (13-bit-in-16 convention)",
-            ));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(CoreError::unsupported(
+            "GSM 06.20 half-rate encoder: input must be S16 (13-bit-in-16 convention)",
+        ));
     }
     let mut output_params = CodecParameters::audio(CodecId::new(HR_CODEC_ID));
     output_params.channels = Some(1);
@@ -181,12 +181,12 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "GSM 06.10 RPE-LTP encoder: §1.5 defines an 8 kHz sampling rate only",
         ));
     }
-    if let Some(fmt) = params.sample_format {
-        if fmt != SampleFormat::S16 {
-            return Err(CoreError::unsupported(
-                "GSM 06.10 RPE-LTP encoder: input must be S16 (§5.2.1 13-bit-in-16 convention)",
-            ));
-        }
+    if let Some(fmt) = params.sample_format
+        && fmt != SampleFormat::S16
+    {
+        return Err(CoreError::unsupported(
+            "GSM 06.10 RPE-LTP encoder: input must be S16 (§5.2.1 13-bit-in-16 convention)",
+        ));
     }
 
     let packing = FramePacking::from_params(params)?;
@@ -460,7 +460,7 @@ impl Encoder for HrGsmEncoder {
             _ => {
                 return Err(CoreError::invalid(
                     "oxideav-gsm: half-rate encoder accepts audio frames only",
-                ))
+                ));
             }
         };
         if audio.data.len() != 1 {
@@ -479,7 +479,7 @@ impl Encoder for HrGsmEncoder {
             self.next_pts = audio.pts.or(Some(0));
         }
         self.sample_buf.reserve(bytes.len() / 2);
-        for pair in bytes.chunks_exact(2) {
+        for pair in bytes.as_chunks::<2>().0 {
             self.sample_buf.push(i16::from_le_bytes([pair[0], pair[1]]));
         }
         self.drain_whole_frames();
@@ -607,7 +607,7 @@ impl Encoder for GsmEncoder {
             _ => {
                 return Err(CoreError::invalid(
                     "oxideav-gsm: encoder accepts audio frames only",
-                ))
+                ));
             }
         };
         if audio.data.len() != 1 {
@@ -627,7 +627,7 @@ impl Encoder for GsmEncoder {
             self.next_pts = audio.pts.or(Some(0));
         }
         self.sample_buf.reserve(bytes.len() / 2);
-        for pair in bytes.chunks_exact(2) {
+        for pair in bytes.as_chunks::<2>().0 {
             self.sample_buf.push(i16::from_le_bytes([pair[0], pair[1]]));
         }
         self.drain_whole_frames();
@@ -866,7 +866,7 @@ mod tests {
             match dec.receive_frame().unwrap() {
                 Frame::Audio(a) => {
                     assert_eq!(a.samples, 160);
-                    for pair in a.data[0].chunks_exact(2) {
+                    for pair in a.data[0].as_chunks::<2>().0 {
                         let v = i16::from_le_bytes([pair[0], pair[1]]) as i64;
                         decoded_energy += v * v;
                     }
@@ -1022,7 +1022,7 @@ mod tests {
             dec.send_packet(pkt).unwrap();
             match dec.receive_frame().unwrap() {
                 Frame::Audio(a) => {
-                    for pair in a.data[0].chunks_exact(2) {
+                    for pair in a.data[0].as_chunks::<2>().0 {
                         pcm.push(i16::from_le_bytes([pair[0], pair[1]]));
                     }
                 }
@@ -1081,8 +1081,8 @@ mod tests {
         let mut enc = make_encoder(&params_with_packing(b"msgsm")).unwrap();
         enc.send_frame(&audio_frame(&triangle(480), Some(0)))
             .unwrap(); // 3 frames
-                       // Frames 1+2 complete a block immediately; frame 3 sits in
-                       // the half-block buffer until flush.
+        // Frames 1+2 complete a block immediately; frame 3 sits in
+        // the half-block buffer until flush.
         let first = enc.receive_packet().unwrap();
         assert_eq!(first.data.len(), 65);
         assert!(matches!(enc.receive_packet(), Err(CoreError::NeedMore)));

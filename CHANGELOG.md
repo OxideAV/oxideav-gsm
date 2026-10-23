@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+- edition 2024, MSRV 1.95
+- edition 2024, MSRV 1.95
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - GSM 06.20 half-rate **encoder**: the complete clause 4.1 excitation

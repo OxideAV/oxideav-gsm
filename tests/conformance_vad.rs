@@ -35,7 +35,7 @@
 #![cfg(not(miri))]
 
 use oxideav_gsm::{
-    EncoderState, TxDtxHandler, TxFrame, UnpackedFrame, Vad, VadMode, FRAME_SAMPLES,
+    EncoderState, FRAME_SAMPLES, TxDtxHandler, TxFrame, UnpackedFrame, Vad, VadMode,
 };
 use std::path::PathBuf;
 
@@ -59,11 +59,13 @@ fn read_pcm_frames(name: &str) -> Vec<[i16; FRAME_SAMPLES]> {
         std::fs::read(fixture_dir().join(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}"));
     assert_eq!(bytes.len() % 320, 0, "{name}: partial frame");
     bytes
-        .chunks_exact(320)
+        .as_chunks::<320>()
+        .0
+        .iter()
         .map(|c| {
             let mut f = [0i16; FRAME_SAMPLES];
-            for (s, ch) in f.iter_mut().zip(c.chunks_exact(2)) {
-                *s = i16::from_le_bytes([ch[0], ch[1]]);
+            for (s, ch) in f.iter_mut().zip(c.as_chunks::<2>().0) {
+                *s = i16::from_le_bytes(*ch);
             }
             f
         })
@@ -92,11 +94,13 @@ fn read_cod_frames(name: &str) -> Vec<CodFrame> {
         std::fs::read(fixture_dir().join(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}"));
     assert_eq!(bytes.len() % 152, 0, "{name}: partial frame");
     bytes
-        .chunks_exact(152)
+        .as_chunks::<152>()
+        .0
+        .iter()
         .map(|c| {
             let mut words = [0u16; 76];
-            for (w, ch) in words.iter_mut().zip(c.chunks_exact(2)) {
-                *w = u16::from_le_bytes([ch[0], ch[1]]);
+            for (w, ch) in words.iter_mut().zip(c.as_chunks::<2>().0) {
+                *w = u16::from_le_bytes(*ch);
             }
             CodFrame {
                 words,

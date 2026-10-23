@@ -43,8 +43,8 @@
 
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 use oxideav_gsm::{
-    decoder_homing_frame, encoder_homing_frame_pcm, make_decoder, UnpackedFrame, CODEC_ID,
-    FRAME_SAMPLES, PULSES,
+    CODEC_ID, FRAME_SAMPLES, PULSES, UnpackedFrame, decoder_homing_frame, encoder_homing_frame_pcm,
+    make_decoder,
 };
 
 fn params() -> CodecParameters {
@@ -279,7 +279,7 @@ fn homing01_output_is_history_independent_after_reset() {
         "§6.2.2: output after a homing reset must be history-independent"
     );
     // And shaped per §5.3.7.
-    for pair in a_out.chunks_exact(2) {
+    for pair in a_out.as_chunks::<2>().0 {
         let v = i16::from_le_bytes([pair[0], pair[1]]);
         assert_eq!(v & 0b111, 0, "§5.3.7 output low 3 bits must be zero");
     }
@@ -302,7 +302,7 @@ fn every_reset_output_is_the_encoder_homing_frame() {
         let out = decode_one(&mut dec, &fractional_homing_cod(s));
         assert!(is_reset_output(&out), "fractional reset {s}");
         // Byte-exact: each is 0x0008.
-        for pair in out.chunks_exact(2) {
+        for pair in out.as_chunks::<2>().0 {
             assert_eq!(i16::from_le_bytes([pair[0], pair[1]]), 0x0008);
         }
     }

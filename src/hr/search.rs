@@ -10,8 +10,8 @@
 //! codewords tie on eq. (117); the sign of `C_i` then picks the
 //! member that yields a positive gain (clause 4.1.10.2).
 
-use super::tables::GSP0_VQ;
 use super::HR_SUBFRAME_SAMPLES;
+use super::tables::GSP0_VQ;
 
 /// Samples per subframe.
 const NS: usize = HR_SUBFRAME_SAMPLES;

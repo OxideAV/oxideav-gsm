@@ -33,7 +33,7 @@
 //!   known to disagree with the reference decode (see the fixtures
 //!   README); the digest pinned here is the reference decoder's.
 
-use oxideav_gsm::{DecoderState, EncoderState, UnpackedFrame, GSM_BYTE_FRAME_LEN, MSGSM_BLOCK_LEN};
+use oxideav_gsm::{DecoderState, EncoderState, GSM_BYTE_FRAME_LEN, MSGSM_BLOCK_LEN, UnpackedFrame};
 
 const FRAME: usize = 160;
 
@@ -48,13 +48,7 @@ fn gen_amp(frames: usize, base: i64, step: i64) -> Vec<i16> {
     for n in 0..(frames * FRAME) as i64 {
         phase1 = (phase1 + 311 * 65536 / 8000) % 65536;
         phase2 = (phase2 + 1123 * 65536 / 8000) % 65536;
-        let tri = |p: i64| -> i64 {
-            if p < 32768 {
-                p - 16384
-            } else {
-                49152 - p
-            }
-        };
+        let tri = |p: i64| -> i64 { if p < 32768 { p - 16384 } else { 49152 - p } };
         let am = base + step * ((n / 160) % 5);
         let s = (tri(phase1) * am / 16384) + (tri(phase2) * am / 3 / 16384);
         out.push(s.clamp(-32768, 32767) as i16);
@@ -135,7 +129,7 @@ fn fnv1a64_pcm(pcm: &[i16]) -> u64 {
 fn encode_all(pcm: &[i16]) -> Vec<u8> {
     let mut enc = EncoderState::new();
     let mut out = Vec::with_capacity(pcm.len() / FRAME * GSM_BYTE_FRAME_LEN);
-    for chunk in pcm.chunks_exact(FRAME) {
+    for chunk in pcm.as_chunks::<FRAME>().0 {
         let mut buf = [0i16; FRAME];
         buf.copy_from_slice(chunk);
         let frame = enc.encode_frame(&buf);
@@ -147,7 +141,7 @@ fn encode_all(pcm: &[i16]) -> Vec<u8> {
 fn decode_all(gsm: &[u8]) -> Vec<i16> {
     let mut dec = DecoderState::new();
     let mut out = Vec::with_capacity(gsm.len() / GSM_BYTE_FRAME_LEN * FRAME);
-    for fb in gsm.chunks_exact(GSM_BYTE_FRAME_LEN) {
+    for fb in gsm.as_chunks::<GSM_BYTE_FRAME_LEN>().0 {
         let f = UnpackedFrame::from_gsm_byte_frame(fb).expect("fixture frame must parse");
         out.extend_from_slice(&dec.decode_frame(&f));
     }
@@ -168,8 +162,10 @@ fn assert_encoder_matches(pcm: &[i16], fixture: &[u8], name: &str) {
     let ours = encode_all(pcm);
     // Compare frame-by-frame for a readable failure location.
     for (i, (a, b)) in ours
-        .chunks_exact(GSM_BYTE_FRAME_LEN)
-        .zip(fixture.chunks_exact(GSM_BYTE_FRAME_LEN))
+        .as_chunks::<GSM_BYTE_FRAME_LEN>()
+        .0
+        .iter()
+        .zip(fixture.as_chunks::<GSM_BYTE_FRAME_LEN>().0)
         .enumerate()
     {
         assert_eq!(a, b, "{name}: encoder output differs at frame {i}");
@@ -252,7 +248,7 @@ fn decoder_sample_exact_blackbox_rand() {
 fn encode_all_msgsm(pcm: &[i16]) -> Vec<u8> {
     let mut enc = EncoderState::new();
     let mut out = Vec::with_capacity(pcm.len() / (2 * FRAME) * MSGSM_BLOCK_LEN);
-    for pair in pcm.chunks_exact(2 * FRAME) {
+    for pair in pcm.as_chunks::<{ 2 * FRAME }>().0 {
         let mut buf_a = [0i16; FRAME];
         let mut buf_b = [0i16; FRAME];
         buf_a.copy_from_slice(&pair[..FRAME]);
@@ -267,7 +263,7 @@ fn encode_all_msgsm(pcm: &[i16]) -> Vec<u8> {
 fn decode_all_msgsm(blocks: &[u8]) -> Vec<i16> {
     let mut dec = DecoderState::new();
     let mut out = Vec::with_capacity(blocks.len() / MSGSM_BLOCK_LEN * 2 * FRAME);
-    for blk in blocks.chunks_exact(MSGSM_BLOCK_LEN) {
+    for blk in blocks.as_chunks::<MSGSM_BLOCK_LEN>().0 {
         let (a, b) = UnpackedFrame::pair_from_msgsm_block(blk).expect("block must parse");
         out.extend_from_slice(&dec.decode_frame(&a));
         out.extend_from_slice(&dec.decode_frame(&b));
@@ -308,8 +304,10 @@ fn encoder_bit_exact_blackbox_msgsm() {
         let ours = encode_all_msgsm(&pcm);
         assert_eq!(ours.len(), fixture.len(), "{name}: length");
         for (i, (a, b)) in ours
-            .chunks_exact(MSGSM_BLOCK_LEN)
-            .zip(fixture.chunks_exact(MSGSM_BLOCK_LEN))
+            .as_chunks::<MSGSM_BLOCK_LEN>()
+            .0
+            .iter()
+            .zip(fixture.as_chunks::<MSGSM_BLOCK_LEN>().0)
             .enumerate()
         {
             assert_eq!(a, b, "{name}: MS-GSM block {i} differs");
@@ -383,10 +381,12 @@ fn msgsm_fixtures_carry_same_parameters_as_gsm_fixtures() {
         ),
     ] {
         let frames: Vec<UnpackedFrame> = gsm
-            .chunks_exact(GSM_BYTE_FRAME_LEN)
+            .as_chunks::<GSM_BYTE_FRAME_LEN>()
+            .0
+            .iter()
             .map(|fb| UnpackedFrame::from_gsm_byte_frame(fb).unwrap())
             .collect();
-        for (i, blk) in msgsm.chunks_exact(MSGSM_BLOCK_LEN).enumerate() {
+        for (i, blk) in msgsm.as_chunks::<MSGSM_BLOCK_LEN>().0.iter().enumerate() {
             let (a, b) = UnpackedFrame::pair_from_msgsm_block(blk).unwrap();
             assert_eq!(a, frames[2 * i], "{name} block {i} frame A");
             assert_eq!(b, frames[2 * i + 1], "{name} block {i} frame B");
@@ -411,7 +411,7 @@ fn fixtures_all_frames_carry_marker_and_roundtrip() {
         ),
         ("rand", &include_bytes!("fixtures/blackbox_rand.gsm")[..]),
     ] {
-        for (i, fb) in bytes.chunks_exact(GSM_BYTE_FRAME_LEN).enumerate() {
+        for (i, fb) in bytes.as_chunks::<GSM_BYTE_FRAME_LEN>().0.iter().enumerate() {
             assert_eq!(fb[0] >> 4, 0xD, "{name} frame {i}: marker nibble");
             let f = UnpackedFrame::from_gsm_byte_frame(fb).unwrap();
             assert_eq!(

@@ -7,11 +7,11 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::hr::{
-    hr_decoder_homing_frame, is_hr_decoder_homing_frame, HrDecoder, HrEncoder,
-    HR_ENCODER_HOMING_SAMPLE,
-};
 use oxideav_gsm::HrParameters;
+use oxideav_gsm::hr::{
+    HR_ENCODER_HOMING_SAMPLE, HrDecoder, HrEncoder, hr_decoder_homing_frame,
+    is_hr_decoder_homing_frame,
+};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -25,7 +25,9 @@ fn read_words(rel: &str) -> Option<Vec<i16>> {
     let bytes = std::fs::read(fixture_dir().join(rel)).ok()?;
     Some(
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect(),
     )
@@ -116,8 +118,8 @@ fn seq05_homing_sequence_codes_as_decoder_homing_frames() {
         return;
     };
     let mut enc = HrEncoder::new();
-    for f in inp.chunks_exact(160) {
-        let p = enc.encode_frame(f.try_into().unwrap());
+    for f in inp.as_chunks::<160>().0 {
+        let p = enc.encode_frame(f);
         assert!(is_hr_decoder_homing_frame(&p));
     }
 }
@@ -130,8 +132,8 @@ fn encoder_is_deterministic_and_packable() {
     let mut a = HrEncoder::new();
     let mut b = HrEncoder::new();
     let mut modes_seen = [false; 4];
-    for f in speech.chunks_exact(160) {
-        let f: &[i16; 160] = f.try_into().unwrap();
+    for f in speech.as_chunks::<160>().0 {
+        let f: &[i16; 160] = f;
         let pa = a.encode_frame(f);
         let pb = b.encode_frame(f);
         assert_eq!(pa, pb);
@@ -153,8 +155,8 @@ fn synthetic_round_trip_tracks_input() {
     let mut enc = HrEncoder::new();
     let mut dec = HrDecoder::new();
     let mut out = Vec::new();
-    for f in speech.chunks_exact(160) {
-        let p = enc.encode_frame(f.try_into().unwrap());
+    for f in speech.as_chunks::<160>().0 {
+        let p = enc.encode_frame(f);
         out.extend_from_slice(&dec.decode_frame(&p));
     }
     let mut c = 0.0;
@@ -191,8 +193,8 @@ fn corpus_round_trip_tracks_input() {
         let mut enc = HrEncoder::new();
         let mut dec = HrDecoder::new();
         let mut out = Vec::with_capacity(inp.len());
-        for f in inp.chunks_exact(160) {
-            let p = enc.encode_frame(f.try_into().unwrap());
+        for f in inp.as_chunks::<160>().0 {
+            let p = enc.encode_frame(f);
             out.extend_from_slice(&dec.decode_frame(&p));
         }
         let frames = inp.len() / 160;

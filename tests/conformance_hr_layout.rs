@@ -26,7 +26,7 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::{HrParameters, SubframeParams, HR_PARAMS_PER_FRAME};
+use oxideav_gsm::{HR_PARAMS_PER_FRAME, HrParameters, SubframeParams};
 use std::path::PathBuf;
 
 fn fixture_dir() -> PathBuf {
@@ -48,7 +48,9 @@ fn read_words(rel: &str) -> Vec<u16> {
     let bytes =
         std::fs::read(fixture_dir().join(rel)).unwrap_or_else(|e| panic!("fixture {rel}: {e}"));
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

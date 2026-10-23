@@ -54,14 +54,14 @@
 //!   filters.
 
 use super::decode::{
-    adaptive_codebook, decode_r0, dequant_reflection, frac_delay_6, hr_decoder_homing_frame,
-    step_down, step_up, vq_index, HR_ENCODER_HOMING_SAMPLE,
+    HR_ENCODER_HOMING_SAMPLE, adaptive_codebook, decode_r0, dequant_reflection, frac_delay_6,
+    hr_decoder_homing_frame, step_down, step_up, vq_index,
 };
-use super::lag::{open_loop_search, OpenLoop, Y_HIST};
-use super::search::{code_search, decorrelate, gain_search, GainInputs};
+use super::lag::{OpenLoop, Y_HIST, open_loop_search};
+use super::search::{GainInputs, code_search, decorrelate, gain_search};
 use super::tables::*;
 use super::{
-    HrParameters, SubframeParams, HR_FRAME_SAMPLES, HR_SUBFRAMES, HR_SUBFRAME_SAMPLES, R0_RMAX,
+    HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, R0_RMAX, SubframeParams,
 };
 
 /// Short-term predictor order (annex A.2 `Np`).
@@ -984,7 +984,7 @@ impl HrEncoder {
                     } else {
                         f64::NEG_INFINITY
                     };
-                    if best.as_ref().map_or(true, |(b, ..)| score > *b) {
+                    if best.as_ref().is_none_or(|(b, ..)| score > *b) {
                         best = Some((score, cand as usize, b_l, b_w));
                     }
                 }
