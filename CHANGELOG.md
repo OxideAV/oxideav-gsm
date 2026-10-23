@@ -7,9 +7,6 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - edition 2024, MSRV 1.95
-- edition 2024, MSRV 1.95
-- edition 2024, MSRV 1.95
-- edition 2024, MSRV 1.95
 
 ### Added
 
