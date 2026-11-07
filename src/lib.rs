@@ -105,6 +105,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod arith;
 pub mod bitstream;
 pub mod codec;
@@ -116,6 +118,8 @@ pub mod encoder;
 pub mod error;
 pub mod hr;
 pub mod sync;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tables;
 pub mod vad;
 

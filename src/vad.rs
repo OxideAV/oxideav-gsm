@@ -86,6 +86,7 @@ fn l_shl_s(v: i32, n: i16) -> i32 {
 /// threshold adapting on network tones (ringing etc.), which only
 /// occur downlink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum VadMode {
     /// Downlink VAD — clause 3.10 tone detection runs each frame.
     #[default]

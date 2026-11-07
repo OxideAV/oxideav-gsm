@@ -20,6 +20,7 @@ All notable changes to this project will be documented in this file.
 - GSM 06.20 decoder — lattice sign convention, eq. (100) periodic extension, 6th-order prefilter interpolator, eq. (151), Q14 gain components
 
 ### Changed
+- API hygiene: `Error`, `FramePacking` and `VadMode` are now `#[non_exhaustive]`; the `arith` (§5.1 fixed-point operators) and `tables` (§5.4 quantiser tables) modules are now `#[doc(hidden)]`. Spec-fixed enums (`SidFlag`, `TxFrame`, `RxFrame`, `RxClassification`, `DtxState`, `VoicingMode`, `SubframeParams`) and the bitstream parameter records stay exhaustive.
 
 - edition 2024, MSRV 1.95
 

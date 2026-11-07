@@ -2,6 +2,7 @@
 
 /// Errors surfaced by the GSM 06.10 decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The crate has been reset to a scaffold pending clean-room
     /// rebuild; reserved for APIs that are not yet wired up.

@@ -24,6 +24,7 @@ pub const CODEC_ID: &str = "gsm";
 /// docs). The coded parameters are identical in all three — only the
 /// bit/byte packaging differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FramePacking {
     /// Empty extradata or `b"inband"` — the spec's abstract §1.7
     /// `b1..b260` stream packed MSB-first into 33 bytes (4 spare
