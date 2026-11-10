@@ -1,33 +1,14 @@
 //! GSM 06.20 half-rate decoder vs the staged GSM 06.07 decoder
 //! conformance vectors (`tests/fixtures/etsi-hr/disk2/`).
 //!
-//! ## What this harness can and cannot pin
+//! What is pinned, exactly:
 //!
-//! EN 300 969 prints the decoder as floating-point functional
-//! equations and places the bit-exact arithmetic in the GSM 06.06
-//! ANSI-C deliverable (clause 5.1), which is deliberately not
-//! staged (clean-room posture — only its ROM data is). On top of
-//! that, the clause 4.2.5 long-term state update feeds the
-//! decoder's own past excitation back into every voiced subframe,
-//! so any sub-LSB arithmetic divergence compounds over a sequence:
-//! whole-stream sample equality (or even high whole-stream SNR) is
-//! not an achievable bar for a non-bit-exact implementation.
-//!
-//! What IS pinned, exactly:
-//!
+//! * every output word of SEQ01–SEQ04 (bit-exact decoding, the
+//!   clause 5.1 conformance bar);
 //! * the clause 5 homing protocol — `SEQ05.DEC` (the decoder
 //!   homing frame) reproduces the encoder homing frame output from
-//!   the home state, and the homing frames leading every `.DEC`
-//!   sequence decode to the reference `0008`-hex frames and the
-//!   silence frame that follows them sample-exactly;
-//! * decoded-vs-reference **per-frame waveform correlation**,
-//!   averaged over every frame of SEQ01–SEQ04 — the measured value
-//!   (≈ 0.99) asserts the decoder tracks the reference waveform,
-//!   and the floor guards against regressions in any
-//!   dequantisation leg;
-//! * per-sequence decoded/reference **energy** agreement — the
-//!   gain chain (R0 decode, eq. (132) RS, GSP0 components) keeps
-//!   the output level within a factor bound of the reference.
+//!   the home state, and a mid-stream homing frame fully resets the
+//!   decoder.
 
 #![cfg(not(miri))]
 
@@ -103,74 +84,40 @@ fn leading_homing_frames_are_sample_exact() {
     }
 }
 
-/// Measured waveform agreement, pinned as a regression floor: the
-/// mean per-frame correlation between decoded and reference frames
-/// across SEQ01–SEQ04 (leading homing frames excluded) is ≈ 0.99
-/// (0.42 when the decoder first landed; 0.76 once the lattice sign
-/// convention, the eq. (100) periodic extension, the 6th-order
-/// prefilter interpolator, the eq. (151) reading and the Q14 gain
-/// components were pinned by the encoder-side conformance; 0.99
-/// with the eqs. (158)-(164) SST-smoothed postfilter numerator).
-/// The floor 0.95 guards every dequantisation leg; whole-stream SNR
-/// is reported alongside.
+/// Bit-exact decoding: every frame of SEQ01–SEQ04 (3 621 speech
+/// frames plus the leading homing frames) must reproduce the
+/// reference `.OUT` words exactly. The decoder carries the clause
+/// 5.1 fixed-point arithmetic per the staged half-rate schedules
+/// (`docs/audio/gsm/halfrate-traces/hr-fixed-point-schedules.md`
+/// Part A).
 #[test]
-fn hr_decoder_vs_etsi_out_references() {
+fn hr_decoder_bit_exact_vs_etsi_out_references() {
     if !corpus_present() {
         return;
     }
-    let mut corr_sum = 0f64;
-    let mut n_frames = 0usize;
+    let mut total = 0usize;
     for seq in ["SEQ01", "SEQ02", "SEQ03", "SEQ04"] {
         let (decoded, reference) = run_sequence(seq);
-        let mut sig = 0f64;
-        let mut err = 0f64;
-        let mut seq_corr = 0f64;
-        let mut seq_n = 0usize;
-        let mut e_dec = 0f64;
-        let mut e_ref = 0f64;
-        for f in 2..decoded.len() / 160 {
-            let d = &decoded[f * 160..(f + 1) * 160];
-            let r = &reference[f * 160..(f + 1) * 160];
-            let mut dot = 0f64;
-            let mut de = 0f64;
-            let mut re = 0f64;
-            for (x, y) in d.iter().zip(r.iter()) {
-                let (xf, yf) = (*x as f64, *y as f64);
-                dot += xf * yf;
-                de += xf * xf;
-                re += yf * yf;
-                sig += yf * yf;
-                err += (yf - xf) * (yf - xf);
-            }
-            e_dec += de;
-            e_ref += re;
-            if de > 0.0 && re > 0.0 {
-                seq_corr += dot / (de * re).sqrt();
-                seq_n += 1;
-            }
+        let frames = decoded.len() / 160;
+        let exact = (0..frames)
+            .filter(|f| decoded[f * 160..(f + 1) * 160] == reference[f * 160..(f + 1) * 160])
+            .count();
+        eprintln!("{seq}: {exact}/{frames} frames bit-exact");
+        if let Some(i) = decoded
+            .iter()
+            .zip(reference.iter())
+            .position(|(a, b)| a != b)
+        {
+            panic!(
+                "{seq}: first mismatch at sample {i} (frame {}): decoded {} vs reference {}",
+                i / 160,
+                decoded[i],
+                reference[i]
+            );
         }
-        let snr = 10.0 * (sig / err).log10();
-        let energy_ratio = e_dec / e_ref;
-        eprintln!(
-            "{seq}: mean frame corr {:.4} ({} frames), stream SNR {snr:.2} dB, energy ratio {energy_ratio:.3}",
-            seq_corr / seq_n as f64,
-            seq_n
-        );
-        // The gain chain keeps the sequence energy within a factor
-        // of ~4 of the reference (measured 0.3–1.1 at pin time).
-        assert!(
-            (0.06..=4.0).contains(&energy_ratio),
-            "{seq}: decoded/reference energy ratio {energy_ratio:.3} out of bounds"
-        );
-        corr_sum += seq_corr;
-        n_frames += seq_n;
+        total += frames;
     }
-    let mean_corr = corr_sum / n_frames as f64;
-    eprintln!("overall mean per-frame correlation: {mean_corr:.4} over {n_frames} frames");
-    assert!(
-        mean_corr >= 0.95,
-        "mean per-frame correlation {mean_corr:.4} fell below the pinned 0.95 floor"
-    );
+    assert_eq!(total, 2359 + 781 + 413 + 76);
 }
 
 /// SEQ05.DEC is the lone decoder homing frame: feeding it

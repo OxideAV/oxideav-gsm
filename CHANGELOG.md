@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- GSM 06.20 half-rate decoder rebuilt on the clause 5.1 fixed-point
+  arithmetic (the staged `halfrate-traces/hr-fixed-point-schedules.md`
+  Part A operator rules): 32-bit step-up with the frame fallback, the
+  AFLAT-smoothed postfilter numerator of the widened denominator,
+  RS_est / ρ normalisation, GSP0 scaling, 10-tap adaptive codebook,
+  pitch prefilter + AGC, synthesis, postfilter + Q13 running gain.
+  **Bit-exact on every frame of the GSM 06.07 `SEQ01`–`SEQ04.OUT`
+  references (3 629/3 629 frames; was 0 bit-exact, 0.99 mean
+  correlation)**; the conformance test now asserts word equality.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.10...v0.0.11) - 2026-10-23
 
 ### Other

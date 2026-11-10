@@ -46,6 +46,7 @@
 
 pub mod decode;
 pub mod encode;
+pub(crate) mod fx;
 mod lag;
 mod search;
 pub mod tables;
