@@ -217,3 +217,44 @@ fn corpus_round_trip_tracks_input() {
     eprintln!("corpus round trip mean per-frame correlation {mean:.3}");
     assert!(mean >= 0.48, "round trip correlation {mean:.3}");
 }
+
+/// The fixed-point encoder and decoder are total over hostile input
+/// (full-scale noise, rail-to-rail square waves, sines, impulses):
+/// no arithmetic panic in debug builds over 1 500 frames.
+#[test]
+fn hostile_input_is_total() {
+    let mut e = HrEncoder::new();
+    let mut d = HrDecoder::new();
+    let mut x: u32 = 1;
+    for f in 0..1500usize {
+        let mut pcm = [0i16; 160];
+        for (n, s) in pcm.iter_mut().enumerate() {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *s = match f % 5 {
+                0 => x as i16,
+                1 => {
+                    if (n / (3 + f % 40)) % 2 == 0 {
+                        32767
+                    } else {
+                        -32768
+                    }
+                }
+                2 => ((n as f64 * 0.3 * (1 + f % 7) as f64).sin() * 32767.0) as i16,
+                3 => (x as i16) >> (f % 14),
+                _ => {
+                    if n % (21 + f % 120) == 0 {
+                        32767
+                    } else {
+                        0
+                    }
+                }
+            };
+        }
+        let p = e.encode_frame(&pcm);
+        for s in d.decode_frame(&p) {
+            assert_eq!(s & 7, 0);
+        }
+    }
+}
