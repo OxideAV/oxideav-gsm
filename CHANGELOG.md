@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.11...v0.0.12) - 2026-11-10
+
+### Other
+
+- HR encoder/decoder totality over hostile input
+- half-rate decoder bit-exact, fixed-point encoder stages; drop a debug print
+- GSM 06.20 encoder — fixed-point lag, code and GSP0 searches
+- GSM 06.20 encoder front end — fixed-point HP/FLAT/R0/AFLAT, bit-exact R0+LPC
+- GSM 06.20 decoder — fixed-point arithmetic, bit-exact on SEQ01–04
+- API hygiene: non_exhaustive errors/options, hide internal modules
+
 ### Changed
 
 - GSM 06.20 half-rate decoder rebuilt on the clause 5.1 fixed-point
