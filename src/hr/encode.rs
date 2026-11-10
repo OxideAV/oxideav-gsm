@@ -627,16 +627,6 @@ impl HrEncoder {
             }
         }
 
-        if std::env::var("HRDBG").is_ok() {
-            let mut e = [0f64; 4];
-            for sf in 0..4 {
-                for n in 0..NS {
-                    let w = y_all[Y_HIST + sf * NS + n] * 16384.0;
-                    e[sf] += w * w;
-                }
-            }
-            eprintln!("YDBG sumsq(words@16384) {:?}", e);
-        }
         // Clauses 4.1.8.1-4.1.8.4.
         let mut yw = [0i16; OL_HIST + HR_FRAME_SAMPLES];
         for (d, &v) in yw.iter_mut().zip(y_all.iter()) {
