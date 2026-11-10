@@ -15,6 +15,17 @@ All notable changes to this project will be documented in this file.
   **Bit-exact on every frame of the GSM 06.07 `SEQ01`–`SEQ04.OUT`
   references (3 629/3 629 frames; was 0 bit-exact, 0.99 mean
   correlation)**; the conformance test now asserts word equality.
+- GSM 06.20 encoder front end rebuilt on the fixed-point arithmetic
+  (schedules Part B): double-precision-memory high-pass, the
+  pre-scaled 160-term covariance with end-point correction, the
+  windowed FLAT lattice with lazy renormalisation, the R0 amplitude
+  decision against the odd R0 table entries, and the 16-bit AFLAT
+  prequantiser / quantiser search with the renormalised 32-bit
+  between-segment update. **R0 and LPC1–LPC3 now match every
+  non-homing frame of `SEQ01..03.COD` (3 547/3 547; end to end was
+  R0 95,6%, LPC 76–81%)**; downstream end-to-end agreement rises with
+  it (INT_LPC 91,5 → 97,9%, MODE 91,3 → 92,4%, CODE1 80,8 → 91,0%,
+  CODE2 77,0 → 88,7%, voiced CODE 20,3 → 27,3%).
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.10...v0.0.11) - 2026-10-23
 

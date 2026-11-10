@@ -1,14 +1,15 @@
 //! GSM 06.20 encoder (clauses 4.1.1–4.1.11) vs the staged GSM 06.07
 //! encoder references (`tests/fixtures/etsi-hr/disk1/`).
 //!
-//! EN 300 969's printed equations are functional (the bit-exact
-//! arithmetic is the unstaged GSM 06.06 ANSI-C), so exact code
-//! equality across whole sequences is not the achievable bar:
-//! quantizer decisions sitting on a boundary flip under sub-LSB
-//! arithmetic differences, and every such flip feeds the long-term
-//! filter state the following subframes search against. What this
-//! harness pins is the measured per-parameter agreement rate
-//! against `SEQ01..03.COD`, twice over:
+//! The front end (high-pass, FLAT, R0, AFLAT VQ) runs in the clause
+//! 5.1 fixed-point arithmetic and reproduces the R0 / LPC1–LPC3
+//! words of every `SEQ01..03.COD` frame exactly
+//! (`hr_front_end_bit_exact`). The later stages still carry
+//! floating-point arithmetic, where quantizer decisions sitting on a
+//! boundary flip under sub-LSB differences and every flip feeds the
+//! long-term filter state the following subframes search against.
+//! What this harness pins for them is the measured per-parameter
+//! agreement rate against `SEQ01..03.COD`, twice over:
 //!
 //! * **end to end** — the encoder alone, every decision its own;
 //! * **stage-isolated** — each search run with the reference's
@@ -24,7 +25,7 @@
 
 #![cfg(not(miri))]
 
-use oxideav_gsm::hr::{FrameAnalysis, HR_DECODER_HOMING_WORDS, HrEncoder, HrForce};
+use oxideav_gsm::hr::{FrameAnalysis, HR_DECODER_HOMING_WORDS, HrEncoder, HrForce, HrFrontEnd};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -200,11 +201,11 @@ fn report(name: &str, r: &Rates) {
     eprintln!("HR encoder [{name}]: {}", line.join(", "));
 }
 
-/// End to end: every decision the encoder's own. Measured when the
-/// excitation chain landed: R0 95,6% (±1 100%), LPC1 76,4%, LPC2
-/// 80,8%, LPC3 80,5%, INT_LPC 91,5%, MODE 91,3%, LAG_1 46,3%, lag
-/// levels 44,3% (±1 65,6%), CODE1 80,8%, CODE2 77,0%, voiced CODE
-/// 20,3%, unvoiced GSP0 68,5%, voiced GSP0 36,4%.
+/// End to end: every decision the encoder's own. Measured with the
+/// fixed-point front end: R0 / LPC1–3 100%, INT_LPC 97,9%, MODE
+/// 92,4%, LAG_1 49,9%, lag levels 49,0% (±1 70,1%), CODE1 91,0%,
+/// CODE2 88,7%, voiced CODE 27,3%, unvoiced GSP0 79,6%, voiced GSP0
+/// 40,2%.
 #[test]
 fn hr_encoder_end_to_end_vs_etsi_cod_references() {
     if !corpus_present() {
@@ -213,20 +214,20 @@ fn hr_encoder_end_to_end_vs_etsi_cod_references() {
     let r = run(Stage::EndToEnd);
     report("end to end", &r);
     let floors = [
-        ("r0", 90.0),
-        ("r0_near", 99.5),
-        ("lpc1", 70.0),
-        ("lpc2", 74.0),
-        ("lpc3", 74.0),
-        ("int_lpc", 85.0),
-        ("mode", 85.0),
-        ("lag1", 38.0),
-        ("lag_level_pm1", 58.0),
-        ("code1", 72.0),
-        ("code2", 68.0),
-        ("code9", 14.0),
-        ("gsp0_u", 60.0),
-        ("gsp0_v", 28.0),
+        ("r0", 100.0),
+        ("r0_near", 100.0),
+        ("lpc1", 100.0),
+        ("lpc2", 100.0),
+        ("lpc3", 100.0),
+        ("int_lpc", 95.0),
+        ("mode", 88.0),
+        ("lag1", 44.0),
+        ("lag_level_pm1", 64.0),
+        ("code1", 85.0),
+        ("code2", 82.0),
+        ("code9", 22.0),
+        ("gsp0_u", 74.0),
+        ("gsp0_v", 34.0),
     ];
     for (k, floor) in floors {
         assert!(
@@ -279,4 +280,37 @@ fn hr_gain_quantizer_on_reference_codes() {
     report("codes forced", &r);
     assert!(r.pct("gsp0_u") >= 74.0, "gsp0_u {:.1}%", r.pct("gsp0_u"));
     assert!(r.pct("gsp0_v") >= 60.0, "gsp0_v {:.1}%", r.pct("gsp0_v"));
+}
+
+/// The fixed-point front end (clauses 4.1.1–4.1.5) reproduces the
+/// R0 and LPC1–LPC3 words of every non-homing frame of
+/// `SEQ01..03.COD` (3 547 frames).
+#[test]
+fn hr_front_end_bit_exact() {
+    if !corpus_present() {
+        return;
+    }
+    let mut total = 0usize;
+    for seq in ["SEQ01", "SEQ02", "SEQ03"] {
+        let inp = read_words(&format!("disk1/{seq}.INP"));
+        let cod = read_words(&format!("disk1/{seq}.COD"));
+        let mut fe = HrFrontEnd::new();
+        for fi in 0..inp.len() / 160 {
+            let mut pcm = [0i16; 160];
+            for (n, s) in pcm.iter_mut().enumerate() {
+                *s = inp[fi * 160 + n] as i16;
+            }
+            let fr = fe.push_and_analyse(&pcm);
+            if pcm.iter().all(|&s| s == 8) {
+                // Encoder homing frame: the encoder resets.
+                fe = HrFrontEnd::new();
+                continue;
+            }
+            let refw = &cod[fi * 20..fi * 20 + 4];
+            let ours = [fr.r0 as u16, fr.lpc.0, fr.lpc.1, fr.lpc.2 as u16];
+            assert_eq!(ours, refw, "{seq} frame {fi}: R0/LPC1-3");
+            total += 1;
+        }
+    }
+    assert_eq!(total, 2357 + 779 + 411);
 }

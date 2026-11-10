@@ -101,21 +101,10 @@ pub(super) fn vq_index(table: &[i16], flat: usize) -> usize {
 }
 
 /// Clause 4.1.4: decode the three LPC vector-quantiser codes into
-/// the ten reflection coefficients, via the 256-entry scalar
-/// dequantiser (Q15 → f64).
+/// the ten reflection coefficients (Q15 → f64).
+#[cfg(test)]
 pub(super) fn dequant_reflection(lpc1: u16, lpc2: u16, lpc3: u8) -> [f64; NP] {
-    let mut r = [0f64; NP];
-    let scalar = |idx: usize| RC_SCALAR_DEQUANT[idx] as f64 / 32768.0;
-    for (c, slot) in r[..3].iter_mut().enumerate() {
-        *slot = scalar(vq_index(&RC_VQ_SEG1, lpc1 as usize * 3 + c));
-    }
-    for (c, slot) in r[3..6].iter_mut().enumerate() {
-        *slot = scalar(vq_index(&RC_VQ_SEG2, lpc2 as usize * 3 + c));
-    }
-    for (c, slot) in r[6..].iter_mut().enumerate() {
-        *slot = scalar(vq_index(&RC_VQ_SEG3, lpc3 as usize * 4 + c));
-    }
-    r
+    dequant_reflection_words(lpc1, lpc2, lpc3).map(|w| w as f64 / 32768.0)
 }
 
 /// Reflection coefficients → direct-form LPC coefficients `α_i` for

@@ -46,6 +46,7 @@
 
 pub mod decode;
 pub mod encode;
+mod front;
 pub(crate) mod fx;
 mod lag;
 mod search;
@@ -56,6 +57,8 @@ pub use decode::{
     is_hr_decoder_homing_frame,
 };
 pub use encode::{FrameAnalysis, HrAnalyzer, HrEncoder, HrForce};
+#[doc(hidden)]
+pub use front::{FrontFrame, HrFrontEnd};
 
 use crate::error::Error;
 

@@ -26,43 +26,39 @@
 //!
 //! ## Conformance posture
 //!
-//! Like the decoder (see `hr::decode`), the chain implements the
-//! printed floating-point equations over the staged ROM tables in
-//! double precision; the bit-exact arithmetic lives in the unstaged
-//! GSM 06.06 ANSI-C, so the achievable validation bar is measured
-//! per-parameter agreement against the staged GSM 06.07 encoder
-//! references (`tests/conformance_hr_encode_params.rs`) plus the
-//! sample-exact self round trip through [`super::HrDecoder`] on the
-//! homing protocol.
+//! The front end — clause 4.1.1 high-pass, 4.1.2 buffer, 4.1.3
+//! FLAT, 4.1.5 R0 and the 4.1.4 AFLAT VQ search — runs in the
+//! clause 5.1 fixed-point arithmetic (`super::front`, the staged
+//! `halfrate-traces/hr-fixed-point-schedules.md` Part B) and
+//! reproduces the R0 / LPC words of every `SEQ01..03.COD` frame.
+//! The later stages (INT_LPC decision, weighting, lag / code / gain
+//! searches) implement the printed equations in double precision on
+//! the fixed-point front end's output; their measured
+//! per-parameter agreement is pinned by
+//! `tests/conformance_hr_encode_params.rs`.
 //!
 //! ## Readings pinned from the printed clause
 //!
-//! * clause 4.1.1 prints the high-pass coefficients halved: taken
-//!   literally, eq. (3)/(4) with the printed values is not a
-//!   120 Hz high-pass at all (a resonator with −38 dB at 500 Hz);
-//!   doubling every coefficient (the words are Q14) gives the
-//!   stated fourth-order 120 Hz high-pass with the *"incorporated
-//!   gain of 0,5"* — a −6 dB passband — exactly. The coded signal
-//!   itself is carried at unity passband gain (the 0,5 undone) with
-//!   the clause 4.1.5 `Rmax = 4096²` ([`super::R0_RMAX`]): the R0
-//!   codes agree with the corpus either way, but the eq. (132)
-//!   energy estimate behind the `{P0,GS}` search and the decoder's
-//!   excitation level pin this scaling (see `HighPass`);
+//! * clause 4.1.1: each biquad's sum is doubled (the effective
+//!   recursion coefficients are twice the printed words), section 1
+//!   halves its input and section 2 doubles its output — an overall
+//!   0,5 passband gain (erratum G1). The floating-point stages see
+//!   the coded signal at unity gain (`y/16384` in the normalised
+//!   13-bit domain), where clause 4.1.5's `Rmax = 4096²` holds;
 //! * the clause 4.1.6 residual comparison and every subframe
 //!   operation run over the coded frame `s(0..160)` of the buffer,
 //!   with the ten samples that precede it kept for the inverse
 //!   filters.
 
 use super::decode::{
-    HR_ENCODER_HOMING_SAMPLE, adaptive_codebook, decode_r0, dequant_reflection, frac_delay_6,
-    hr_decoder_homing_frame, step_down, step_up, vq_index,
+    HR_ENCODER_HOMING_SAMPLE, adaptive_codebook, decode_r0, dequant_reflection_words, frac_delay_6,
+    hr_decoder_homing_frame, step_down, step_up,
 };
+use super::front::FrontEnd;
 use super::lag::{OpenLoop, Y_HIST, open_loop_search};
 use super::search::{GainInputs, code_search, decorrelate, gain_search};
 use super::tables::*;
-use super::{
-    HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, R0_RMAX, SubframeParams,
-};
+use super::{HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, SubframeParams};
 
 /// Short-term predictor order (annex A.2 `Np`).
 const NP: usize = 10;
@@ -70,10 +66,6 @@ const NP: usize = 10;
 /// Analysis buffer length (clause 4.1.2: *"the previous 195 input
 /// high pass filtered speech samples"*).
 const BUF: usize = 195;
-
-/// Clause 4.1.2 `NA` = 170, the analysis-interval length; the
-/// clause 4.1.3 covariance sum runs `n = Np ..= NA`.
-const NA: usize = 170;
 
 /// The frame-level parameters the clause 4.1.1–4.1.6 chain derives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,57 +78,6 @@ pub struct FrameAnalysis {
     pub lpc3: u8,
     /// Clause 4.1.6: the soft-interpolation bit.
     pub int_lpc: bool,
-}
-
-/// Clause 4.1.1: fourth-order pole-zero high-pass filter (120 Hz),
-/// two cascaded biquads with an incorporated gain of 0,5. The ROM
-/// words ([`HIGHPASS_COEFFS`], storage order per section
-/// `(b0, b1, b2, a2, a1)`) equal the printed eq. (3)/(4) values in
-/// Q15 — and both are **halved**: used as printed the cascade is a
-/// resonator (−38 dB at 500 Hz, −12 dB at 1 kHz), while doubling
-/// every coefficient (reading the words as Q14) yields a real
-/// fourth-order 120 Hz high-pass whose passband sits at exactly the
-/// stated −6 dB (double real poles at 0,926 and 0,965).
-#[derive(Debug, Clone, Default)]
-struct HighPass {
-    x1: [f64; 2],
-    y1: [f64; 2],
-    y2: [f64; 2],
-    x2in: [f64; 2],
-}
-
-impl HighPass {
-    fn process(&mut self, x: f64) -> f64 {
-        // Q14: every word doubled relative to its Q15 reading.
-        let c = |i: usize| HIGHPASS_COEFFS[i] as f64 / 16384.0;
-        // Section 1 (eq. (3)).
-        let y1 = c(0) * x
-            + c(1) * self.x1[0]
-            + c(2) * self.x1[1]
-            + c(4) * self.y1[0]
-            + c(3) * self.y1[1];
-        self.x1 = [x, self.x1[0]];
-        self.y1 = [y1, self.y1[0]];
-        // Section 2 (eq. (4)).
-        let y2 = c(5) * y1
-            + c(6) * self.x2in[0]
-            + c(7) * self.x2in[1]
-            + c(9) * self.y2[0]
-            + c(8) * self.y2[1];
-        self.x2in = [y1, self.x2in[0]];
-        self.y2 = [y2, self.y2[0]];
-        // The coded-signal domain is the filtered input at unity
-        // passband gain: the printed 0,5 gain is undone here. Pinned
-        // by the staged references — the R0 codes agree either way
-        // (R0 is relative to Rmax), but the eq. (132) energy
-        // estimate feeding the {P0,GS} search and the decoder's
-        // excitation level only match the corpus with the coded
-        // signal at the input level (GSP0 agreement with every other
-        // parameter forced: 7% at −6 dB versus 77% here; decoder
-        // output level ≈ the reference's, which sits at the input
-        // level).
-        2.0 * y2
-    }
 }
 
 /// Where a subframe's direct-form coefficient set comes from
@@ -170,7 +111,8 @@ pub struct FrameSets {
 /// The clause 4.1.1–4.1.6 frame analyzer.
 #[derive(Debug, Clone)]
 pub struct HrAnalyzer {
-    hp: HighPass,
+    /// Clauses 4.1.1-4.1.5 in the fixed-point arithmetic.
+    front: FrontEnd,
     /// Clause 4.1.2 sample buffer `s(0..=194)`, `s(0)` oldest; the
     /// coded frame is `s(0..160)`.
     buf: [f64; BUF],
@@ -192,7 +134,7 @@ impl HrAnalyzer {
     /// Fresh analyzer (all-zero filter and buffer state).
     pub fn new() -> Self {
         Self {
-            hp: HighPass::default(),
+            front: FrontEnd::new(),
             buf: [0.0; BUF],
             pre: [0.0; NP],
             prev_alpha: [0.0; NP],
@@ -246,105 +188,34 @@ impl HrAnalyzer {
         samples: &[i16; HR_FRAME_SAMPLES],
         forced: Option<FrameAnalysis>,
     ) -> FrameSets {
-        // Clauses 4.1.1/4.1.2: high-pass + buffer shift. The frame
-        // being shifted out (s(0..160)) leaves its last ten samples
-        // as the inverse-filter memory of the next coded frame.
+        // Clauses 4.1.1-4.1.5 in the fixed-point arithmetic
+        // (`super::front`): high-pass, buffer shift, FLAT, R0 and the
+        // AFLAT VQ search. The frame being shifted out (s(0..160))
+        // leaves its last ten samples as the inverse-filter memory of
+        // the next coded frame.
         self.pre
             .copy_from_slice(&self.buf[HR_FRAME_SAMPLES - NP..HR_FRAME_SAMPLES]);
-        self.buf.copy_within(HR_FRAME_SAMPLES.., 0);
-        for (i, &s) in samples.iter().enumerate() {
-            // 13-bit left-justified in 16 bits: s/32768 = s13/4096.
-            self.buf[BUF - HR_FRAME_SAMPLES + i] = self.hp.process(s as f64 / 32768.0);
+        self.front.push(samples);
+        // The f64 stages run on the coded signal at unity passband
+        // gain in the normalised domain (13-bit full scale = 1,0):
+        // the 16-bit high-pass words carry the 0,5 gain, so
+        // y/16384.
+        for (d, &w) in self.buf.iter_mut().zip(self.front.buf.iter()) {
+            *d = w as f64 / 16384.0;
         }
-
-        // Clause 4.1.3 STEP 1: covariance matrix (eq. (5)).
-        let mut phi = [[0f64; NP + 1]; NP + 1];
-        for i in 0..=NP {
-            for k in i..=NP {
-                let mut acc = 0.0;
-                for n in NP..=NA {
-                    acc += self.buf[n + 24 - i] * self.buf[n + 24 - k];
-                }
-                phi[i][k] = acc;
-                phi[k][i] = acc;
-            }
-        }
-
-        // Clause 4.1.5 eqs. (27)-(29): frame-energy code, relative
-        // to Rmax = the square of the filtered signal's maximum
-        // amplitude (the −6 dB high-pass halves the 13-bit full
-        // scale). Pinned by the staged references: every R0 code
-        // lands within one 2 dB step of the corpus.
-        let r0_energy = (phi[0][0] + phi[NP][NP]) / 320.0 / R0_RMAX;
-        let r0 = if r0_energy <= 0.0 {
-            0
-        } else {
-            let rdb = 10.0 * r0_energy.log10();
-            (((rdb + 66.0) / 2.0).round()).clamp(0.0, 31.0) as u8
-        };
-
-        // Clause 4.1.3 STEP 2: window (table 1, staged Q31 words).
-        let mut phiw = phi;
-        for i in 0..=NP {
-            for k in 0..=NP {
-                let d = i.abs_diff(k);
-                if d > 0 {
-                    phiw[i][k] *= FLAT_SST_COEFFS[d - 1] as f64 / 2147483648.0;
-                }
-            }
-        }
-
-        // Clause 4.1.3 STEPs 3-9: the FLAT recursion (eqs. (7)-(13)).
-        let mut f = [[0f64; NP]; NP];
-        let mut b = [[0f64; NP]; NP];
-        let mut c = [[0f64; NP]; NP];
-        for i in 0..NP {
-            for k in 0..NP {
-                f[i][k] = phiw[i][k];
-                b[i][k] = phiw[i + 1][k + 1];
-                c[i][k] = phiw[i][k + 1];
-            }
-        }
-        let mut r_opt = [0f64; NP];
-        for j in 1..=NP {
-            let m = NP - j;
-            let num = c[0][0] + c[m][m];
-            let den = f[0][0] + b[0][0] + f[m][m] + b[m][m];
-            let rj = if den.abs() > 1e-30 {
-                (-2.0 * num / den).clamp(-0.999_99, 0.999_99)
-            } else {
-                0.0
-            };
-            r_opt[j - 1] = rj;
-            if j == NP {
-                break;
-            }
-            let bound = NP - j;
-            let (fp, bp, cp) = (f, b, c);
-            for i in 0..bound {
-                for k in 0..bound {
-                    f[i][k] = fp[i][k] + rj * (cp[i][k] + cp[k][i]) + rj * rj * bp[i][k];
-                    b[i][k] = bp[i + 1][k + 1]
-                        + rj * (cp[i + 1][k + 1] + cp[k + 1][i + 1])
-                        + rj * rj * fp[i + 1][k + 1];
-                    c[i][k] =
-                        cp[i][k + 1] + rj * (bp[i][k + 1] + fp[i][k + 1]) + rj * rj * cp[k + 1][i];
-                }
-            }
-        }
-
-        // Clause 4.1.4.1: autocorrelation sequence R(i) of the
-        // optimal reflection coefficients (unit-energy model), then
-        // the three-segment AFLAT VQ search.
-        let rr = rc_to_autocorr(&r_opt);
-        let (mut lpc1, mut lpc2, mut lpc3, mut rq) = vq_search(&rr);
-        let mut r0 = r0;
+        let fr = self.front.analyse();
+        let (mut r0, mut lpc1, mut lpc2, mut lpc3) = (fr.r0, fr.lpc.0, fr.lpc.1, fr.lpc.2);
+        let mut rq_w = fr.rq;
         if let Some(f) = forced {
             r0 = f.r0;
             lpc1 = f.lpc1;
             lpc2 = f.lpc2;
             lpc3 = f.lpc3;
-            rq = dequant_reflection(lpc1, lpc2, lpc3);
+            rq_w = dequant_reflection_words(lpc1, lpc2, lpc3);
+        }
+        let mut rq = [0f64; NP];
+        for (d, &w) in rq.iter_mut().zip(rq_w.iter()) {
+            *d = w as f64 / 32768.0;
         }
 
         // Clause 4.1.6: the soft-interpolation decision. Build the
@@ -430,6 +301,7 @@ impl HrAnalyzer {
 /// `R(0..=Np)` (`R(0) = 1`), the inverse Levinson recursion clause
 /// 4.1.4.1 presupposes (*"Compute the autocorrelation sequence
 /// R(i), from the optimal reflection coefficients"*).
+#[cfg(test)]
 pub(super) fn rc_to_autocorr(r: &[f64; NP]) -> [f64; NP + 1] {
     // Build each order's direct-form coefficients A_n(z) = 1 + Σ a_k z^-k.
     // Sign pairing: the AFLAT stage recursion (eq. (21)) reduces
@@ -470,106 +342,6 @@ pub(super) fn aflat_stage(p: &mut [f64; NP + 1], v: &mut [f64; 2 * NP - 1], rj: 
             + rj * rj * vat(&pv, -i - 1)
             + 2.0 * rj * pp[(i + 1).unsigned_abs().min(NP)];
     }
-}
-
-/// Clause 4.1.4/4.1.4.1: the three-segment reflection-coefficient
-/// vector quantizer search — prequantizer (best four), then the
-/// four associated VQ subsets — driven by the AFLAT residual `Er`.
-/// Returns the three codes and the quantized reflection set.
-fn vq_search(rr: &[f64; NP + 1]) -> (u16, u16, u8, [f64; NP]) {
-    // Segment layout: stages, tables, sizes.
-    struct Seg {
-        n_coeff: usize,
-        preq: &'static [i16],
-        preq_rows: usize,
-        vq: &'static [i16],
-        subset: usize,
-    }
-    let segs = [
-        Seg {
-            n_coeff: 3,
-            preq: &RC_PREQ_SEG1,
-            preq_rows: 64,
-            vq: &RC_VQ_SEG1,
-            subset: 32,
-        },
-        Seg {
-            n_coeff: 3,
-            preq: &RC_PREQ_SEG2,
-            preq_rows: 32,
-            vq: &RC_VQ_SEG2,
-            subset: 16,
-        },
-        Seg {
-            n_coeff: 4,
-            preq: &RC_PREQ_SEG3,
-            preq_rows: 16,
-            vq: &RC_VQ_SEG3,
-            subset: 16,
-        },
-    ];
-
-    // AFLAT initial conditions (eqs. (15)/(16)).
-    let mut p = [0f64; NP + 1];
-    p.copy_from_slice(rr);
-    // Eq. (16)/(160): V0(i) = R(i+1) over 1-Np <= i <= Np-1 (the
-    // autocorrelation is symmetric, so negative arguments fold).
-    let mut v = [0f64; 2 * NP - 1];
-    for i in (1 - (NP as isize))..(NP as isize) {
-        v[(i + NP as isize - 1) as usize] = rr[(i + 1).unsigned_abs()];
-    }
-
-    let mut codes = [0u16; 3];
-    let mut rq = [0f64; NP];
-    let mut coeff_base = 0usize;
-    for (kseg, seg) in segs.iter().enumerate() {
-        let scalar = |idx: usize| RC_SCALAR_DEQUANT[idx] as f64 / 32768.0;
-        let candidate = |table: &[i16], row: usize| -> [f64; 4] {
-            let mut rs = [0f64; 4];
-            for (c, slot) in rs.iter_mut().take(seg.n_coeff).enumerate() {
-                *slot = scalar(vq_index(table, row * seg.n_coeff + c));
-            }
-            rs
-        };
-        let eval = |rs: &[f64; 4]| -> f64 {
-            let mut ep = p;
-            let mut ev = v;
-            for r in rs.iter().take(seg.n_coeff) {
-                aflat_stage(&mut ep, &mut ev, *r);
-            }
-            ep[0]
-        };
-
-        // Prequantizer pass: keep the four lowest-distortion rows.
-        let mut best4: Vec<(f64, usize)> = Vec::with_capacity(seg.preq_rows);
-        for q in 0..seg.preq_rows {
-            best4.push((eval(&candidate(seg.preq, q)), q));
-        }
-        best4.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        best4.truncate(4);
-
-        // VQ subsets of the four selected prequantizer rows.
-        let mut best = (f64::INFINITY, 0usize);
-        for &(_, q) in &best4 {
-            for row in q * seg.subset..(q + 1) * seg.subset {
-                let er = eval(&candidate(seg.vq, row));
-                if er < best.0 {
-                    best = (er, row);
-                }
-            }
-        }
-        codes[kseg] = best.1 as u16;
-
-        // Advance the lattice through this segment with the chosen
-        // quantized coefficients (steps 11-14, eqs. (24)-(26)).
-        let chosen = candidate(seg.vq, best.1);
-        for (c, r) in chosen.iter().take(seg.n_coeff).enumerate() {
-            rq[coeff_base + c] = *r;
-            aflat_stage(&mut p, &mut v, *r);
-        }
-        coeff_base += seg.n_coeff;
-    }
-    (codes[0], codes[1], codes[2] as u8, rq)
 }
 
 // ─── Clause 4.1.7–4.1.11: the excitation analysis ───
@@ -1158,26 +930,6 @@ mod tests {
             &hf[..6]
         );
         assert!(e_d / e_h < 0.05, "fit rel err {}", e_d / e_h);
-    }
-
-    /// The VQ search is self-consistent: quantizing the exact
-    /// dequantized value of a codebook row recovers reflection
-    /// coefficients close to it (the search minimizes the AFLAT
-    /// residual, so the chosen vector's residual can only be
-    /// lower-or-equal than the seed row's).
-    #[test]
-    fn vq_search_self_consistency() {
-        let seed = dequant_reflection(700, 300, 150);
-        let rr = rc_to_autocorr(&seed);
-        let (l1, l2, l3, rq) = vq_search(&rr);
-        let re = dequant_reflection(l1, l2, l3);
-        assert_eq!(rq, re, "returned set must equal the coded rows");
-        for (a, b) in seed.iter().zip(rq.iter()) {
-            assert!(
-                (a - b).abs() < 0.2,
-                "quantized rc far from seed: {a} vs {b}"
-            );
-        }
     }
 
     /// `rc_to_autocorr` inverts `step_up`-style modeling: running
