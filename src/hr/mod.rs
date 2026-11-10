@@ -48,15 +48,15 @@ pub mod decode;
 pub mod encode;
 mod front;
 pub(crate) mod fx;
-mod lag;
-mod search;
+mod olfx;
+mod subfx;
 pub mod tables;
 
 pub use decode::{
     HR_DECODER_HOMING_WORDS, HR_ENCODER_HOMING_SAMPLE, HrDecoder, hr_decoder_homing_frame,
     is_hr_decoder_homing_frame,
 };
-pub use encode::{FrameAnalysis, HrAnalyzer, HrEncoder, HrForce};
+pub use encode::{FrameAnalysis, HrAnalyzer, HrEncoder, HrForce, HrLagDiag};
 #[doc(hidden)]
 pub use front::{FrontFrame, HrFrontEnd};
 
@@ -77,12 +77,6 @@ pub const HR_SUBFRAME_SAMPLES: usize = 40;
 
 /// Subframes per frame.
 pub const HR_SUBFRAMES: usize = 4;
-
-/// Clause 4.1.5 `Rmax` in the normalised sample domain (13-bit full
-/// scale = 1,0): the square of the maximum sample amplitude, with
-/// the coded signal carried at unity passband gain (see
-/// `encode::HighPass`).
-pub(crate) const R0_RMAX: f64 = 1.0;
 
 /// Number of coded parameters per frame (annex A.1: *"the encoder
 /// derives 18 parameters"* — 6 frame parameters + 12 subframe

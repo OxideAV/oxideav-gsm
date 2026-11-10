@@ -26,6 +26,21 @@ All notable changes to this project will be documented in this file.
   R0 95,6%, LPC 76–81%)**; downstream end-to-end agreement rises with
   it (INT_LPC 91,5 → 97,9%, MODE 91,3 → 92,4%, CODE1 80,8 → 91,0%,
   CODE2 77,0 → 88,7%, voiced CODE 20,3 → 27,3%).
+- GSM 06.20 encoder lag / code / gain searches rebuilt on the
+  fixed-point rules of the staged schedules (§C.1, §C.2): the
+  open-loop search with the linear Pv test, the log2/exp2 threshold,
+  the ±4 peak windows, the narrowed −6..+5 / −5..+6 trajectory
+  windows, the two-anchor rule and the clamped Σ C²/G merit; the
+  closed-loop search with its common shifts; C(z) / H(z) responses;
+  the 16-bit-ratio decorrelation; the Gray-order code search with
+  the complement rule; the χ-biased GSP0 maximisation; the
+  encoder-side local excitation history. INT_LPC interpolation and
+  stability now run on the fixed-point words. End to end vs
+  `SEQ01..03.COD`: MODE 92,4 → 98,9%, lag levels 49,0 → 74,3%
+  (±1 70,1 → 89,9%), voiced CODE 27,3 → 43,6%, unvoiced GSP0
+  79,6 → 91,9%, voiced GSP0 40,2 → 60,0%; GSP0 on the reference
+  codes 96,6% / 90,5%. The floating-point `lag` / `search` modules
+  are retired.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-gsm/compare/v0.0.10...v0.0.11) - 2026-10-23
 

@@ -4,10 +4,13 @@
 //! The front end (high-pass, FLAT, R0, AFLAT VQ) runs in the clause
 //! 5.1 fixed-point arithmetic and reproduces the R0 / LPC1–LPC3
 //! words of every `SEQ01..03.COD` frame exactly
-//! (`hr_front_end_bit_exact`). The later stages still carry
-//! floating-point arithmetic, where quantizer decisions sitting on a
-//! boundary flip under sub-LSB differences and every flip feeds the
-//! long-term filter state the following subframes search against.
+//! (`hr_front_end_bit_exact`). The open-loop / closed-loop lag
+//! searches, the code searches and the `{P0,GS}` search run the
+//! fixed-point rules too, but on weighted speech from the
+//! floating-point clause 4.1.7 weighting filter (whose fixed-point
+//! schedule is not staged), so quantizer decisions near a boundary
+//! still flip and every flip feeds the long-term filter state the
+//! following subframes search against.
 //! What this harness pins for them is the measured per-parameter
 //! agreement rate against `SEQ01..03.COD`, twice over:
 //!
@@ -202,10 +205,11 @@ fn report(name: &str, r: &Rates) {
 }
 
 /// End to end: every decision the encoder's own. Measured with the
-/// fixed-point front end: R0 / LPC1–3 100%, INT_LPC 97,9%, MODE
-/// 92,4%, LAG_1 49,9%, lag levels 49,0% (±1 70,1%), CODE1 91,0%,
-/// CODE2 88,7%, voiced CODE 27,3%, unvoiced GSP0 79,6%, voiced GSP0
-/// 40,2%.
+/// fixed-point front end and fixed-point lag / code / gain searches
+/// (on floating-point weighted speech): R0 / LPC1–3 100%, INT_LPC
+/// 98,3%, MODE 98,9%, LAG_1 74,5%, lag levels 74,3% (±1 89,9%),
+/// CODE1 93,1%, CODE2 91,1%, voiced CODE 43,6%, unvoiced GSP0 91,9%,
+/// voiced GSP0 60,0%.
 #[test]
 fn hr_encoder_end_to_end_vs_etsi_cod_references() {
     if !corpus_present() {
@@ -219,15 +223,16 @@ fn hr_encoder_end_to_end_vs_etsi_cod_references() {
         ("lpc1", 100.0),
         ("lpc2", 100.0),
         ("lpc3", 100.0),
-        ("int_lpc", 95.0),
-        ("mode", 88.0),
-        ("lag1", 44.0),
-        ("lag_level_pm1", 64.0),
-        ("code1", 85.0),
-        ("code2", 82.0),
-        ("code9", 22.0),
-        ("gsp0_u", 74.0),
-        ("gsp0_v", 34.0),
+        ("int_lpc", 97.5),
+        ("mode", 98.0),
+        ("lag1", 72.0),
+        ("lag_level", 72.0),
+        ("lag_level_pm1", 88.0),
+        ("code1", 91.0),
+        ("code2", 89.0),
+        ("code9", 41.0),
+        ("gsp0_u", 90.0),
+        ("gsp0_v", 58.0),
     ];
     for (k, floor) in floors {
         assert!(
@@ -239,7 +244,7 @@ fn hr_encoder_end_to_end_vs_etsi_cod_references() {
 }
 
 /// Lag search + MODE on the reference's frame parameters (measured
-/// MODE 92,4%, lag levels ±1 70,0%).
+/// MODE 99,0%, lag levels ±1 90,1%).
 #[test]
 fn hr_lag_search_on_reference_frame_parameters() {
     if !corpus_present() {
@@ -247,16 +252,16 @@ fn hr_lag_search_on_reference_frame_parameters() {
     }
     let r = run(Stage::FrameForced);
     report("frame forced", &r);
-    assert!(r.pct("mode") >= 86.0, "mode {:.1}%", r.pct("mode"));
+    assert!(r.pct("mode") >= 98.0, "mode {:.1}%", r.pct("mode"));
     assert!(
-        r.pct("lag_level_pm1") >= 62.0,
+        r.pct("lag_level_pm1") >= 88.0,
         "lag_level_pm1 {:.1}%",
         r.pct("lag_level_pm1")
     );
 }
 
 /// VSELP code searches on the reference's lags (measured CODE1
-/// 91,4%, CODE2 88,4%, voiced CODE 41,1%).
+/// 93,6%, CODE2 91,7%, voiced CODE 51,5%).
 #[test]
 fn hr_code_search_on_reference_lags() {
     if !corpus_present() {
@@ -264,13 +269,13 @@ fn hr_code_search_on_reference_lags() {
     }
     let r = run(Stage::LagsForced);
     report("lags forced", &r);
-    assert!(r.pct("code1") >= 84.0, "code1 {:.1}%", r.pct("code1"));
-    assert!(r.pct("code2") >= 80.0, "code2 {:.1}%", r.pct("code2"));
-    assert!(r.pct("code9") >= 34.0, "code9 {:.1}%", r.pct("code9"));
+    assert!(r.pct("code1") >= 92.0, "code1 {:.1}%", r.pct("code1"));
+    assert!(r.pct("code2") >= 90.0, "code2 {:.1}%", r.pct("code2"));
+    assert!(r.pct("code9") >= 50.0, "code9 {:.1}%", r.pct("code9"));
 }
 
 /// {P0,GS} quantizer on the reference's codes (measured unvoiced
-/// 82,2%, voiced 68,7%).
+/// 96,6%, voiced 90,5%).
 #[test]
 fn hr_gain_quantizer_on_reference_codes() {
     if !corpus_present() {
@@ -278,8 +283,8 @@ fn hr_gain_quantizer_on_reference_codes() {
     }
     let r = run(Stage::CodesForced);
     report("codes forced", &r);
-    assert!(r.pct("gsp0_u") >= 74.0, "gsp0_u {:.1}%", r.pct("gsp0_u"));
-    assert!(r.pct("gsp0_v") >= 60.0, "gsp0_v {:.1}%", r.pct("gsp0_v"));
+    assert!(r.pct("gsp0_u") >= 95.0, "gsp0_u {:.1}%", r.pct("gsp0_u"));
+    assert!(r.pct("gsp0_v") >= 89.0, "gsp0_v {:.1}%", r.pct("gsp0_v"));
 }
 
 /// The fixed-point front end (clauses 4.1.1–4.1.5) reproduces the

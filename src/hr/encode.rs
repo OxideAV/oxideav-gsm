@@ -7,10 +7,10 @@
 //! on top of it, the complete per-subframe excitation analysis
 //! ([`HrEncoder`]): the spectral noise weighting filter (4.1.7),
 //! the open-loop lag search / trajectory / voicing mode
-//! ([`super::lag`], 4.1.8.1–4.1.8.4), the closed-loop lag search
+//! (`super::olfx`, 4.1.8.1–4.1.8.4), the closed-loop lag search
 //! (4.1.8.5), harmonic noise weighting (4.1.9), the VSELP code
-//! searches (4.1.10, [`super::search`]) and the multimode `{P0,GS}`
-//! gain quantization (4.1.11), plus the clause 5.3 encoder homing.
+//! searches (4.1.10) and the multimode `{P0,GS}` gain quantization
+//! (4.1.11) (`super::subfx`), plus the clause 5.3 encoder homing.
 //!
 //! ## Segmentation (clause 4.1.2)
 //!
@@ -31,12 +31,20 @@
 //! clause 5.1 fixed-point arithmetic (`super::front`, the staged
 //! `halfrate-traces/hr-fixed-point-schedules.md` Part B) and
 //! reproduces the R0 / LPC words of every `SEQ01..03.COD` frame.
-//! The later stages (INT_LPC decision, weighting, lag / code / gain
-//! searches) implement the printed equations in double precision on
-//! the fixed-point front end's output; their measured
-//! per-parameter agreement is pinned by
+//! The open-loop lag search, trajectory and voicing mode
+//! (`super::olfx`, §C.1 rules 1–20), the closed-loop lag search,
+//! C(z), H(z) responses, decorrelation, the VSELP code searches, the
+//! `{P0,GS}` search and the encoder's local excitation
+//! (`super::subfx`, §C.1 rules 21–24 and §C.2) are fixed-point too.
+//! Two stages remain floating point because their fixed-point
+//! schedules are not staged: the clause 4.1.6 residual-energy
+//! comparison behind INT_LPC (on the exact fixed-point coefficient
+//! words and stability checks) and the clause 4.1.7 spectral noise
+//! weighting coefficients / weighted speech `y(n)` (rounded to
+//! 16-bit words at the high-pass output scale before the searches).
+//! The measured per-parameter agreement is pinned by
 //! `tests/conformance_hr_encode_params.rs`.
-//!
+
 //! ## Readings pinned from the printed clause
 //!
 //! * clause 4.1.1: each biquad's sum is doubled (the effective
@@ -51,12 +59,21 @@
 //!   filters.
 
 use super::decode::{
-    HR_ENCODER_HOMING_SAMPLE, adaptive_codebook, decode_r0, dequant_reflection_words, frac_delay_6,
-    hr_decoder_homing_frame, step_down, step_up,
+    HR_ENCODER_HOMING_SAMPLE, adaptive_codebook_words, codevector_words, dequant_reflection_words,
+    hr_decoder_homing_frame, interp_words, rs_estimate, scale_vector, shift_append_words,
+    step_down_words, step_up, step_up_words,
 };
 use super::front::FrontEnd;
-use super::lag::{OpenLoop, Y_HIST, open_loop_search};
-use super::search::{GainInputs, code_search, decorrelate, gain_search};
+use super::olfx::{OL_HIST, OpenLoopState, open_loop_fx};
+
+/// Weighted-speech history kept in front of a frame (the open-loop
+/// search's deepest correlation tap, n = −145).
+const Y_HIST: usize = OL_HIST;
+use super::fx::{add, shr, sub};
+use super::subfx::{
+    GspInputs, HIST as SUB_HIST, closed_loop, code_search_fx, combine, cz, decorrelate_fx,
+    gsp0_search, hz_filter, hz_zir, hz_zsr, rho_plain, target_shift,
+};
 use super::tables::*;
 use super::{HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, SubframeParams};
 
@@ -101,6 +118,8 @@ pub struct FrameSets {
     /// The current frame's quantized reflection coefficients and
     /// direct-form set.
     pub refl_q: [f64; NP],
+    /// The same reflection coefficients as Q15 words.
+    pub refl_w: [i16; NP],
     pub alpha_cur: [f64; NP],
     /// The per-subframe direct-form sets and their provenance.
     pub sub_alpha: [[f64; NP]; HR_SUBFRAMES],
@@ -122,6 +141,7 @@ pub struct HrAnalyzer {
     /// Previous frame's quantized direct-form set + INT_LPC state
     /// (clause 4.1.6).
     prev_alpha: [f64; NP],
+    prev_a_w: [i16; NP],
 }
 
 impl Default for HrAnalyzer {
@@ -138,6 +158,7 @@ impl HrAnalyzer {
             buf: [0.0; BUF],
             pre: [0.0; NP],
             prev_alpha: [0.0; NP],
+            prev_a_w: [0; NP],
         }
     }
 
@@ -223,7 +244,16 @@ impl HrAnalyzer {
         // previous and current quantized coefficients, inverse
         // filter the coded frame s(0..160), and pick the lower
         // residual energy (ties go to uninterpolated).
-        let alpha_cur = step_up(&rq);
+        // The coefficient sets are the Q11 direct-form words of the
+        // fixed-point step-up (with the saturation fallback), and the
+        // interpolated sets the `mac_r` interpolation of those words
+        // with the fixed-point stability check (schedules §A.1/§A.3).
+        let (mut a_cur_w, flagged) = step_up_words(&rq_w);
+        if flagged {
+            a_cur_w = self.prev_a_w;
+        }
+        let to_alpha = |w: &[i16; NP]| w.map(|v| -(v as f64) / 2048.0);
+        let alpha_cur = to_alpha(&a_cur_w);
         let mut int_sets = [[0f64; NP]; HR_SUBFRAMES];
         let mut int_src = [CoefSource::Current; HR_SUBFRAMES];
         let mut flat_sets = [[0f64; NP]; HR_SUBFRAMES];
@@ -234,13 +264,9 @@ impl HrAnalyzer {
             let (a_int, src) = if sf == HR_SUBFRAMES - 1 {
                 (alpha_cur, CoefSource::Current)
             } else {
-                let del = SOFT_INTERP_CURRENT[sf] as f64 / 32768.0;
-                let mut a = [0f64; NP];
-                for i in 0..NP {
-                    a[i] = self.prev_alpha[i] + del * (alpha_cur[i] - self.prev_alpha[i]);
-                }
-                if step_down(&a).is_some() {
-                    (a, CoefSource::Interpolated)
+                let aw = interp_words(&a_cur_w, &self.prev_a_w, sf);
+                if !step_down_words(&aw).1 {
+                    (to_alpha(&aw), CoefSource::Interpolated)
                 } else if sf == 0 {
                     (self.prev_alpha, CoefSource::Previous)
                 } else {
@@ -281,6 +307,7 @@ impl HrAnalyzer {
         };
 
         self.prev_alpha = alpha_cur;
+        self.prev_a_w = a_cur_w;
         FrameSets {
             codes: FrameAnalysis {
                 r0,
@@ -290,6 +317,7 @@ impl HrAnalyzer {
                 int_lpc,
             },
             refl_q: rq,
+            refl_w: rq_w,
             alpha_cur,
             sub_alpha,
             sub_src,
@@ -348,10 +376,6 @@ pub(super) fn aflat_stage(p: &mut [f64; NP + 1], v: &mut [f64; 2 * NP - 1], rj: 
 
 /// Samples per subframe (annex A.2 `Ns`).
 const NS: usize = HR_SUBFRAME_SAMPLES;
-
-/// Long-term filter history length (clause 4.1.8.5: the deepest
-/// interpolator tap for `Lmax` reaches 147 samples back).
-const HIST: usize = 147;
 
 /// Clause 4.1.7: the spectral noise weighting coefficients `α̃_i`
 /// for one direct-form set `α`: the zero-state response `h3(n)` of
@@ -413,6 +437,7 @@ fn weighting_coefficients(alpha: &[f64; NP]) -> [f64; NP] {
 
 /// Zero-state response of the all-pole filter `1/(1 − Σ a_i z⁻ⁱ)`
 /// to `x` over one subframe.
+#[cfg(test)]
 fn zsr_allpole(a: &[f64; NP], x: &[f64; NS]) -> [f64; NS] {
     let mut y = [0f64; NS];
     for n in 0..NS {
@@ -423,54 +448,6 @@ fn zsr_allpole(a: &[f64; NP], x: &[f64; NS]) -> [f64; NS] {
         y[n] = acc;
     }
     y
-}
-
-/// Zero-input response of the same filter from its memory
-/// (`mem[i]` = output at `n − 1 − i`).
-fn zir_allpole(a: &[f64; NP], mem: &[f64; NP]) -> [f64; NS] {
-    let mut y = [0f64; NS];
-    for n in 0..NS {
-        let mut acc = 0.0;
-        for i in 0..NP {
-            let past = if n > i { y[n - 1 - i] } else { mem[i - n] };
-            acc += a[i] * past;
-        }
-        y[n] = acc;
-    }
-    y
-}
-
-/// Clause 4.1.9 eqs. (106)/(107): apply `C(z) = 1 − λ z^{−L_pitch}`
-/// to `cur` (history `hist` for `n < 0`; zero history for a
-/// zero-state response).
-fn harmonic_weight(hist: &[f64], cur: &[f64; NS], lambda: f64, lpitch: i32) -> [f64; NS] {
-    if lambda == 0.0 {
-        return *cur;
-    }
-    let mut out = [0f64; NS];
-    for n in 0..NS {
-        out[n] = cur[n] - lambda * frac_delay_6(hist, cur, n as isize, lpitch);
-    }
-    out
-}
-
-/// Clause 4.1.10 eq. (108): the (unweighted) VSELP codevector for
-/// a codeword, in the codebook's raw ROM units.
-fn codevector(basis: &[[i16; 40]], codeword: u16) -> [f64; NS] {
-    let mut u = [0f64; NS];
-    for (m, v) in basis.iter().enumerate() {
-        let sign = if (codeword >> m) & 1 == 1 { 1.0 } else { -1.0 };
-        for (n, &s) in v.iter().enumerate() {
-            u[n] += sign * s as f64;
-        }
-    }
-    u
-}
-
-/// Shift a history buffer left by one subframe and append `new`.
-fn shift_append(hist: &mut [f64; HIST], new: &[f64; NS]) {
-    hist.copy_within(NS.., 0);
-    hist[HIST - NS..].copy_from_slice(new);
 }
 
 /// Diagnostics: reference values to substitute at each stage of
@@ -497,20 +474,39 @@ pub struct HrEncoder {
     /// Previous frame's spectral-noise-weighting set `α̃` (clause
     /// 4.1.7 interpolation mirror).
     prev_wa: [f64; NP],
-    /// Previous frame's decoded energy and quantized reflection set
-    /// (eqs. (131a)/(132)).
-    prev_r0q: f64,
-    prev_refl: [f64; NP],
+    /// Previous frame's quantized reflection words, direct-form words
+    /// and R0 amplitude word (eqs. (131a)/(132)).
+    prev_refl_w: [i16; NP],
+    prev_a_w: [i16; NP],
+    prev_amp: i16,
     /// Weighting filter `W(z)` all-pole memory (past `y`) and the
     /// weighted-speech history in front of the frame.
     w_mem: [f64; NP],
     y_hist: [f64; Y_HIST],
-    /// `H(z)` memory (past weighted synthetic excitation) and its
-    /// history for the harmonic-weighting zero-input response.
-    h_mem: [f64; NP],
-    h_hist: [f64; HIST],
-    /// Long-term filter state `r(n)` (clause 4.2.5 mirror).
-    ltp_hist: [f64; HIST],
+    /// `H(z)` memory (past weighted synthetic excitation, words) and
+    /// its history for the harmonic-weighting zero-input response.
+    h_mem_w: [i16; NP],
+    h_hist_w: [i16; SUB_HIST],
+    /// Long-term filter state `r(n)` (encoder-side local excitation).
+    ltp_w: [i16; SUB_HIST],
+    /// Open-loop search state (previous frame's subframe energies)
+    /// and the previous frame's R0 code.
+    ol_state: OpenLoopState,
+    prev_r0: u8,
+    /// Diagnostics: the last frame's open-loop trajectory / Lpitch
+    /// (1/6 units) and closed-loop lags.
+    last_lags: HrLagDiag,
+}
+
+/// Diagnostics of the last encoded frame's lag decisions (1/6-sample
+/// units; 0 when unvoiced).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HrLagDiag {
+    pub mode: u8,
+    pub traj6: [i32; HR_SUBFRAMES],
+    pub pitch6: [i32; HR_SUBFRAMES],
+    pub cl6: [i32; HR_SUBFRAMES],
 }
 
 impl Default for HrEncoder {
@@ -525,19 +521,29 @@ impl HrEncoder {
         Self {
             an: HrAnalyzer::new(),
             prev_wa: [0.0; NP],
-            prev_r0q: 0.0,
-            prev_refl: [0.0; NP],
+            ol_state: OpenLoopState::default(),
+            prev_r0: 0,
+            last_lags: HrLagDiag::default(),
+            prev_refl_w: [0; NP],
+            prev_a_w: [0; NP],
+            prev_amp: 0,
             w_mem: [0.0; NP],
             y_hist: [0.0; Y_HIST],
-            h_mem: [0.0; NP],
-            h_hist: [0.0; HIST],
-            ltp_hist: [0.0; HIST],
+            h_mem_w: [0; NP],
+            h_hist_w: [0; SUB_HIST],
+            ltp_w: [0; SUB_HIST],
         }
     }
 
     /// Reset to the home state (clause 5.3 step 2).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    /// Diagnostics: the last frame's lag decisions.
+    #[doc(hidden)]
+    pub fn last_lags(&self) -> HrLagDiag {
+        self.last_lags
     }
 
     /// Encode one 160-sample input frame (13-bit left-justified
@@ -621,17 +627,59 @@ impl HrEncoder {
             }
         }
 
+        if std::env::var("HRDBG").is_ok() {
+            let mut e = [0f64; 4];
+            for sf in 0..4 {
+                for n in 0..NS {
+                    let w = y_all[Y_HIST + sf * NS + n] * 16384.0;
+                    e[sf] += w * w;
+                }
+            }
+            eprintln!("YDBG sumsq(words@16384) {:?}", e);
+        }
         // Clauses 4.1.8.1-4.1.8.4.
-        let mut ol: OpenLoop = open_loop_search(&y_all);
+        let mut yw = [0i16; OL_HIST + HR_FRAME_SAMPLES];
+        for (d, &v) in yw.iter_mut().zip(y_all.iter()) {
+            *d = (v * 16384.0).round().clamp(-32768.0, 32767.0) as i16;
+        }
+        let olf = open_loop_fx(&yw, &mut self.ol_state, self.prev_r0, codes.r0);
+        let (mut mode, mut ol_levels) = (olf.mode, olf.levels);
         let forced_lags = force.lags.is_some();
         if let Some((m, lv)) = force.lags {
-            ol.mode = m;
-            ol.levels = lv;
+            mode = m;
+            ol_levels = lv;
         }
-        let mode = ol.mode;
 
-        // Eq. (132) energy estimate inputs.
-        let r0q_cur = decode_r0(codes.r0);
+        // sqrt(RS) per subframe (eqs. (131)/(132), the decoder's
+        // schedule §A.3 on the quantised words).
+        let refl_w = sets.refl_w;
+        let amp = R0_DECODE_TABLE[2 * (codes.r0 as usize & 31)];
+        let (mut a_cur_w, flagged) = step_up_words(&refl_w);
+        let mut refl_eff = refl_w;
+        if flagged {
+            a_cur_w = self.prev_a_w;
+            refl_eff = self.prev_refl_w;
+        }
+        let rs_cur = rs_estimate(&refl_eff, amp);
+        let rs_prev = rs_estimate(&self.prev_refl_w, self.prev_amp);
+        let mut sub_rs = [rs_cur; HR_SUBFRAMES];
+        for k in 0..HR_SUBFRAMES - 1 {
+            sub_rs[k] = if codes.int_lpc {
+                let ai = interp_words(&a_cur_w, &self.prev_a_w, k);
+                let (rk, unstable) = step_down_words(&ai);
+                if !unstable {
+                    rs_estimate(&rk, if k == 0 { self.prev_amp } else { amp })
+                } else if k == 0 {
+                    rs_prev
+                } else {
+                    rs_cur
+                }
+            } else if k == 0 {
+                rs_prev
+            } else {
+                rs_cur
+            };
+        }
 
         let mut lag_levels = [0usize; HR_SUBFRAMES];
         let mut code1 = [0u8; HR_SUBFRAMES];
@@ -640,219 +688,129 @@ impl HrEncoder {
         let mut gsp0 = [0u8; HR_SUBFRAMES];
 
         for sf in 0..HR_SUBFRAMES {
-            let wa = &sub_wa[sf];
-            let mut y_sf = [0f64; NS];
-            y_sf.copy_from_slice(&y_all[Y_HIST + sf * NS..Y_HIST + (sf + 1) * NS]);
-            let y_before = &y_all[..Y_HIST + sf * NS];
-            let zir = zir_allpole(wa, &self.h_mem);
-
-            let (r0q_eff, refl_eff) = if sf == 0 {
-                (self.prev_r0q, &self.prev_refl)
-            } else {
-                (r0q_cur, &sets.refl_q)
-            };
-            let mut rs = NS as f64 * r0q_eff;
-            for r in refl_eff.iter() {
-                rs *= 1.0 - r * r;
+            // Q11 H(z) words of the subframe's weighting set.
+            let aw: [i16; NP] =
+                sub_wa[sf].map(|v| (-v * 2048.0).round().clamp(-32768.0, 32767.0) as i16);
+            let ys = OL_HIST + sf * NS;
+            let mut y_sf = [0i16; NS];
+            y_sf.copy_from_slice(&yw[ys..ys + NS]);
+            let zir = hz_zir(&aw, &self.h_mem_w);
+            let mut p = [0i16; NS];
+            for n in 0..NS {
+                p[n] = sub(y_sf[n], zir[n]);
             }
+            let s = target_shift(&p);
+            let ps = p.map(|v| shr(v, s));
 
             let (c0, c1, w0, w1, target);
             if mode == 0 {
-                // Target p(n) = W(z)s − ZIR of H(z).
-                let mut p = [0f64; NS];
-                for n in 0..NS {
-                    p[n] = y_sf[n] - zir[n];
-                }
-                // First VSELP codebook.
-                let mut q1: Vec<[f64; NS]> = BASIS_VECTORS_MODE0[0]
+                let q1: Vec<[i16; NS]> = BASIS_VECTORS_MODE0[0]
                     .iter()
-                    .map(|v| {
-                        let mut x = [0f64; NS];
-                        for (n, &s) in v.iter().enumerate() {
-                            x[n] = s as f64;
-                        }
-                        zsr_allpole(wa, &x)
-                    })
+                    .map(|v| hz_zsr(&aw, v))
                     .collect();
-                let mut i_code = code_search(&q1, &p);
+                let mut i_code = code_search_fx(&q1, &ps);
                 if let Some(c) = force.codes {
-                    i_code = c[sf];
+                    i_code = c[sf] & 0x7f;
                 }
-                let f_i = {
-                    let mut f = [0f64; NS];
-                    for (m, qm) in q1.iter().enumerate() {
-                        let sg = if (i_code >> m) & 1 == 1 { 1.0 } else { -1.0 };
-                        for n in 0..NS {
-                            f[n] += sg * qm[n];
-                        }
-                    }
-                    f
-                };
-                // Second codebook, decorrelated against f_I.
-                let mut q2: Vec<[f64; NS]> = BASIS_VECTORS_MODE0[1]
+                let b = combine(&q1, i_code);
+                let mut q2: Vec<[i16; NS]> = BASIS_VECTORS_MODE0[1]
                     .iter()
-                    .map(|v| {
-                        let mut x = [0f64; NS];
-                        for (n, &s) in v.iter().enumerate() {
-                            x[n] = s as f64;
-                        }
-                        zsr_allpole(wa, &x)
-                    })
+                    .map(|v| hz_zsr(&aw, v))
                     .collect();
-                let q2_raw = q2.clone();
-                decorrelate(&mut q2, &f_i);
-                let mut h_code = code_search(&q2, &p);
+                decorrelate_fx(&mut q2, &b);
+                let mut h_code = code_search_fx(&q2, &ps);
                 if let Some(c) = force.codes2 {
-                    h_code = c[sf];
+                    h_code = c[sf] & 0x7f;
                 }
-                let f_h = {
-                    let mut f = [0f64; NS];
-                    for (m, qm) in q2_raw.iter().enumerate() {
-                        let sg = if (h_code >> m) & 1 == 1 { 1.0 } else { -1.0 };
-                        for n in 0..NS {
-                            f[n] += sg * qm[n];
-                        }
-                    }
-                    f
-                };
-                q1.clear();
                 code1[sf] = i_code as u8;
                 code2[sf] = h_code as u8;
-                c0 = codevector(&BASIS_VECTORS_MODE0[0], i_code);
-                c1 = codevector(&BASIS_VECTORS_MODE0[1], h_code);
-                w0 = f_i;
-                w1 = f_h;
-                target = p;
+                c0 = codevector_words(&BASIS_VECTORS_MODE0[0], i_code);
+                c1 = codevector_words(&BASIS_VECTORS_MODE0[1], h_code);
+                w0 = hz_zsr(&aw, &c0);
+                w1 = hz_zsr(&aw, &c1);
+                target = ps;
             } else {
-                // Clause 4.1.8.5: closed-loop lag search over the
-                // three levels around the trajectory lag (two at the
-                // table ends), restricted to what the annex A.1.4
-                // delta code can carry.
-                let mut p = [0f64; NS];
+                // Clause 4.1.8.5 (rules 21-24).
+                let cl = closed_loop(&self.ltp_w, &aw, ol_levels[sf], &ps, forced_lags);
+                lag_levels[sf] = cl.level;
+                // Clause 4.1.9: C(z) on the target, the ZIR and the
+                // filtered vectors.
+                let (lp6, hnw) = (olf.lpitch6[sf], olf.hnw[sf]);
+                let yc = cz(&y_sf, Some(&yw[..ys]), lp6, hnw);
+                let zc = cz(&zir, Some(&self.h_hist_w[..]), lp6, hnw);
+                let mut pc = [0i16; NS];
                 for n in 0..NS {
-                    p[n] = y_sf[n] - zir[n];
+                    pc[n] = shr(sub(yc[n], zc[n]), s);
                 }
-                let centre = ol.levels[sf] as i32;
-                let mut best: Option<(f64, usize, [f64; NS], [f64; NS])> = None;
-                for cand in centre - 1..=centre + 1 {
-                    if !(0..LAG_TABLE.len() as i32).contains(&cand) {
-                        continue;
-                    }
-                    if forced_lags && cand != centre {
-                        continue;
-                    }
-                    if sf > 0 && !forced_lags {
-                        let d = cand - lag_levels[sf - 1] as i32;
-                        if !(-8..=7).contains(&d) {
-                            continue;
-                        }
-                    }
-                    let b_l = adaptive_codebook(&self.ltp_hist, LAG_TABLE[cand as usize] as i32);
-                    let b_w = zsr_allpole(wa, &b_l);
-                    let c: f64 = b_w.iter().zip(p.iter()).map(|(a, b)| a * b).sum();
-                    let g: f64 = b_w.iter().map(|v| v * v).sum();
-                    let score = if g > 0.0 {
-                        c / g.sqrt()
-                    } else {
-                        f64::NEG_INFINITY
-                    };
-                    if best.as_ref().is_none_or(|(b, ..)| score > *b) {
-                        best = Some((score, cand as usize, b_l, b_w));
-                    }
-                }
-                let (_, level, b_l, b_w) =
-                    best.expect("at least the trajectory lag is a candidate");
-                lag_levels[sf] = level;
-
-                // Clause 4.1.9: harmonic noise weighting on the
-                // target, the ZIR and every filtered vector.
-                let lambda = ol.lambda[sf];
-                let lpitch = ol.lpitch[sf];
-                let yc = harmonic_weight(y_before, &y_sf, lambda, lpitch);
-                let zir_c = harmonic_weight(&self.h_hist, &zir, lambda, lpitch);
-                let mut pc = [0f64; NS];
-                for n in 0..NS {
-                    pc[n] = yc[n] - zir_c[n];
-                }
-                let zero_hist = [0f64; NS];
-                let b_wc = harmonic_weight(&zero_hist, &b_w, lambda, lpitch);
-                let q_raw: Vec<[f64; NS]> = BASIS_VECTORS_MODE123
+                let b_full = adaptive_codebook_words(&self.ltp_w, LAG_TABLE[cl.level]);
+                let bw = cz(&hz_zsr(&aw, &b_full), None, lp6, hnw).map(|v| shr(v, cl.t));
+                let mut q: Vec<[i16; NS]> = BASIS_VECTORS_MODE123
                     .iter()
-                    .map(|v| {
-                        let mut x = [0f64; NS];
-                        for (n, &s) in v.iter().enumerate() {
-                            x[n] = s as f64;
-                        }
-                        harmonic_weight(&zero_hist, &zsr_allpole(wa, &x), lambda, lpitch)
-                    })
+                    .map(|v| cz(&hz_zsr(&aw, v), None, lp6, hnw))
                     .collect();
-                let mut q = q_raw.clone();
-                decorrelate(&mut q, &b_wc);
-                let mut code = code_search(&q, &pc);
+                decorrelate_fx(&mut q, &bw);
+                let mut code = code_search_fx(&q, &pc);
                 if let Some(c) = force.codes {
-                    code = c[sf];
+                    code = c[sf] & 0x1ff;
                 }
-                let f_i = {
-                    let mut f = [0f64; NS];
-                    for (m, qm) in q_raw.iter().enumerate() {
-                        let sg = if (code >> m) & 1 == 1 { 1.0 } else { -1.0 };
-                        for n in 0..NS {
-                            f[n] += sg * qm[n];
-                        }
-                    }
-                    f
-                };
                 vcode[sf] = code;
-                c0 = b_l;
-                c1 = codevector(&BASIS_VECTORS_MODE123, code);
-                w0 = b_wc;
-                w1 = f_i;
+                c0 = cl.b;
+                c1 = codevector_words(&BASIS_VECTORS_MODE123, code);
+                w0 = bw;
+                w1 = cz(&hz_zsr(&aw, &c1), None, lp6, hnw);
                 target = pc;
             }
 
-            // Clause 4.1.11: joint gain quantization.
-            let mut gc = gain_search(
+            // Clause 4.1.11.1.
+            let mut g = gsp0_search(
                 mode,
-                &GainInputs {
+                &GspInputs {
                     p: &target,
                     c0: &c0,
                     c1: &c1,
                     w0: &w0,
                     w1: &w1,
-                    rs,
+                    s,
+                    sqrt_rs: sub_rs[sf],
                 },
             );
-            if let Some(g) = force.gsp0 {
-                gc = super::search::gain_from_code(mode, g[sf], &c0, &c1, rs);
+            if let Some(gf) = force.gsp0 {
+                g = gf[sf] & 31;
             }
-            gsp0[sf] = gc.code;
+            gsp0[sf] = g;
 
-            // Reconstruct the excitation exactly as the decoder does
-            // (eq. (127)) and advance the states: long-term filter
-            // (clause 4.2.5) and the weighted synthetic excitation
-            // through H(z) with its memory.
-            let mut ex = [0f64; NS];
+            // Local excitation (encoder-side rule: plain-energy ρ on
+            // the shifted LTP vector) and state updates.
+            let row = &GSP0_VQ[mode as usize][g as usize];
+            let (y0, _) = scale_vector(&c0, row[0], rho_plain(&c0, sub_rs[sf]));
+            let (y1, _) = scale_vector(&c1, row[1], rho_plain(&c1, sub_rs[sf]));
+            let mut ex = [0i16; NS];
             for n in 0..NS {
-                ex[n] = gc.beta * c0[n] + gc.gamma * c1[n];
+                ex[n] = add(y0[n], y1[n]);
             }
-            shift_append(&mut self.ltp_hist, &ex);
-            let hx = zsr_allpole(wa, &ex);
-            let mut h_out = [0f64; NS];
-            for n in 0..NS {
-                h_out[n] = zir[n] + hx[n];
-            }
-            for i in 0..NP {
-                self.h_mem[i] = h_out[NS - 1 - i];
-            }
-            shift_append(&mut self.h_hist, &h_out);
+            shift_append_words(&mut self.ltp_w, &ex);
+            let h_out = hz_filter(&aw, &ex, &mut self.h_mem_w);
+            shift_append_words(&mut self.h_hist_w, &h_out);
         }
 
         // Frame-level state.
         self.y_hist
             .copy_from_slice(&y_all[HR_FRAME_SAMPLES..HR_FRAME_SAMPLES + Y_HIST]);
         self.prev_wa = wa_cur;
-        self.prev_r0q = r0q_cur;
-        self.prev_refl = sets.refl_q;
+        self.prev_r0 = codes.r0;
+        self.prev_refl_w = refl_eff;
+        self.prev_a_w = a_cur_w;
+        self.prev_amp = amp;
+        self.last_lags = if mode == 0 {
+            HrLagDiag::default()
+        } else {
+            HrLagDiag {
+                mode,
+                traj6: olf.levels.map(|l| LAG_TABLE[l] as i32),
+                pitch6: olf.lpitch6,
+                cl6: lag_levels.map(|l| LAG_TABLE[l] as i32),
+            }
+        };
 
         let sub = if mode == 0 {
             SubframeParams::Unvoiced { code1, code2, gsp0 }

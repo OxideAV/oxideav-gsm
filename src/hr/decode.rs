@@ -38,16 +38,14 @@
 //! * the postfilter AGC word starts from 0 after a reset and only its
 //!   16-bit word survives a subframe boundary.
 //!
-//! The `f64` helpers that precede the decoder (`step_up`,
-//! `adaptive_codebook`, …) serve the floating-point encoder stages.
+//! The `f64` helpers `step_up` / `step_down` serve the encoder's
+//! remaining floating-point stages (INT_LPC decision, weighting).
 
 #![allow(clippy::needless_range_loop)]
 
 use super::fx::*;
 use super::tables::*;
-use super::{
-    HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, R0_RMAX, SubframeParams,
-};
+use super::{HR_FRAME_SAMPLES, HR_SUBFRAME_SAMPLES, HR_SUBFRAMES, HrParameters, SubframeParams};
 
 /// Short-term predictor order (annex A.2 `Np`).
 const NP: usize = 10;
@@ -136,114 +134,6 @@ pub(super) fn step_up(r: &[f64; NP]) -> [f64; NP] {
         alpha[i] = -a[i];
     }
     alpha
-}
-
-/// Direct-form → reflection coefficients (step-down), used for the
-/// clause 4.1.6 stability check of interpolated coefficient sets.
-/// Returns `None` when any |r_j| ≥ 1 (unstable filter).
-pub(super) fn step_down(alpha: &[f64; NP]) -> Option<[f64; NP]> {
-    let mut a = [0f64; NP];
-    for i in 0..NP {
-        a[i] = -alpha[i];
-    }
-    let mut r = [0f64; NP];
-    for j in (0..NP).rev() {
-        let k = a[j];
-        // NaN (a degenerate interpolated set) is treated as
-        // unstable, like any |r| >= 1.
-        if !k.is_finite() || k.abs() >= 0.999_999 {
-            return None;
-        }
-        r[j] = k;
-        let denom = 1.0 - k * k;
-        let prev = a;
-        for i in 0..j {
-            a[i] = (prev[i] - k * prev[j - 1 - i]) / denom;
-        }
-    }
-    Some(r)
-}
-
-/// Clause 4.1.5 eq. (30): decode the 5-bit R0 code into the average
-/// signal power `R(0)_q = Rmax · 10^((2·R0 − 66)/10)` with `Rmax`
-/// the square of the high-pass filtered signal's maximum amplitude
-/// ([`R0_RMAX`] in the normalised sample domain). Code 0 is the
-/// −66 dB floor; the home state treats it as silence.
-#[inline]
-pub(super) fn decode_r0(r0: u8) -> f64 {
-    if r0 == 0 {
-        return 0.0;
-    }
-    R0_RMAX * 10f64.powf((2.0 * r0 as f64 - 66.0) / 10.0)
-}
-
-// ─── Fractional-lag interpolation ───
-
-/// Clause 4.1.8.5 eqs. (100)/(101): the adaptive-codebook output
-/// `b_L(n)` for a (possibly fractional) lag `L` in 1/6-sample units,
-/// generated in order from `n = 0` so that in-subframe references
-/// resolve to already-generated samples. The delay actually applied
-/// at sample `n` is `q = ⌊(n + L + 5/6) / L⌋ · L` — the smallest
-/// multiple of `L` that keeps every tap of the 10th-order
-/// interpolator `f̃_j(i)` ([`INTERP_FILTER_10`], taps at
-/// `n − Λ − 5 + i`, `Λ = ⌊q⌋`, `j = 6(q − Λ)`) on samples that
-/// already exist, so a lag shorter than the subframe repeats the
-/// history periodically instead of re-interpolating its own
-/// interpolated output. Phase 0 is the single-tap special case.
-pub(super) fn adaptive_codebook(hist: &[f64; HIST], lag_sixths: i32) -> [f64; NS] {
-    let mut b = [0f64; NS];
-    let lag = lag_sixths.max(1);
-    for n in 0..NS {
-        // q in sixths: ⌊(6n + L6 + 5) / L6⌋ · L6.
-        let q6 = ((6 * n as i32 + lag + 5) / lag) * lag;
-        let lambda = (q6 / 6) as isize;
-        let phase = (q6 % 6) as usize;
-        let fetch = |m: isize| -> f64 {
-            if m < 0 {
-                let idx = m + HIST as isize;
-                if idx < 0 { 0.0 } else { hist[idx as usize] }
-            } else {
-                b[m as usize]
-            }
-        };
-        let n = n as isize;
-        b[n as usize] = if phase == 0 {
-            fetch(n - lambda)
-        } else {
-            let mut acc = 0.0;
-            for (i, row) in INTERP_FILTER_10.iter().enumerate() {
-                acc += row[phase] as f64 / 32768.0 * fetch(n - lambda - 5 + i as isize);
-            }
-            acc
-        };
-    }
-    b
-}
-
-/// Clause 4.1.9 eq. (107): a sequence delayed by a fractional lag
-/// `L` (1/6-sample units) through the 6th-order interpolator
-/// `g_j(i)` ([`INTERP_FILTER_6`]) — the filter the open-loop lag
-/// search interpolates with, which clause 4.2.2 also assigns to the
-/// adaptive pitch prefilter. Taps sit at `n − ⌊L⌋ − 3 + i`,
-/// `j = 6(L − ⌊L⌋)`; `hist` supplies `n < 0` (oldest first, `cur`
-/// the samples at `n ≥ 0`, which must already be generated — every
-/// tap is at least 19 samples in the past for `L ≥ 21`).
-pub(super) fn frac_delay_6(hist: &[f64], cur: &[f64], n: isize, lag_sixths: i32) -> f64 {
-    let i_part = (lag_sixths / 6) as isize;
-    let phase = (lag_sixths % 6) as usize;
-    let fetch = |m: isize| -> f64 {
-        if m < 0 {
-            let idx = m + hist.len() as isize;
-            if idx < 0 { 0.0 } else { hist[idx as usize] }
-        } else {
-            cur[m as usize]
-        }
-    };
-    let mut acc = 0.0;
-    for (i, row) in INTERP_FILTER_6.iter().enumerate() {
-        acc += row[phase] as f64 / 32768.0 * fetch(n - i_part - 3 + i as isize);
-    }
-    acc
 }
 
 // ─── Fixed-point building blocks (schedules Part A) ───
@@ -469,7 +359,7 @@ fn postfilter_numerator(den: &[i16; NP]) -> [i16; NP] {
 
 /// RS_est (schedules §A.3): `sqrt(RS)` as a normalised pair from the
 /// reflection coefficients and the R0 amplitude word.
-fn rs_estimate(r: &[i16; NP], amp: i16) -> (i16, i16) {
+pub(super) fn rs_estimate(r: &[i16; NP], amp: i16) -> (i16, i16) {
     let mut p: i16 = i16::MIN;
     let mut s: i16 = -6;
     for &ri in r.iter() {
@@ -492,7 +382,7 @@ fn rs_estimate(r: &[i16; NP], amp: i16) -> (i16, i16) {
 
 /// Plain energy `E(x)` (schedules §0.2): normalised long and its
 /// `norm_l`, `(0, 0)` for silence.
-fn energy_plain(x: &[i16; NS]) -> (i32, i16) {
+pub(super) fn energy_plain(x: &[i16; NS]) -> (i32, i16) {
     let mut l = 0i32;
     for &v in x.iter() {
         l = l_mac(l, v, v);
@@ -528,7 +418,7 @@ fn energy_shifted(x: &[i16; NS], k: i16) -> (i32, i16) {
 
 /// ρ = sqrt(RS)/sqrt(energy) (schedules §A.6 step 1) from an energy
 /// pair `(L, n)`.
-fn rho_from_energy(l: i32, n: i16, rs: (i16, i16)) -> (i16, i16) {
+pub(super) fn rho_from_energy(l: i32, n: i16, rs: (i16, i16)) -> (i16, i16) {
     let t = sqroot(l);
     let mut n = n;
     let mut l = if n & 1 != 0 {
@@ -549,7 +439,7 @@ fn rho_from_energy(l: i32, n: i16, rs: (i16, i16)) -> (i16, i16) {
 /// Excitation scaling by a GSP0 table word (schedules §A.6 step 2).
 /// Returns the scaled vector and the gain word (β for the LTP
 /// vector).
-fn scale_vector(x: &[i16; NS], t: i16, rho: (i16, i16)) -> ([i16; NS], i16) {
+pub(super) fn scale_vector(x: &[i16; NS], t: i16, rho: (i16, i16)) -> ([i16; NS], i16) {
     let mut l = l_mult(t, rho.0);
     let n = norm_s(extract_h(l));
     l = l_shl(l, n);
@@ -659,7 +549,7 @@ pub(super) fn adaptive_codebook_words(hist: &[i16; HIST], lag6: i16) -> [i16; NS
 
 /// One all-pole filter pass with the Q11 direct-form words (schedules
 /// §A.10): `mem` holds `y(n−1)..y(n−10)` and is updated.
-fn all_pole(a: &[i16; NP], x: &[i16; NS], mem: &mut [i16; NP]) -> [i16; NS] {
+pub(super) fn all_pole(a: &[i16; NP], x: &[i16; NS], mem: &mut [i16; NP]) -> [i16; NS] {
     let mut y = [0i16; NS];
     for n in 0..NS {
         let mut l = 0x0800i32;
@@ -700,7 +590,7 @@ fn all_zero(a: &[i16; NP], x: &[i16; NS], mem: &mut [i16; NP]) -> [i16; NS] {
 /// Soft-interpolate two Q11 word sets (schedules §A.2 step 4 /
 /// §A.3).
 #[inline]
-fn interp_words(new: &[i16; NP], old: &[i16; NP], k: usize) -> [i16; NP] {
+pub(super) fn interp_words(new: &[i16; NP], old: &[i16; NP], k: usize) -> [i16; NP] {
     let mut o = [0i16; NP];
     for i in 0..NP {
         o[i] = mac_r(
@@ -714,7 +604,7 @@ fn interp_words(new: &[i16; NP], old: &[i16; NP], k: usize) -> [i16; NP] {
 
 /// Shift a word history left by one subframe and append 40 samples
 /// (clause 4.2.5 eqs. (169)/(170)).
-fn shift_append_words(hist: &mut [i16; HIST], new: &[i16; NS]) {
+pub(super) fn shift_append_words(hist: &mut [i16; HIST], new: &[i16; NS]) {
     hist.copy_within(NS.., 0);
     hist[HIST - NS..].copy_from_slice(new);
 }
@@ -1155,25 +1045,5 @@ mod tests {
         for (x, y) in r.iter().zip(r2.iter()) {
             assert!((x - y).abs() < 400, "{x} vs {y}");
         }
-    }
-
-    /// Step-up/step-down are inverse recursions.
-    #[test]
-    fn step_up_down_roundtrip() {
-        let r = [0.5, -0.3, 0.2, -0.1, 0.05, 0.0, 0.1, -0.2, 0.3, -0.4];
-        let a = step_up(&r);
-        let r2 = step_down(&a).expect("stable set");
-        for (x, y) in r.iter().zip(r2.iter()) {
-            assert!((x - y).abs() < 1e-12);
-        }
-    }
-
-    /// Eq. (30) R0 decode: code 31 → −4 dB, code 1 → −64 dB, code 0
-    /// is the silence floor.
-    #[test]
-    fn r0_decode_matches_printed_equation() {
-        assert!((decode_r0(31) - R0_RMAX * 10f64.powf(-0.4)).abs() < 1e-12);
-        assert!((decode_r0(1) - R0_RMAX * 10f64.powf(-6.4)).abs() < 1e-15);
-        assert_eq!(decode_r0(0), 0.0);
     }
 }
